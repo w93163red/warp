@@ -12396,6 +12396,10 @@ impl Workspace {
     }
 
     fn open_require_login_modal(&mut self, variant: AuthViewVariant, ctx: &mut ViewContext<Self>) {
+        if AuthState::is_account_authentication_disabled() {
+            return;
+        }
+
         self.require_login_modal.update(ctx, |modal, ctx| {
             modal.set_variant(ctx, variant);
         });

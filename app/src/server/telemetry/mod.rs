@@ -91,6 +91,11 @@ impl TelemetryApi {
     // Batches up telemetry events from the global queue and sends a Message to the Rudderstack API.
     // Returns the number of events that were flushed.
     pub async fn flush_events(&self, settings_snapshot: PrivacySettingsSnapshot) -> Result<usize> {
+        if !warpui::telemetry::telemetry_collection_enabled() {
+            clear_event_queue();
+            return Ok(0);
+        }
+
         let events = warpui::telemetry::flush_events();
         let event_count = events.len();
 
@@ -120,6 +125,10 @@ impl TelemetryApi {
         path: &Path,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if !warpui::telemetry::telemetry_collection_enabled() {
+            return Ok(());
+        }
+
         if path.exists() {
             let file = File::open(path)?;
             let events: Vec<RudderBatchMessage> = serde_json::from_reader(file)?;
@@ -161,6 +170,11 @@ impl TelemetryApi {
         settings_snapshot: PrivacySettingsSnapshot,
         path: impl AsRef<Path>,
     ) -> Result<()> {
+        if !warpui::telemetry::telemetry_collection_enabled() {
+            clear_event_queue();
+            return Result::Ok(());
+        }
+
         if settings_snapshot.should_disable_telemetry() {
             log::info!("Not writing queued events to disk because telemetry is disabled.");
             return Result::Ok(());
@@ -240,6 +254,10 @@ impl TelemetryApi {
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> impl Future<Output = Result<()>> + '_ {
         let work = async move {
+            if !warpui::telemetry::telemetry_collection_enabled() {
+                return Result::Ok(());
+            }
+
             if settings_snapshot.should_disable_telemetry() {
                 log::info!("Not sending telemetry event because telemetry is disabled.");
                 return Result::Ok(());
@@ -304,6 +322,10 @@ impl TelemetryApi {
         messages: Vec<RudderBatchMessageWithMetadata>,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if !warpui::telemetry::telemetry_collection_enabled() {
+            return Ok(());
+        }
+
         if messages.is_empty() {
             log::debug!("Dropping empty RudderStack telemetry batch");
             return Ok(());
@@ -381,6 +403,10 @@ impl TelemetryApi {
         mut msg: RudderMessage,
         rudder_stack_destination: RudderStackDestination,
     ) -> Result<()> {
+        if !warpui::telemetry::telemetry_collection_enabled() {
+            return Ok(());
+        }
+
         msg.attach_context();
 
         let path = match msg {

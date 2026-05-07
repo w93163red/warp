@@ -21,7 +21,7 @@ use super::{
     auth_manager::user_persistence::PersistedUser,
     credentials::Credentials,
     user::{AnonymousUserType, FirebaseAuthTokens, PersonalObjectLimits, PrincipalType, User},
-    UserUid, API_KEY_PREFIX,
+    UserUid,
 };
 
 const ANONYMOUS_USER_NOTIFICATION_BLOCK_TIMER: Duration = Duration::days(7);
@@ -89,45 +89,8 @@ impl AuthState {
             return state;
         }
 
-        if let Some(api_key_value) = api_key {
-            log::info!("Authenticating via API key");
-            let formatted = if api_key_value.starts_with(API_KEY_PREFIX) {
-                api_key_value
-            } else {
-                format!("{API_KEY_PREFIX}{api_key_value}")
-            };
-            state.set_credentials(Some(Credentials::ApiKey {
-                key: formatted,
-                owner_type: None,
-            }));
-            return state;
-        }
-
-        // Try WARP_USER_SECRET environment variable.
-        if let Some(persisted) = option_env!("WARP_USER_SECRET")
-            .and_then(|s| serde_json::from_str::<PersistedUser>(s).ok())
-        {
-            state.apply_persisted_user(persisted);
-            return state;
-        }
-
-        // Try reading from secure storage.
-        match PersistedUser::from_secure_storage(ctx) {
-            Ok(persisted) => {
-                if persisted.auth_tokens.refresh_token.is_empty() {
-                    log::warn!(
-                        "Found persisted user with empty refresh token; clearing secure storage entry"
-                    );
-                    let _ = PersistedUser::remove_from_secure_storage(ctx).map_err(|err| {
-                        log::warn!("Unable to clear invalid user from secure storage: {err:?}");
-                    });
-                } else {
-                    state.apply_persisted_user(persisted);
-                }
-            }
-            Err(err) => {
-                log::info!("Unable to read user from secure storage: {err:?}");
-            }
+        if api_key.is_some() {
+            log::info!("Ignoring API key because account authentication is disabled.");
         }
 
         state
@@ -176,28 +139,6 @@ impl AuthState {
         }
     }
 
-    /// Applies a deserialized PersistedUser, splitting it into User and Credentials.
-    fn apply_persisted_user(&self, persisted: PersistedUser) {
-        let user = User {
-            is_onboarded: persisted.is_onboarded,
-            local_id: persisted.local_id,
-            metadata: persisted.metadata,
-            needs_sso_link: persisted.needs_sso_link,
-            anonymous_user_type: persisted.anonymous_user_type,
-            is_on_work_domain: persisted.is_on_work_domain,
-            linked_at: persisted.linked_at,
-            personal_object_limits: persisted.personal_object_limits,
-            principal_type: PrincipalType::default(),
-        };
-        *self.user.write() = Some(user);
-
-        if persisted.auth_tokens.refresh_token.is_empty() {
-            log::warn!("Skipping credentials update due to empty refresh token");
-            return;
-        }
-        *self.credentials.write() = Some(Credentials::Firebase(persisted.auth_tokens));
-    }
-
     /// Sets the user. This should only be called by the AuthManager, to ensure
     /// side-effects are handled properly (e.g. notifying other models, persisting
     /// the user to secure storage, etc.).
@@ -240,7 +181,15 @@ impl AuthState {
     /// during the transient state where credentials exist but user data hasn't loaded
     /// yet, the user is conservatively treated as lacking a full account.
     pub fn is_anonymous_or_logged_out(&self) -> bool {
+        if Self::is_account_authentication_disabled() {
+            return false;
+        }
+
         !self.is_logged_in() || self.is_user_anonymous().unwrap_or(true)
+    }
+
+    pub fn is_account_authentication_disabled() -> bool {
+        true
     }
 
     /// Returns the cached access token, if any exists. This method *will not* check if the JWT is

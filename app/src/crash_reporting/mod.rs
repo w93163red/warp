@@ -118,6 +118,10 @@ fn is_crash_reporting_enabled(ctx: &mut AppContext) -> bool {
         .as_ref(ctx)
         .is_crash_reporting_enabled
 }
+
+fn crash_reporting_hard_disabled() -> bool {
+    true
+}
 #[derive(Default)]
 struct CrashRecoveryMetadata {
     /// Whether the Sentry event was previously _unhandled_.
@@ -181,6 +185,11 @@ impl ToSentryTags for CrashRecoveryMetadata {
 /// Initializes the crash reporting subsystem.  Returns whether or not crash
 /// reporting is active.
 pub(crate) fn init(ctx: &mut AppContext) -> bool {
+    if crash_reporting_hard_disabled() {
+        log::info!("Crash reporting is disabled; not initializing sentry.");
+        return false;
+    }
+
     if !FeatureFlag::CrashReporting.is_enabled() {
         log::info!("Crash reporting FeatureFlag is disabled; not initializing sentry.");
         return false;

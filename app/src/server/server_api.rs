@@ -891,6 +891,11 @@ impl ServerApi {
     /// Sends an authenticated empty POST request to /client/login, which signals to the server
     /// that the user is logged in.
     pub async fn notify_login(&self) {
+        if AuthState::is_account_authentication_disabled() {
+            log::info!("Skipping /client/login because account authentication is disabled.");
+            return;
+        }
+
         match self.get_or_refresh_access_token().await {
             Ok(auth_token) => {
                 let url = format!("{}/client/login", ChannelState::server_root_url());
@@ -1284,45 +1289,8 @@ impl ServerApi {
         include_changelogs: bool,
         is_daily: bool,
     ) -> Result<ChannelVersions> {
-        let mut url = Url::parse(&ChannelState::server_root_url())
-            .expect("Should not fail to parse server root URL");
-        if is_daily {
-            url.set_path("/client_version/daily");
-        } else {
-            url.set_path("/client_version");
-        }
-        url.query_pairs_mut()
-            .append_pair("include_changelogs", &include_changelogs.to_string());
-
-        if include_changelogs {
-            log::info!("Fetching channel versions and changelogs from Warp server");
-        } else {
-            log::info!("Fetching channel versions (without changelogs) from Warp server");
-        }
-
-        let mut request_builder = self
-            .client
-            .get(url.as_str())
-            .timeout(FETCH_CHANNEL_VERSIONS_TIMEOUT)
-            .header(EXPERIMENT_ID_HEADER, self.auth_state.anonymous_id());
-
-        // Authorization for /client_version is optional. Attach authorization header if an access
-        // token is present. First, try to get a valid token. If our cached one is expired, try to
-        // refresh. Failing that, send the expired token.
-        let auth_token = self
-            .get_or_refresh_access_token()
-            .await
-            .ok()
-            .and_then(|token| token.bearer_token())
-            .or_else(|| self.auth_state.get_access_token_ignoring_validity());
-        if let Some(token_str) = auth_token {
-            request_builder = request_builder.bearer_auth(token_str);
-        }
-
-        let response = request_builder.send().await?;
-        let versions: ChannelVersions = response.json().await?;
-        log::info!("Received channel versions from Warp server: {versions}");
-        Ok(versions)
+        let _ = (include_changelogs, is_daily);
+        anyhow::bail!("network channel version checks are disabled");
     }
 }
 

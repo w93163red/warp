@@ -487,13 +487,7 @@ impl LaunchMode {
     /// Whether Sentry / crash reporting should be initialized.
     #[cfg_attr(not(feature = "crash_reporting"), allow(dead_code))]
     pub(crate) fn needs_crash_reporting(&self) -> bool {
-        match self {
-            LaunchMode::App { .. }
-            | LaunchMode::CommandLine { .. }
-            | LaunchMode::Test { .. }
-            | LaunchMode::RemoteServerDaemon { .. }
-            | LaunchMode::RemoteServerProxy => true,
-        }
+        false
     }
 
     /// Whether profiling and tracing should be initialized.
@@ -2897,6 +2891,24 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         #[cfg(feature = "handoff_cloud_cloud")]
         FeatureFlag::HandoffCloudCloud,
     ]);
+
+    for disabled_flag in [
+        FeatureFlag::Autoupdate,
+        FeatureFlag::AutoupdateUIRevamp,
+        FeatureFlag::Changelog,
+        FeatureFlag::CocoaSentry,
+        FeatureFlag::CrashReporting,
+        FeatureFlag::GlobalAIAnalyticsBanner,
+        FeatureFlag::GlobalAIAnalyticsCollection,
+        FeatureFlag::LogExpensiveFramesInSentry,
+        FeatureFlag::RecordAppActiveEvents,
+        FeatureFlag::SendTelemetryToFile,
+        FeatureFlag::WithSandboxTelemetry,
+        FeatureFlag::ForceLogin,
+    ] {
+        flags.remove(&disabled_flag);
+    }
+    flags.insert(FeatureFlag::SkipFirebaseAnonymousUser);
 
     flags
 }

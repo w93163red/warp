@@ -14,6 +14,10 @@ lazy_static! {
     static ref TELEMETRY: Mutex<EventStore> = Mutex::new(EventStore::new());
 }
 
+pub fn telemetry_collection_enabled() -> bool {
+    false
+}
+
 #[macro_export]
 macro_rules! record_telemetry_from_ctx {
     ($user_id: expr, $anonymous_id: expr, $name:expr, $payload: expr, $contains_ugc: expr, $ctx: expr) => {{
@@ -81,6 +85,10 @@ pub fn record_event(
     contains_ugc: bool,
     timestamp: DateTime<Utc>,
 ) {
+    if !telemetry_collection_enabled() {
+        return;
+    }
+
     let mut telemetry = TELEMETRY.lock();
     telemetry.record_event(
         user_id,
@@ -93,6 +101,10 @@ pub fn record_event(
 }
 
 pub fn record_identify_user_event(user_id: String, anonymous_id: String, timestamp: DateTime<Utc>) {
+    if !telemetry_collection_enabled() {
+        return;
+    }
+
     let mut telemetry = TELEMETRY.lock();
     telemetry.record_identify_user_event(user_id, anonymous_id, timestamp);
 }
@@ -104,10 +116,19 @@ pub fn record_app_active_event(
     anonymous_id: String,
     timestamp: DateTime<Utc>,
 ) {
+    if !telemetry_collection_enabled() {
+        return;
+    }
+
     let mut telemetry = TELEMETRY.lock();
     telemetry.record_app_active(user_id, anonymous_id, timestamp);
 }
 
 pub fn flush_events() -> Vec<Event> {
+    if !telemetry_collection_enabled() {
+        TELEMETRY.lock().events.clear();
+        return Vec::new();
+    }
+
     TELEMETRY.lock().events.drain(..).collect()
 }

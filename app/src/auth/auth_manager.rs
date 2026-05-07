@@ -144,6 +144,12 @@ impl AuthManager {
         enforce_state_validation: bool,
         ctx: &mut ModelContext<Self>,
     ) {
+        if AuthState::is_account_authentication_disabled() {
+            self.pending_auth_state = None;
+            ctx.emit(AuthManagerEvent::SkippedLogin);
+            return;
+        }
+
         let AuthRedirectPayload {
             refresh_token,
             user_uid,
@@ -211,6 +217,12 @@ impl AuthManager {
         auth_payload: AuthRedirectPayload,
         ctx: &mut ModelContext<Self>,
     ) {
+        if AuthState::is_account_authentication_disabled() {
+            self.pending_auth_state = None;
+            ctx.emit(AuthManagerEvent::SkippedLogin);
+            return;
+        }
+
         let AuthRedirectPayload {
             refresh_token,
             user_uid: _,
@@ -248,6 +260,10 @@ impl AuthManager {
 
     /// Refreshes the user's auth state using their existing credentials.
     pub fn refresh_user(&self, ctx: &mut ModelContext<Self>) {
+        if AuthState::is_account_authentication_disabled() {
+            return;
+        }
+
         let Some(credentials) = self.auth_state.credentials() else {
             log::warn!("Attempted to refresh user without credentials");
             return;
@@ -270,6 +286,11 @@ impl AuthManager {
     /// This is only used by the Warp CLI if running on a device that does not have the Warp app installed.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub fn authorize_device(&self, ctx: &mut ModelContext<Self>) {
+        if AuthState::is_account_authentication_disabled() {
+            ctx.emit(AuthManagerEvent::SkippedLogin);
+            return;
+        }
+
         // Clear any stale user state so old credentials don't interfere
         // with the fresh device auth flow.
         self.auth_state.set_credentials(None);
@@ -562,6 +583,10 @@ impl AuthManager {
 
     /// Sets whether or not this user's Firebase credentials are invalid and thus needs to reauth.
     pub fn set_needs_reauth(&self, needs_reauth: bool, ctx: &mut ModelContext<Self>) {
+        if AuthState::is_account_authentication_disabled() {
+            return;
+        }
+
         let became_true = self.auth_state.set_needs_reauth(needs_reauth);
 
         if became_true {
@@ -575,6 +600,11 @@ impl AuthManager {
         referral_code: Option<String>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if AuthState::is_account_authentication_disabled() {
+            ctx.emit(AuthManagerEvent::SkippedLogin);
+            return;
+        }
+
         let anonymous_user_type = AnonymousUserType::NativeClientAnonymousUserFeatureGated;
 
         let auth_client = self.auth_client.clone();
@@ -638,6 +668,10 @@ impl AuthManager {
         auth_view_variant: AuthViewVariant,
         ctx: &mut ModelContext<Self>,
     ) {
+        if AuthState::is_account_authentication_disabled() {
+            return;
+        }
+
         if self.auth_state.is_anonymous_or_logged_out() {
             send_telemetry_from_ctx!(
                 TelemetryEvent::AnonymousUserAttemptLoginGatedFeature { feature },
@@ -648,6 +682,10 @@ impl AuthManager {
     }
 
     pub fn anonymous_user_hit_drive_object_limit(&self, ctx: &mut ModelContext<Self>) {
+        if AuthState::is_account_authentication_disabled() {
+            return;
+        }
+
         if self.auth_state.is_anonymous_or_logged_out() {
             send_telemetry_from_ctx!(TelemetryEvent::AnonymousUserHitCloudObjectLimit, ctx);
             ctx.emit(AuthManagerEvent::AttemptedLoginGatedFeature {
@@ -661,6 +699,10 @@ impl AuthManager {
         entrypoint: AnonymousUserSignupEntrypoint,
         ctx: &mut ModelContext<Self>,
     ) {
+        if AuthState::is_account_authentication_disabled() {
+            return;
+        }
+
         let auth_client = self.auth_client.clone();
         let _ = ctx.spawn(
             async move { auth_client.fetch_new_custom_token().await },
@@ -710,6 +752,12 @@ impl AuthManager {
         ctx: &mut ModelContext<Self>,
         construct_url: URLConstructorCallback,
     ) {
+        if AuthState::is_account_authentication_disabled() {
+            let url = construct_url(None);
+            ctx.open_url(&url);
+            return;
+        }
+
         if !self.auth_state.is_user_anonymous().unwrap_or_default()
             || !self.auth_state.is_logged_in()
         {
@@ -740,6 +788,10 @@ impl AuthManager {
     }
 
     pub fn copy_anonymous_user_linking_url_to_clipboard(&self, ctx: &mut ModelContext<Self>) {
+        if AuthState::is_account_authentication_disabled() {
+            return;
+        }
+
         if !self.auth_state.is_user_anonymous().unwrap_or_default() {
             return;
         }
@@ -858,6 +910,11 @@ impl AuthManager {
     /// 1. Updates the server by calling set_user_is_onboarded
     /// 2. Updates the local auth state and persists the user data
     pub fn set_user_onboarded(&self, ctx: &mut ModelContext<Self>) {
+        if AuthState::is_account_authentication_disabled() {
+            self.auth_state.set_is_onboarded(true);
+            return;
+        }
+
         // Update server
         let auth_client = self.auth_client.clone();
         let _ = ctx.spawn(

@@ -118,6 +118,10 @@ pub struct AutoupdateState {
     polling_started: bool,
 }
 
+pub fn autoupdate_requests_enabled() -> bool {
+    false
+}
+
 impl AutoupdateState {
     pub fn new(server_api: Arc<ServerApi>) -> Self {
         Self {
@@ -139,6 +143,11 @@ impl AutoupdateState {
     /// Must be called explicitly once onboarding (if any) has completed. For returning users
     /// who bypass onboarding, this should be called during app startup.
     pub fn start_polling(&mut self, ctx: &mut ModelContext<Self>) {
+        if !autoupdate_requests_enabled() {
+            log::info!("Autoupdate polling is disabled.");
+            return;
+        }
+
         if self.polling_started {
             return;
         }
@@ -202,6 +211,10 @@ impl AutoupdateState {
 
     /// After queueing the request, immediately try executing it.
     fn enqueue_request(&mut self, request_type: RequestType, ctx: &mut ModelContext<Self>) {
+        if !autoupdate_requests_enabled() {
+            return;
+        }
+
         // WASM cannot execute any update requests; skip enqueuing entirely so the
         // queue never grows with work that can never be consumed.
         if cfg!(target_family = "wasm") {
@@ -251,6 +264,10 @@ impl AutoupdateState {
     /// The caller is responsible for checking that we _should_ check for an update. Generally, the
     /// only caller should be [`Self::try_execute_request`].
     fn check_for_update(&mut self, request_type: RequestType, ctx: &mut ModelContext<Self>) {
+        if !autoupdate_requests_enabled() {
+            return;
+        }
+
         let current_date = DateTime::now().date_naive();
         let is_daily = self.should_make_daily_request(
             request_type,

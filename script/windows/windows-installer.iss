@@ -232,7 +232,7 @@ begin
 #if ReleaseChannel == "stable"
     CmdScriptName := 'oz.cmd'
 #elif ReleaseChannel == "oss"
-    CmdScriptName := 'warp-oss.cmd';
+    CmdScriptName := 'lx-term.cmd';
 #else
     CmdScriptName := 'oz-{#ReleaseChannel}.cmd';
 #endif

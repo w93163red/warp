@@ -305,9 +305,9 @@ elif [[ $RELEASE_CHANNEL = "stable" ]]; then
     WARP_APP_NAME="Warp"
     WARP_SCHEME_NAME="warp"
 elif [[ $RELEASE_CHANNEL = "oss" ]]; then
-    WARP_BIN="warp-oss"
+    WARP_BIN="lx-term"
     BUNDLE_ID="dev.warp.WarpOss"
-    WARP_APP_NAME="WarpOss"
+    WARP_APP_NAME="lx-term"
     WARP_SCHEME_NAME="warposs"
     # The OSS channel does not ship Sentry, so drop the cocoa_sentry feature
     # (which would otherwise pull in the Sentry framework dependency).
@@ -531,7 +531,7 @@ if [[ "$ARTIFACT" == "app" ]]; then
   if [[ $RELEASE_CHANNEL = "stable" ]]; then
     CLI_SCRIPT_PATH="$BUNDLED_RESOURCES_DIR/bin/oz"
   elif [[ $RELEASE_CHANNEL = "oss" ]]; then
-    CLI_SCRIPT_PATH="$BUNDLED_RESOURCES_DIR/bin/warp-oss"
+    CLI_SCRIPT_PATH="$BUNDLED_RESOURCES_DIR/bin/lx-term"
   else
     CLI_SCRIPT_PATH="$BUNDLED_RESOURCES_DIR/bin/oz-$RELEASE_CHANNEL"
   fi

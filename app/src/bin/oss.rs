@@ -14,7 +14,7 @@ fn main() -> Result<()> {
         Channel::Oss,
         ChannelConfig {
             app_id: AppId::new("dev", "warp", "WarpOss"),
-            logfile_name: "warp-oss.log".into(),
+            logfile_name: "lx-term.log".into(),
             server_config: WarpServerConfig::production(),
             oz_config: OzConfig::production(),
             telemetry_config: None,
@@ -41,15 +41,15 @@ embed_plist::embed_info_plist_bytes!(r#"
     <key>CFBundleDevelopmentRegion</key>
     <string>English</string>
     <key>CFBundleDisplayName</key>
-    <string>WarpOss</string>
+    <string>lx-term</string>
     <key>CFBundleExecutable</key>
-    <string>warp-oss</string>
+    <string>lx-term</string>
     <key>CFBundleIdentifier</key>
     <string>dev.warp.WarpOss</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>WarpOss</string>
+    <string>lx-term</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

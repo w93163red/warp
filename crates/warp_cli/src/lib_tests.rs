@@ -1528,7 +1528,7 @@ fn agent_run_cloud_accepts_harness_flag() {
 }
 
 #[test]
-fn agent_run_cloud_defaults_harness_to_oz() {
+fn agent_run_cloud_defaults_harness_to_codex() {
     let args = Args::try_parse_from(["warp", "agent", "run-cloud", "--prompt", "hello"]).unwrap();
 
     let Some(Command::CommandLine(boxed_cmd)) = args.command else {
@@ -1538,7 +1538,7 @@ fn agent_run_cloud_defaults_harness_to_oz() {
         panic!("Expected `warp agent run-cloud` command");
     };
 
-    assert_eq!(run_args.harness, Harness::Oz);
+    assert_eq!(run_args.harness, Harness::Codex);
 }
 
 #[test]
@@ -1625,7 +1625,7 @@ fn agent_run_cloud_claude_auth_secret_without_harness_parses() {
         panic!("Expected `warp agent run-cloud` command");
     };
 
-    assert_eq!(run_args.harness, Harness::Oz);
+    assert_eq!(run_args.harness, Harness::Codex);
     assert_eq!(run_args.claude_auth_secret.as_deref(), Some("my-key"));
 }
 

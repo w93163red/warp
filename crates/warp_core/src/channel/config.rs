@@ -14,7 +14,7 @@ pub struct ChannelConfig {
 
     /// Configuration for talking to Warp's servers.
     pub server_config: WarpServerConfig,
-    /// Configuration for Oz/ambient agents.
+    /// Configuration for hosted ambient-agent dashboards; empty in OSS builds.
     pub oz_config: OzConfig,
     /// Configuration for telemetry sending, or [`None`] if telemetry should be
     /// disabled for this build.
@@ -51,7 +51,7 @@ impl WarpServerConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct OzConfig {
     /// Root URL for the Oz (ambient agent management) dashboard.
     pub oz_root_url: Cow<'static, str>,

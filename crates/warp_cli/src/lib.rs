@@ -91,16 +91,11 @@ pub struct GlobalOptions {
 /// Command-line argument parser for the main Warp binary. This is used across all channels.
 #[derive(Debug, Default, Parser, Clone)]
 #[command(
-    name = "oz",
-    display_name = "Oz",
-    about = r#"The orchestration platform for cloud agents
+    name = "lx-term",
+    display_name = "lx-term",
+    about = r#"The local-first terminal CLI
 
-The Oz CLI is a tool for running, managing, and orchestrating coding agents at scale.
-Use the CLI to:
-* Launch and inspect cloud agents
-* Schedule cloud agents to run in the future
-* Manage the environments that cloud agents run in
-* Upload secrets to Oz's secure storage"#
+Use the CLI to launch the terminal and run local coding-agent workflows."#
 )]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct Args {

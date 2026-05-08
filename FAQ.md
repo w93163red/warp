@@ -38,17 +38,17 @@ macOS, Linux, and Windows are all supported. Platform-specific setup is handled 
 
 ### Will my PR be reviewed by a human or by an agent?
 
-Both. When you open a PR, Oz is auto-assigned and produces an initial review. Once Oz approves, it automatically requests a follow-up review from a Warp team subject-matter expert. You don't need to assign reviewers manually.
+A maintainer will review your PR. You may use your own agent locally, but PRs are reviewed as code contributions, not as agent output.
 
 ### My PR has been sitting without review — what do I do?
 
-After you push changes that address Oz's feedback, comment `/oz-review` on the PR (up to three times per PR) to request a re-review. If something looks stuck or you've used your re-reviews, mention **@oss-maintainers** to escalate to the team.
+After you push changes that address feedback, ask for re-review in the PR thread. If something looks stuck, mention **@oss-maintainers** to escalate to the team.
 
 ### What's the difference between a contributor and a collaborator?
 
 A **contributor** is anyone who contributes to the project — by filing an issue, opening a PR, helping triage, or participating in discussion. Most people who help out are contributors. You don't need permission or a status of any kind; just file an issue or open a PR.
 
-A **collaborator** is a formal GitHub role we grant to contributors with a track record of merged PRs in this repo. Collaborators get expanded permissions: applying and managing issue labels, dispatching Oz directly with `@oz` on any ready issue, and using complimentary Oz credits for work in this repo.
+A **collaborator** is a formal GitHub role we grant to contributors with a track record of merged PRs in this repo. Collaborators get expanded permissions such as applying and managing issue labels.
 
 ### How do I become a collaborator?
 
@@ -68,19 +68,17 @@ That said, we plan to support [ACP (agent client protocol)](https://agentclientp
 
 [This is tracked on our roadmap](https://github.com/warpdotdev/warp/issues/9233), and we will update the community as we explore this.
 
-### How can I get Oz to implement an issue for me?
+### Can I use an agent to implement an issue?
 
-Mention **@oss-maintainers** on any issue with a readiness label and ask. Approved requests run on **complimentary Oz credits** — you don't need to set up your own Oz account or pay for compute.
-
-Once you're a collaborator, you can mention `@oz` directly on any ready issue to dispatch it without waiting for a maintainer.
+Yes. You can use your own local coding agent, but you remain responsible for reviewing, testing, and submitting the changes.
 
 ### Do I have to pay anything to contribute here?
 
-No. Contributing by hand or with your own agent is free. Oz runs on Warp's credits for approved requests on this repo, and is free for collaborators contributing back to it.
+No. Contributing by hand is free; costs for any local agent tooling are up to you.
 
 ### Are agent-generated PRs held to the same bar as human ones?
 
-Yes. The same Oz + SME review, the same tests, and the same `cargo fmt` / `cargo clippy` / presubmit checks apply regardless of who (or what) wrote the code. Whether a PR is hand-written or agent-written doesn't change the quality bar — it changes how quickly you can iterate to meet it.
+Yes. The same maintainer review, tests, and `cargo fmt` / `cargo clippy` / presubmit checks apply regardless of who (or what) wrote the code.
 
 ### Will my issues, comments, or code be used to train models?
 
@@ -90,19 +88,19 @@ No. Warp does not use contributions to this repository, or the discussion around
 
 ### Is Warp fully open source?
 
-The Warp **client** is open source: the app and most crates are licensed under [AGPL v3](LICENSE-AGPL), and the UI framework crates (`warpui_core`, `warpui`) are licensed under [MIT](LICENSE-MIT). The **server**, the **Warp Drive backend**, and **Oz** (our agent orchestration layer) are not in this repository and remain proprietary today.
+The Warp **client** is open source: the app and most crates are licensed under [AGPL v3](LICENSE-AGPL), and the UI framework crates (`warpui_core`, `warpui`) are licensed under [MIT](LICENSE-MIT). The **server**, the **Warp Drive backend**, and hosted agent orchestration are not in this repository.
 
 ### What lives in this repo and what doesn't?
 
 **In this repo:** the Warp client app, the WarpUI framework, integration tests, agent skills, and feature specs.
 
-**Not in this repo:** the server, the Drive backend, hosted authentication, and Oz orchestration.
+**Not in this repo:** the server, the Drive backend, hosted authentication, and hosted agent orchestration.
 
 ### Can I run Warp without signing in or using Warp's cloud?
 
 Some functionality works fully locally; other features (Drive sync, hosted-model agents, team features) require Warp's backend. We're working to make the locally-runnable surface clearer over time, including more explicit controls in onboarding.
 
-### Will the server or Oz ever be open-sourced?
+### Will the server ever be open-sourced?
 
 We haven't committed to a date and don't want to overpromise. Opening the client under AGPL is a one-way door, and opening the server would be a similar commitment — we'll be explicit when and if we make it.
 

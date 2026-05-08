@@ -9,8 +9,8 @@ use crate::{
     skill::SkillSpec,
 };
 
-/// `ScheduleCommand` has a slightly unusual definition because we allow `oz schedule` as
-// a shorthand for `oz schedule create`.
+/// `ScheduleCommand` has a slightly unusual definition because we allow `lx-term schedule` as
+// a shorthand for `lx-term schedule create`.
 #[derive(Debug, Clone, Args)]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct ScheduleCommand {
@@ -22,7 +22,7 @@ pub struct ScheduleCommand {
 }
 
 impl ScheduleCommand {
-    /// Get the specific scheduling subcommand. Returns `None` if using the `oz schedule` creation shorthand.
+    /// Get the specific scheduling subcommand. Returns `None` if using the `lx-term schedule` creation shorthand.
     pub fn subcommand(&self) -> Option<&ScheduleSubcommand> {
         self.subcommand.as_ref()
     }

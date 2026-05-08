@@ -123,9 +123,8 @@ impl HiddenComputerUseArgs {
     Debug, Copy, Clone, ValueEnum, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize,
 )]
 pub enum Harness {
-    /// Use Warp's built-in MAA infrastructure (default).
-    #[default]
-    #[value(name = "oz")]
+    /// Legacy Warp-hosted harness. Retained only for deserializing old/server data; not selectable in OSS CLI.
+    #[value(skip)]
     Oz,
     /// Delegate to the `claude` CLI.
     #[value(name = "claude", alias = "claude-code")]
@@ -137,6 +136,7 @@ pub enum Harness {
     #[value(name = "gemini")]
     Gemini,
     /// Delegate to the `codex` CLI.
+    #[default]
     #[value(name = "codex")]
     Codex,
     /// A harness produced by a newer client/server that this client doesn't
@@ -156,7 +156,7 @@ impl Harness {
     pub fn parse_local_child_harness(value: &str) -> Option<Self> {
         match Self::parse_orchestration_harness(value) {
             Some(harness @ (Self::Claude | Self::OpenCode | Self::Codex)) => Some(harness),
-            Some(Self::Oz) | Some(Self::Gemini) | Some(Self::Unknown) | None => None,
+            Some(Self::Gemini) | Some(Self::Oz) | Some(Self::Unknown) | None => None,
         }
     }
 
@@ -227,9 +227,9 @@ pub enum AgentProfileCommand {
 /// Agent-related subcommands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum AgentCommand {
-    /// Run a new Oz agent.
+    /// Run a new local coding agent.
     Run(RunAgentArgs),
-    /// Dispatch an Oz agent that runs remotely.
+    /// Dispatch a coding agent that runs remotely.
     RunCloud(RunCloudArgs),
     /// Manage agent profiles.
     #[command(subcommand)]
@@ -268,7 +268,7 @@ pub struct RunAgentArgs {
     ///
     /// When used with --prompt, the skill provides the base context and the prompt is the task.
     ///
-    /// To automate a skill on a schedule, use `oz schedule create --skill <SPEC>`.
+    /// To automate a skill on a schedule, use `lx-term schedule create --skill <SPEC>`.
     #[arg(long = "skill", value_name = "SPEC")]
     pub skill: Option<SkillSpec>,
 
@@ -343,9 +343,9 @@ pub struct RunAgentArgs {
 
     /// Execution harness for the agent run.
     ///
-    /// "oz" (default) uses Warp's built-in agent infrastructure.
+    /// "codex" (default) delegates to the `codex` CLI.
     /// "claude" delegates to the `claude` CLI.
-    #[arg(long = "harness", value_name = "HARNESS", default_value_t = Harness::Oz, hide = true)]
+    #[arg(long = "harness", value_name = "HARNESS", default_value_t = Harness::Codex, hide = true)]
     pub harness: Harness,
 }
 
@@ -405,7 +405,7 @@ pub struct RunCloudArgs {
     ///
     /// When used with --prompt, the skill provides the base context and the prompt is the task.
     ///
-    /// To automate a skill on a schedule, use `oz schedule create --skill <SPEC>`.
+    /// To automate a skill on a schedule, use `lx-term schedule create --skill <SPEC>`.
     #[arg(long = "skill", value_name = "SPEC")]
     pub skill: Option<SkillSpec>,
 
@@ -464,9 +464,9 @@ pub struct RunCloudArgs {
 
     /// Execution harness for the agent run.
     ///
-    /// "oz" (default) uses Warp's built-in agent infrastructure.
+    /// "codex" (default) delegates to the `codex` CLI.
     /// "claude" delegates to the `claude` CLI.
-    #[arg(long = "harness", value_name = "HARNESS", default_value_t = Harness::Oz, hide = true)]
+    #[arg(long = "harness", value_name = "HARNESS", default_value_t = Harness::Codex, hide = true)]
     pub harness: Harness,
 
     /// Name of a managed secret for Claude Code harness authentication.

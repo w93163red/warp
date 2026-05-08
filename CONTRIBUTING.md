@@ -10,18 +10,18 @@ Thanks for helping improve Warp! This guide explains how to open issues, propose
 - Bug fixes are welcome for any issue. All bugs are marked as `ready-to-implement`.
 - Feature requests must be marked `ready-to-spec` or `ready-to-implement` before PRs are accepted.
 - Specs are the place where technical and design discussion on larger issues happen.
-- Oz automatically triages incoming issues and reviews open PRs.
+- Maintainers triage incoming issues and review open PRs.
 
 ## How Contributing to Warp Works
 
-Warp's contribution model is shaped by [Oz](https://oz.warp.dev), an agent that automates parts of triage, spec writing, implementation, and review. Compared with a typical open-source repository, a few things work differently here:
+This fork uses a lightweight maintainer-reviewed open-source workflow:
 
 - **Issues are the starting point for everything.** Discussion, scoping, and design happen on the issue before any PR is opened.
 - **Feature requests differ from bug fixes:**
   - Features are gated by readiness labels — `ready-to-spec`, then `ready-to-implement` once the design is settled — that signal when contributors can pick up the work. Discussion alone is not approval to begin work.
   - Feature work needs a written spec first: feature requests go through a spec PR (a *product spec* + *tech spec* committed under [`specs/`](specs/)) before any code is written.
   - Bug fixes skip both steps; they are implicitly `ready-to-implement` once triaged.
-- **Review is largely automated.** When you open a PR, Oz is auto-assigned and produces an initial review. Once Oz approves, it automatically requests a follow-up review from a Warp team subject-matter expert — you do not need to assign human reviewers yourself.
+- **Review is maintainer-driven.** When you open a PR, maintainers review it for correctness, style, tests, and alignment with the linked issue.
 
 ### Readiness labels
 
@@ -35,7 +35,7 @@ Anyone can pick up a ready issue — readiness labels are not assignments, and t
 
 ## Contribution Flow
 
-Steps owned by you (the contributor) are shown in yellow; steps owned by the Warp team or Oz are shown in blue.
+Steps owned by you (the contributor) are shown in yellow; maintainer-owned steps are shown in blue.
 
 ```mermaid
 flowchart TD
@@ -45,7 +45,7 @@ flowchart TD
     D --> E[Open code PR]
     C -- specs approved --> E
     B -- ready-to-implement<br/>(incl. all triaged bugs) --> E
-    E --> F[Oz review → SME review → CI → merge]
+    E --> F[Maintainer review → CI → merge]
 
     classDef contributor fill:#fef3c7,stroke:#b45309,color:#78350f;
     classDef warpTeam fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a;
@@ -69,7 +69,7 @@ A good bug report includes:
 - Warp version and OS (see `Settings → About`).
 - Logs, screenshots, or screen recordings when relevant.
 
-Once an issue is triaged as a bug (by Oz's triage agent or a maintainer), it is implicitly **`ready-to-implement`** — you can pick it up and open a code PR without waiting for a separate label.
+Once an issue is triaged as a bug by a maintainer, it is implicitly **`ready-to-implement`** — you can pick it up and open a code PR without waiting for a separate label.
 
 ### Feature requests
 
@@ -107,24 +107,24 @@ For issues labeled `ready-to-implement` (this includes any triaged bug):
 4. Open a PR using the [pull request template](.github/pull_request_template.md) and add a changelog entry (`CHANGELOG-NEW-FEATURE`, `CHANGELOG-IMPROVEMENT`, or `CHANGELOG-BUG-FIX`); omit only for docs-only or refactoring-only changes.
 5. Keep the PR focused on a single logical change and merge `master` in before the PR enters review.
 
-You **do not need to manually request reviewers**. Oz is auto-assigned to PRs that target a ready issue and produces an initial review. After Oz approves, it automatically requests a follow-up review from the appropriate Warp team subject-matter expert.
+Open a PR against a ready issue and request maintainer review as usual.
 
-After you push changes that address Oz's feedback, comment `/oz-review` on the PR to request a re-review — you can do this up to **three times** per PR. If something looks stuck or you need more reviews than that, mention **@oss-maintainers** on the PR to escalate to the team.
+After you push changes that address review feedback, ask for re-review in the PR thread. If something looks stuck, mention **@oss-maintainers** on the PR to escalate to the team.
 
 ## Using a Coding Agent
 
 You can use **any coding agent** to implement a contribution — for example, Warp's built-in agent, Claude Code, Codex, Gemini CLI, or others — or no agent at all. This repository ships agent-readable context (skills under [`.agents/skills/`](.agents/skills/), specs under [`specs/`](specs/), and [`WARP.md`](WARP.md)) that any harness supporting these formats can pick up.
 
-If you'd rather have an **Oz cloud agent** implement a ready issue for you, mention **@oss-maintainers** on the issue to request it. Approved requests run **for free** on complimentary Oz credits — you don't need to set up your own Oz account or pay for compute.
+If you use an external coding agent, you remain responsible for reviewing, testing, and explaining the resulting changes.
 
 ## Code Review
 
 All pull requests go through a two-stage review process:
 
-1. **Oz review** — When you open a PR, [Oz](https://warp.dev/oz) is automatically assigned and produces the first review. Oz checks for correctness, style, test coverage, and alignment with the linked issue and any associated specs.
-2. **Warp team review** — Only after Oz has **approved** the PR is it routed to a Warp team subject-matter expert for a final human review. PRs that have not yet been approved by Oz will not be assigned to a team member.
+1. **Maintainer review** — Maintainers check correctness, style, test coverage, and alignment with the linked issue and any associated specs.
+2. **CI** — Required checks must pass before merge.
 
-You do not need to manually request reviewers at any stage. After pushing changes that address Oz's feedback, comment `/oz-review` on the PR to request a re-review — you can do this up to **three times** per PR. If something looks stuck or you need additional reviews, mention **@oss-maintainers** on the PR to escalate to the team.
+After pushing changes that address feedback, ask for re-review in the PR thread. If something looks stuck or you need additional reviews, mention **@oss-maintainers** on the PR to escalate to the team.
 
 ## Development Setup
 

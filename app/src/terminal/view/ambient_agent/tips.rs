@@ -164,11 +164,11 @@ pub fn get_cloud_mode_tips() -> Vec<CloudModeTip> {
             Some("https://docs.warp.dev/agent-platform/cloud-agents/triggers/scheduled-agents"),
         ),
         CloudModeTip::new(
-            "Use `oz schedule create` to set up cron-triggered agents.",
+            "Use `lx-term schedule create` to set up cron-triggered agents.",
             Some("https://docs.warp.dev/agent-platform/cloud-agents/triggers/scheduled-agents"),
         ),
         CloudModeTip::new(
-            "Pause and resume scheduled agents without deleting them using `oz schedule pause`.",
+            "Pause and resume scheduled agents without deleting them using `lx-term schedule pause`.",
             Some("https://docs.warp.dev/agent-platform/cloud-agents/triggers/scheduled-agents"),
         ),
         CloudModeTip::new(

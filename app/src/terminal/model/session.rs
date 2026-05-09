@@ -165,6 +165,9 @@ impl Sessions {
                     sessions.set_remote_server_setup_state(*session_id, state.clone());
                     ctx.notify();
                 }
+                RemoteServerManagerEvent::BufferUpdated { .. } => {
+                    // Handled directly by GlobalBufferModel's subscription.
+                }
                 RemoteServerManagerEvent::SessionConnecting { .. }
                 | RemoteServerManagerEvent::SessionDeregistered { .. }
                 | RemoteServerManagerEvent::SessionConnectionFailed { .. }
@@ -1429,6 +1432,13 @@ impl Session {
     #[cfg(feature = "integration_tests")]
     pub fn external_commands(&self) -> Arc<OnceCell<HashSet<SmolStr>>> {
         self.external_commands.clone()
+    }
+
+    /// Returns a reference to the session's command executor for integration
+    /// test assertions (e.g. to verify `RemoteServerCommandExecutor` is wired).
+    #[cfg(any(test, feature = "integration_tests"))]
+    pub fn command_executor(&self) -> Arc<dyn CommandExecutor> {
+        self.command_executor.read().clone()
     }
 
     pub async fn execute_command(

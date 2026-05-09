@@ -3434,7 +3434,10 @@ impl AuthOnboardingState {
             && !has_completed_local_onboarding
             && FeatureFlag::AgentOnboarding.is_enabled()
         {
-            self.try_open_onboarding_slides(ctx);
+            // Do not show the startup onboarding flow in this build. New users
+            // should land directly in a command-line terminal instead of the
+            // agent/Oz-oriented guided setup.
+            mark_local_onboarding_completed(ctx);
         }
 
         // If we didn't transition to Onboarding, set the Terminal state.

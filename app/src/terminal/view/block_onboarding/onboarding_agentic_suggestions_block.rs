@@ -589,7 +589,7 @@ impl OnboardingAgenticSuggestionsBlock {
         let font_size = appearance.monospace_font_size();
         let font_color = current_theme.main_text_color(current_theme.background());
 
-        const WELCOME_TEXT_LINE_ONE: &str = "Welcome to Warp!";
+        const WELCOME_TEXT_LINE_ONE: &str = "Welcome to lx-term!";
         const WELCOME_TEXT_LINE_TWO_PART_ONE: &str =
             "Here are a few examples of how to leverage the power of AI in your terminal using";
         const WELCOME_TEXT_LINE_TWO_PART_TWO: &str = " Agent Mode";

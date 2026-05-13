@@ -7,7 +7,7 @@ use crate::settings::{AISettings, CodeSettings};
 use crate::workspace::tab_settings::TabSettings;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use onboarding::slides::{AgentAutonomy, AgentDevelopmentSettings};
-use onboarding::{SelectedSettings, UICustomizationSettings};
+use onboarding::{SelectedSettings, SessionDefault, UICustomizationSettings};
 use settings::Setting as _;
 use warp_core::features::FeatureFlag;
 use warpui::{AppContext, SingletonEntity as _};
@@ -107,10 +107,11 @@ fn apply_ui_customization_settings(
 }
 
 fn apply_agent_settings(agent_settings: &AgentDevelopmentSettings, app: &mut AppContext) {
-    // Keep startup/new-session defaults on the command line. Agent mode remains
-    // available explicitly, but onboarding must not make it the default.
-    let default_mode = DefaultSessionMode::Terminal;
-    let _ = agent_settings.session_default;
+    // Apply session default mode.
+    let default_mode = match agent_settings.session_default {
+        SessionDefault::Agent => DefaultSessionMode::Agent,
+        SessionDefault::Terminal => DefaultSessionMode::Terminal,
+    };
     AISettings::handle(app).update(app, |settings, ctx| {
         report_if_error!(settings
             .default_session_mode_internal

@@ -58,7 +58,7 @@ fn get_universal_input_callout_options(
 ) -> Option<CalloutOptions> {
     match state {
         UniversalInputCalloutState::MeetInput => Some(CalloutOptions {
-            title: "Meet the Warp input",
+            title: "Meet the lx-term input",
             text: format!(
                 "Your terminal input accepts both terminal commands and agent prompts and automatically detects which you're using. Use {} to lock the input to Agent mode (natural language) or Terminal mode (commands).",
                 keybindings.toggle_input_mode
@@ -158,7 +158,7 @@ fn get_agent_modality_callout_options(
                 Some(CalloutOptions {
                     title: "Natural language support",
                     text: format!(
-                        "Natural language input is off by default. If enabled, you can type requests in plain English and Warp will autodetect queries for the agent. You can always override them using {}.",
+                        "Natural language input is off by default. If enabled, you can type requests in plain English and lx-term will autodetect queries for the agent. You can always override them using {}.",
                         keybindings.toggle_input_mode
                     ),
                     step: StepStatus::new(1, total_steps),
@@ -176,7 +176,7 @@ fn get_agent_modality_callout_options(
             }
         }
         AgentModalityCalloutState::IntroducingAgentExperience => Some(CalloutOptions {
-            title: "Introducing Warp's new agent experience",
+            title: "Introducing lx-term's new agent experience",
             text: "Agent conversations are now their own scoped view outside of your terminal. Simply hit ESC to return to the terminal at any point.".to_string(),
             step: StepStatus::new(2, total_steps),
             left_button: None,

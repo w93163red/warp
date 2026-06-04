@@ -475,6 +475,7 @@ extern "C" {
     fn open_save_file_picker(callback: *mut c_void, default_filename: id, default_directory: id);
     fn open_url(urlString: id);
     fn set_titlebar_height(window: id, height: f64);
+    fn set_titlebar_drag_at_bottom(window: id, enabled: BOOL);
 }
 
 pub type FrameCaptureCallback = Box<dyn FnOnce(platform::CapturedFrame) + Send + 'static>;
@@ -1109,6 +1110,12 @@ impl WindowState {
             set_titlebar_height(self.native_window, height);
         }
     }
+
+    fn set_titlebar_drag_at_bottom(&self, enabled: bool) {
+        unsafe {
+            set_titlebar_drag_at_bottom(self.native_window, enabled as BOOL);
+        }
+    }
 }
 
 impl platform::WindowContext for WindowState {
@@ -1166,6 +1173,9 @@ pub trait WindowExt {
 
     /// Sets whether or not to show the native macOS window buttons (traffic lights).
     fn set_window_buttons(&self, window_buttons: bool);
+
+    /// Sets whether the app-rendered title/tab bar accepts window drags at the bottom edge.
+    fn set_titlebar_drag_at_bottom(&self, enabled: bool);
 }
 
 /// Utility for interacting with the native [`Window`] implementation. The native window is always
@@ -1191,6 +1201,12 @@ impl WindowExt for &dyn platform::Window {
     fn set_window_buttons(&self, window_buttons: bool) {
         if let Some(window) = native_window(*self) {
             window.0.set_window_buttons(window_buttons)
+        }
+    }
+
+    fn set_titlebar_drag_at_bottom(&self, enabled: bool) {
+        if let Some(window) = native_window(*self) {
+            window.0.set_titlebar_drag_at_bottom(enabled)
         }
     }
 }

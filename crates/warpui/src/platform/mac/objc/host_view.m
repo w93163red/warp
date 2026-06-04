@@ -41,6 +41,11 @@ void warp_marked_text_cleared(WarpHostView *);
     // Whether we start a window drag on an unhandled mouseDown event inside the title bar
     BOOL titlebarDragEnabled;
 
+    // Whether the app-rendered title/tab bar is placed at the bottom of the window. The native
+    // macOS titlebar and traffic lights remain top-oriented, but unhandled drags from the visual
+    // bottom titlebar should still move the window.
+    BOOL titlebarDragAtBottom;
+
     // Whether we are in test mode, which suppresses drawing.
     BOOL testMode;
 
@@ -89,7 +94,10 @@ void warp_marked_text_cleared(WarpHostView *);
     // windowLoc.y is the distance from the bottom of the window to the cursor
     // NSHeight(window.frame) will be the height of the whole window, so
     // NSHeight - titlebarHeight will be the bottom border of the titlebar
-    return NSHeight(self.window.frame) - [self titlebarHeight] <= windowLoc.y;
+    CGFloat titlebarHeight = [self titlebarHeight];
+    BOOL inTopTitlebar = NSHeight(self.window.frame) - titlebarHeight <= windowLoc.y;
+    BOOL inBottomTitlebar = titlebarDragAtBottom && windowLoc.y <= titlebarHeight;
+    return inTopTitlebar || inBottomTitlebar;
 }
 
 // See if the user double clicked in the titlebar. If so, do whatever
@@ -152,6 +160,10 @@ void warp_marked_text_cleared(WarpHostView *);
 
 - (void)setAsyncCallback:(BOOL)shouldAsync {
     asyncCallback = shouldAsync;
+}
+
+- (void)setTitlebarDragAtBottom:(BOOL)enabled {
+    titlebarDragAtBottom = enabled;
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -294,6 +306,7 @@ void warp_marked_text_cleared(WarpHostView *);
     ]];
     self->testMode = testModeFlag;
     self->titlebarDragEnabled = enableTitlebarDrag;
+    self->titlebarDragAtBottom = NO;
     self->metalDevice = [device retain];
     self->markedText = [[NSMutableAttributedString alloc] init];
     self->textToInsert = [[NSMutableString alloc] init];

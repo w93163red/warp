@@ -1040,6 +1040,13 @@ void set_titlebar_height(id window, CGFloat height) {
     }
 }
 
+void set_titlebar_drag_at_bottom(id window, BOOL enabled) {
+    NSView *contentView = [window contentView];
+    if ([contentView respondsToSelector:@selector(setTitlebarDragAtBottom:)]) {
+        [(WarpHostView *)contentView setTitlebarDragAtBottom:enabled];
+    }
+}
+
 void position_and_order_front(WarpWindow<WarpWindowProtocol> *window) {
     // Called from Rust to position ourselves and order front.
     // TODO: use NSUserDefaults to remember window locations.

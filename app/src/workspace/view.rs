@@ -12081,16 +12081,18 @@ impl Workspace {
             .platform_window(self.window_id)
             .is_some_and(|window| window.fullscreen_state() == FullscreenState::Fullscreen);
 
+        // Check if any of the menus/popups rendered relative to the tab bar are open.
+        let tab_settings = TabSettings::as_ref(app);
+        let is_vertical_tabs_active = FeatureFlag::VerticalTabs.is_enabled()
+            && *tab_settings.use_vertical_tabs
+            && self.vertical_tabs_panel_open;
+        let title_bar_bottom =
+            tab_settings.title_bar_position == TitleBarPosition::Bottom && !is_vertical_tabs_active;
         let is_hovered = self
             .tab_bar_hover_state
             .lock()
             .is_ok_and(|state| state.is_hovered())
-            || self.traffic_light_mouse_states.are_traffic_lights_hovered();
-
-        // Check if any of the menus/popups rendered relative to the tab bar are open.
-        let is_vertical_tabs_active = FeatureFlag::VerticalTabs.is_enabled()
-            && *TabSettings::as_ref(app).use_vertical_tabs
-            && self.vertical_tabs_panel_open;
+            || (!title_bar_bottom && self.traffic_light_mouse_states.are_traffic_lights_hovered());
         let is_tab_menu_open = self.show_tab_bar_overflow_menu
             || (self.show_tab_right_click_menu.is_some() && !is_vertical_tabs_active)
             || (self.show_new_session_dropdown_menu.is_some() && !is_vertical_tabs_active)
@@ -12104,9 +12106,7 @@ impl Workspace {
             .as_ref(app)
             .any_pane_being_dragged(app);
 
-        let workspace_decoration_visibility = TabSettings::as_ref(app)
-            .workspace_decoration_visibility
-            .value();
+        let workspace_decoration_visibility = tab_settings.workspace_decoration_visibility.value();
 
         let hovered_visibility = if is_pane_being_dragged || is_hovered || is_tab_menu_open {
             ShowTabBar::Stacked
@@ -12127,20 +12127,29 @@ impl Workspace {
     #[cfg(target_os = "macos")]
     pub fn sync_window_button_visibility(&self, ctx: &mut ViewContext<Self>) {
         use warpui::platform::mac::WindowExt;
-        let show = if FeatureFlag::FullScreenZenMode.is_enabled()
-            && TabSettings::as_ref(ctx)
-                .workspace_decoration_visibility
-                .value()
-                == &WorkspaceDecorationVisibility::OnHover
+        let tab_settings = TabSettings::as_ref(ctx);
+        let is_vertical_tabs_active = FeatureFlag::VerticalTabs.is_enabled()
+            && *tab_settings.use_vertical_tabs
+            && self.vertical_tabs_panel_open;
+        let title_bar_bottom =
+            tab_settings.title_bar_position == TitleBarPosition::Bottom && !is_vertical_tabs_active;
+        let workspace_decoration_visibility = tab_settings.workspace_decoration_visibility.value();
+        let show = if title_bar_bottom {
+            // The macOS traffic lights stay in the native top titlebar even when the app-rendered
+            // tab/title bar moves to the bottom. Keep them stable instead of tying their visibility
+            // to bottom-bar hover state, which otherwise causes visible flicker.
+            true
+        } else if FeatureFlag::FullScreenZenMode.is_enabled()
+            && workspace_decoration_visibility == &WorkspaceDecorationVisibility::OnHover
         {
             self.tab_bar_mode(ctx).has_tab_bar()
         } else {
-            TabSettings::as_ref(ctx)
-                .workspace_decoration_visibility
-                .show_window_decorations()
+            workspace_decoration_visibility.show_window_decorations()
         };
         if let Some(platform_window) = ctx.windows().platform_window(ctx.window_id()) {
-            platform_window.as_ref().set_window_buttons(show);
+            let platform_window = platform_window.as_ref();
+            platform_window.set_window_buttons(show);
+            platform_window.set_titlebar_drag_at_bottom(title_bar_bottom);
         }
     }
 

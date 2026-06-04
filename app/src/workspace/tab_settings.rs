@@ -68,6 +68,34 @@ settings::macros::implement_setting_for_enum!(
     description: "Position of the close button on tabs.",
 );
 
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Position of the title bar.", rename_all = "snake_case")]
+pub enum TitleBarPosition {
+    #[default]
+    Top,
+    Bottom,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TitleBarPosition,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    private: false,
+    toml_path: "appearance.tabs.title_bar_position",
+    description: "Position of the title bar.",
+);
+
 /// Visibility options for workspace decorations like the tab bar.
 #[derive(
     Clone,
@@ -541,6 +569,7 @@ define_settings_group!(TabSettings, settings: [
     header_toolbar_chip_selection: HeaderToolbarChipSelection,
     new_tab_placement: NewTabPlacement,
     workspace_decoration_visibility: WorkspaceDecorationVisibility,
+    title_bar_position: TitleBarPosition,
     close_button_position: TabCloseButtonPosition,
     directory_tab_colors: DirectoryTabColors,
 ]);

@@ -56,8 +56,8 @@ use crate::workspace::header_toolbar_editor::HeaderToolbarInlineEditor;
 use crate::workspace::tab_settings::{
     DirectoryTabColor, PreserveActiveTabColor, ShowCodeReviewButton, ShowIndicatorsButton,
     ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition, TabSettings,
-    TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames, UseVerticalTabs,
-    WorkspaceDecorationVisibility,
+    TabSettingsChangedEvent, TitleBarPosition, UseLatestUserPromptAsConversationTitleInTabNames,
+    UseVerticalTabs, WorkspaceDecorationVisibility,
 };
 use crate::workspace::WorkspaceAction;
 use crate::{editor::EditorView, themes::theme_chooser::ThemeChooserMode};
@@ -471,6 +471,7 @@ pub enum AppearancePageAction {
     ToggleInputMode,
     UpdateAltScreenPaddingMode(AltScreenPaddingMode),
     SetTabCloseButtonPosition(TabCloseButtonPosition),
+    SetTitleBarPosition(TitleBarPosition),
     SetZoomLevel(u16),
     ResetZoomLevel,
     SetDefaultDirectoryTabColor {
@@ -506,6 +507,7 @@ pub struct AppearanceSettingsPageView {
     app_icon_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     workspace_decorations_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     tab_close_button_position_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    title_bar_position_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_level_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_reset_button_mouse_state: MouseStateHandle,
     available_families: HashMap<String, (Option<FamilyId>, FontType)>,
@@ -644,6 +646,9 @@ impl TypedActionView for AppearanceSettingsPageView {
             }
             SetTabCloseButtonPosition(position) => {
                 self.update_tab_close_button_position(*position, ctx);
+            }
+            SetTitleBarPosition(position) => {
+                self.update_title_bar_position(*position, ctx);
             }
             SetZoomLevel(zoom_level) => {
                 WindowSettings::handle(ctx).update(ctx, |window_settings, ctx| {
@@ -1225,6 +1230,7 @@ impl AppearanceSettingsPageView {
                 ctx,
             ),
             tab_close_button_position_dropdown: Self::build_tab_close_button_position_dropdown(ctx),
+            title_bar_position_dropdown: Self::build_title_bar_position_dropdown(ctx),
             zoom_level_dropdown: Self::build_zoom_level_dropdown(ctx),
             zoom_reset_button_mouse_state: MouseStateHandle::default(),
             available_families: Default::default(),
@@ -1383,6 +1389,7 @@ impl AppearanceSettingsPageView {
         if FeatureFlag::TabCloseButtonOnLeft.is_enabled() {
             tab_settings_widgets.push(Box::new(TabCloseButtonPositionWidget::default()));
         }
+        tab_settings_widgets.push(Box::new(TitleBarPositionWidget::default()));
         tab_settings_widgets.push(Box::new(PreserveActiveTabColorWidget::default()));
 
         if FeatureFlag::VerticalTabs.is_enabled() {
@@ -1579,6 +1586,13 @@ impl AppearanceSettingsPageView {
         match value {
             TabCloseButtonPosition::Right => "Right",
             TabCloseButtonPosition::Left => "Left",
+        }
+    }
+
+    fn title_bar_position_dropdown_item_label(value: TitleBarPosition) -> &'static str {
+        match value {
+            TitleBarPosition::Top => "Top",
+            TitleBarPosition::Bottom => "Bottom",
         }
     }
 
@@ -2414,10 +2428,7 @@ impl AppearanceSettingsPageView {
         ctx.add_typed_action_view(|ctx| {
             let mut dropdown = Dropdown::new(ctx);
 
-            let values = [
-                TabCloseButtonPosition::Right,
-                TabCloseButtonPosition::Left,
-            ];
+            let values = [TabCloseButtonPosition::Right, TabCloseButtonPosition::Left];
 
             let current_value = TabSettings::as_ref(ctx).close_button_position;
             let selected_index = values.iter().position(|val| *val == current_value).unwrap_or_else(|| {
@@ -2428,6 +2439,43 @@ impl AppearanceSettingsPageView {
             dropdown.set_items(values.into_iter().map(|value| {
                 DropdownItem::new(Self::tab_close_button_position_dropdown_item_label(value), AppearancePageAction::SetTabCloseButtonPosition(value))
             }).collect(), ctx);
+            dropdown.set_selected_by_index(selected_index, ctx);
+
+            dropdown
+        })
+    }
+
+    fn build_title_bar_position_dropdown(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AppearancePageAction>> {
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+
+            let values = [TitleBarPosition::Top, TitleBarPosition::Bottom];
+
+            let current_value = TabSettings::as_ref(ctx).title_bar_position;
+            let selected_index = values
+                .iter()
+                .position(|val| *val == current_value)
+                .unwrap_or_else(|| {
+                    log::error!(
+                        "Could not find current TitleBarPosition value in dropdown option list"
+                    );
+                    0
+                });
+
+            dropdown.set_items(
+                values
+                    .into_iter()
+                    .map(|value| {
+                        DropdownItem::new(
+                            Self::title_bar_position_dropdown_item_label(value),
+                            AppearancePageAction::SetTitleBarPosition(value),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
             dropdown.set_selected_by_index(selected_index, ctx);
 
             dropdown
@@ -2484,6 +2532,14 @@ impl AppearanceSettingsPageView {
             let value = TabSettings::as_ref(ctx).workspace_decoration_visibility;
             let name = Self::workspace_decoration_visibility_dropdown_item_label(value);
             self.workspace_decorations_dropdown
+                .update(ctx, |dropdown, ctx| {
+                    dropdown.set_selected_by_name(name, ctx);
+                });
+        }
+        if let TabSettingsChangedEvent::TitleBarPosition { .. } = event {
+            let value = TabSettings::as_ref(ctx).title_bar_position;
+            let name = Self::title_bar_position_dropdown_item_label(value);
+            self.title_bar_position_dropdown
                 .update(ctx, |dropdown, ctx| {
                     dropdown.set_selected_by_name(name, ctx);
                 });
@@ -2547,6 +2603,17 @@ impl AppearanceSettingsPageView {
             TelemetryEvent::TabCloseButtonPositionUpdated { position },
             ctx
         );
+        ctx.notify();
+    }
+
+    pub fn update_title_bar_position(
+        &mut self,
+        position: TitleBarPosition,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        TabSettings::handle(ctx).update(ctx, |tab_settings, ctx| {
+            report_if_error!(tab_settings.title_bar_position.set_value(position, ctx));
+        });
         ctx.notify();
     }
 }
@@ -4424,6 +4491,39 @@ impl SettingsWidget for TabCloseButtonPositionWidget {
             ),
             None,
             &view.tab_close_button_position_dropdown,
+        )
+    }
+}
+
+#[derive(Default)]
+struct TitleBarPositionWidget {}
+
+impl SettingsWidget for TitleBarPositionWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "title bar tab bar position top bottom"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Title bar position",
+            None,
+            None,
+            LocalOnlyIconState::for_setting(
+                TitleBarPosition::storage_key(),
+                TitleBarPosition::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.title_bar_position_dropdown,
         )
     }
 }

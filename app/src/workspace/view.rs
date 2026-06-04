@@ -133,7 +133,7 @@ use crate::terminal::cli_agent_sessions::plugin_manager::{plugin_manager_for, Pl
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
 use crate::workspace::header_toolbar_editor::{HeaderToolbarEditorEvent, HeaderToolbarEditorModal};
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
-use crate::workspace::tab_settings::TabCloseButtonPosition;
+use crate::workspace::tab_settings::{TabCloseButtonPosition, TitleBarPosition};
 use crate::workspace::view::build_plan_migration_modal::{
     BuildPlanMigrationModal, BuildPlanMigrationModalEvent,
 };
@@ -3450,6 +3450,7 @@ impl Workspace {
             TabSettingsChangedEvent::ShowIndicatorsButton { .. }
             | TabSettingsChangedEvent::NewTabPlacement { .. }
             | TabSettingsChangedEvent::TabCloseButtonPosition { .. }
+            | TabSettingsChangedEvent::TitleBarPosition { .. }
             | TabSettingsChangedEvent::PreserveActiveTabColor { .. } => {
                 self.sync_window_button_visibility(ctx);
                 ctx.notify();
@@ -6363,9 +6364,13 @@ impl Workspace {
             return;
         }
 
+        let title_bar_position = TabSettings::as_ref(ctx).title_bar_position;
         let position = ctx
             .element_position_by_id_at_last_frame(self.window_id, NEW_TAB_BUTTON_POSITION_ID)
-            .map(|position| position.lower_left())
+            .map(|position| match title_bar_position {
+                TitleBarPosition::Top => position.lower_left(),
+                TitleBarPosition::Bottom => position.origin(),
+            })
             .unwrap_or_else(Vector2F::zero);
         self.open_tab_configs_menu(
             position,
@@ -18134,6 +18139,7 @@ impl Workspace {
     fn render_tab_bar(
         &self,
         tab_fixed_width: Option<f32>,
+        title_bar_position: TitleBarPosition,
         appearance: &Appearance,
         ctx: &AppContext,
     ) -> Box<dyn Element> {
@@ -18152,7 +18158,12 @@ impl Workspace {
         .finish();
 
         let tab_bar_border =
-            Border::bottom(TAB_BAR_BORDER_HEIGHT).with_border_fill(appearance.theme().outline());
+            match title_bar_position {
+                TitleBarPosition::Top => Border::bottom(TAB_BAR_BORDER_HEIGHT)
+                    .with_border_fill(appearance.theme().outline()),
+                TitleBarPosition::Bottom => Border::top(TAB_BAR_BORDER_HEIGHT)
+                    .with_border_fill(appearance.theme().outline()),
+            };
 
         let mut tab_bar_container = Container::new(
             EventHandler::new(Clipped::new(self.render_tab_bar_hoverable(bar_contents)).finish())
@@ -18311,13 +18322,17 @@ impl Workspace {
             ))
             .build()
             .on_click(move |ctx, app, _| {
-                // We are positioning the menu to the lower-left corner of the new tab button.
-                // This gives the impression that both individual buttons are one big button.
+                // Position the menu on the title-bar side of the new tab button so the
+                // individual buttons still read as one big button.
                 if let Some(position) =
                     app.element_position_by_id_at_last_frame(window_id, NEW_TAB_BUTTON_POSITION_ID)
                 {
+                    let menu_position = match TabSettings::as_ref(app).title_bar_position {
+                        TitleBarPosition::Top => position.lower_left(),
+                        TitleBarPosition::Bottom => position.origin(),
+                    };
                     ctx.dispatch_typed_action(WorkspaceAction::ToggleNewSessionMenu {
-                        position: position.lower_left(),
+                        position: menu_position,
                         is_vertical_tabs: false,
                     });
                 }
@@ -22609,6 +22624,8 @@ impl View for Workspace {
         let appearance = Appearance::as_ref(app);
 
         let tab_bar_mode = self.tab_bar_mode(app);
+        let title_bar_position = TabSettings::as_ref(app).title_bar_position;
+        let title_bar_bottom = title_bar_position == TitleBarPosition::Bottom;
 
         // For WASM simplified tab bar views (lx-term Drive objects, shared sessions, conversation transcripts),
         // we render the tab bar outside of panels so that the details panel only affects content below the tab bar.
@@ -22625,24 +22642,50 @@ impl View for Workspace {
             // so that content being added/moved around in the workspace (for example the details panel being toggled)
             // does not affect the tab.
             let mut outer_column = Flex::column();
-            if tab_bar_mode == ShowTabBar::Stacked {
-                outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
+            if tab_bar_mode == ShowTabBar::Stacked && !title_bar_bottom {
+                outer_column.add_child(self.render_tab_bar(
+                    self.tab_fixed_width,
+                    title_bar_position,
+                    appearance,
+                    app,
+                ));
             }
             let content = self.render_banner_and_active_tab(app, appearance);
             // Hide the vertical tab rail for simplified WASM views (notebooks, shared sessions, etc.)
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), true);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
+            if tab_bar_mode == ShowTabBar::Stacked && title_bar_bottom {
+                outer_column.add_child(self.render_tab_bar(
+                    self.tab_fixed_width,
+                    title_bar_position,
+                    appearance,
+                    app,
+                ));
+            }
             Container::new(outer_column.finish())
                 .with_background(util::get_terminal_background_fill(self.window_id, app))
                 .finish()
         } else {
             let mut outer_column = Flex::column();
-            if tab_bar_mode == ShowTabBar::Stacked {
-                outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
+            if tab_bar_mode == ShowTabBar::Stacked && !title_bar_bottom {
+                outer_column.add_child(self.render_tab_bar(
+                    self.tab_fixed_width,
+                    title_bar_position,
+                    appearance,
+                    app,
+                ));
             }
             let content = self.render_banner_and_active_tab(app, appearance);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
+            if tab_bar_mode == ShowTabBar::Stacked && title_bar_bottom {
+                outer_column.add_child(self.render_tab_bar(
+                    self.tab_fixed_width,
+                    title_bar_position,
+                    appearance,
+                    app,
+                ));
+            }
             Container::new(outer_column.finish())
                 .with_background(util::get_terminal_background_fill(self.window_id, app))
                 .finish()
@@ -22819,13 +22862,17 @@ impl View for Workspace {
             ShowTabBar::Stacked => (), // The tab bar was rendered in the content column.
             ShowTabBar::Hidden => {
                 // Hide the tab bar, but include a hover area.
+                let (parent_anchor, child_anchor) = match title_bar_position {
+                    TitleBarPosition::Top => (ParentAnchor::TopLeft, ChildAnchor::TopLeft),
+                    TitleBarPosition::Bottom => (ParentAnchor::BottomLeft, ChildAnchor::BottomLeft),
+                };
                 stack.add_positioned_child(
                     self.render_tab_bar_hover_area(),
                     OffsetPositioning::offset_from_parent(
                         Vector2F::zero(),
                         ParentOffsetBounds::WindowByPosition,
-                        ParentAnchor::TopLeft,
-                        ChildAnchor::TopLeft,
+                        parent_anchor,
+                        child_anchor,
                     ),
                 );
             }
@@ -22941,6 +22988,10 @@ impl View for Workspace {
                 // context menu but a dropdown. Since it is quite wide, we need to reposition
                 // it so it does not render outside the bounds of the window.
                 let new_session_menu_position = self.show_new_session_dropdown_menu.unwrap();
+                let child_anchor = match title_bar_position {
+                    TitleBarPosition::Top => ChildAnchor::TopLeft,
+                    TitleBarPosition::Bottom => ChildAnchor::BottomLeft,
+                };
                 let bounds = if FeatureFlag::ShellSelector.is_enabled() {
                     ParentOffsetBounds::WindowByPosition
                 } else {
@@ -22952,7 +23003,7 @@ impl View for Workspace {
                         new_session_menu_position,
                         bounds,
                         ParentAnchor::TopLeft,
-                        ChildAnchor::TopLeft,
+                        child_anchor,
                     ),
                 );
             }

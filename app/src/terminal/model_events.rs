@@ -17,7 +17,7 @@ use warpui::SingletonEntity;
 use warpui::{Entity, ModelContext, ModelHandle};
 
 use super::event::SshLoginStatus;
-use super::model::ansi::{FinishUpdateValue, WarpificationUnavailableReason};
+use super::model::ansi::{EditFileValue, FinishUpdateValue, WarpificationUnavailableReason};
 use super::model::block::BlockId;
 use super::model::completions::ShellCompletion;
 use super::model::terminal_model::{ExitReason, TmuxControlModeContext, TmuxInstallationState};
@@ -280,6 +280,7 @@ impl ModelEventDispatcher {
             Event::HonorPS1OutOfSync => ModelEvent::HonorPS1OutOfSync,
             Event::Typeahead => ModelEvent::Typeahead,
             Event::FinishUpdate(data) => ModelEvent::FinishUpdate(data),
+            Event::EditFile(data) => ModelEvent::EditFile(data),
             Event::TextSelectionChanged => ModelEvent::SelectedTextChanged,
             Event::ShellSpawned(shell_type) => ModelEvent::ShellSpawned(shell_type),
             Event::SendCompletionsPrompt => ModelEvent::SendCompletionsPrompt,
@@ -452,6 +453,8 @@ pub enum ModelEvent {
     /// inaccessible to views/models.
     Handler(AnsiHandlerEvent),
     FinishUpdate(FinishUpdateValue),
+    /// See [`Event::EditFile`].
+    EditFile(EditFileValue),
     SelectedTextChanged,
     ShellSpawned(ShellType),
     CompletionsFinished(Vec<ShellCompletion>),

@@ -18,7 +18,7 @@ use crate::terminal::ClipboardType;
 use crate::util::AsciiDebug;
 
 use super::history::HistoryEntry;
-use super::model::ansi::{FinishUpdateValue, WarpificationUnavailableReason};
+use super::model::ansi::{EditFileValue, FinishUpdateValue, WarpificationUnavailableReason};
 use super::model::block::BlockId;
 use super::model::session::{SessionId, SessionInfo};
 use super::model::terminal_model::{BlockIndex, ExitReason, TmuxInstallationState};
@@ -130,6 +130,9 @@ pub enum Event {
     /// Emitted when the assisted auto-update has completed and we're ready to
     /// relaunch the app.
     FinishUpdate(FinishUpdateValue),
+    /// Emitted when `warp edit` asks for a file to be opened in Warp's built-in
+    /// editor on behalf of a tool that spawned it as `$EDITOR`.
+    EditFile(EditFileValue),
     TextSelectionChanged,
     ShellSpawned(ShellType),
     SendCompletionsPrompt,
@@ -474,6 +477,7 @@ impl Debug for Event {
                 )
             }
             Event::FinishUpdate(data) => write!(f, "FinishUpdate({})", data.update_id),
+            Event::EditFile(data) => write!(f, "EditFile({})", data.path.display()),
             Event::TextSelectionChanged => write!(f, "TextSelectionChanged"),
             Event::ShellSpawned(shell_type) => write!(f, "ShellSpawned({shell_type:?})"),
             Event::SendCompletionsPrompt => write!(f, "SendCompletionsPrompt"),

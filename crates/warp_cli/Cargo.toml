@@ -10,9 +10,13 @@ license.workspace = true
 chrono.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 cfg-if = { workspace = true }
+command.workspace = true
+hex.workspace = true
 humantime.workspace = true
+instant.workspace = true
 jaq-all.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true }
 warp_core = { path = "../warp_core" }
@@ -36,3 +40,4 @@ api_key_authentication = []
 
 [dev-dependencies]
 serial_test = "0.8.0"
+tempfile.workspace = true

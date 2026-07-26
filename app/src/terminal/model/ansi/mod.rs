@@ -636,6 +636,7 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
             }
             Ok(DProtoHook::TmuxInstallFailed { value }) => self.handler.tmux_install_failed(value),
             Ok(DProtoHook::ExitShell { value }) => self.handler.exit_shell(value),
+            Ok(DProtoHook::EditFile { value }) => self.handler.edit_file(value),
 
             Err(e) => safe_error!(
                 safe: ("Error when deserializing escape sequence data"),

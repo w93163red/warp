@@ -707,6 +707,14 @@ pub fn run() -> Result<()> {
                     computer_use_override,
                 });
             }
+            #[cfg(not(target_family = "wasm"))]
+            warp_cli::Command::Edit(edit_args) => {
+                // Deliberately handled before any app initialization: this runs
+                // as $EDITOR for another process, which is blocked waiting on
+                // us, so it must stay a thin shim over the shell hook.
+                let exit_code = warp_cli::edit::run(edit_args)?;
+                std::process::exit(exit_code);
+            }
             warp_cli::Command::DumpDebugInfo => {
                 return debug_dump::run();
             }
@@ -1769,6 +1777,8 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(|ctx| NotebookManager::new(notebooks, ctx));
     ctx.add_singleton_model(|_| CodeManager::default());
     ctx.add_singleton_model(|_| OpenedFilesModel::new());
+    #[cfg(feature = "local_fs")]
+    ctx.add_singleton_model(|_| code::pending_edit::PendingEditsModel::new());
     ctx.add_singleton_model(NotebookKeybindings::new);
     ctx.add_singleton_model(TerminalKeybindings::new);
     ctx.add_singleton_model(|_| ActiveSession::default());

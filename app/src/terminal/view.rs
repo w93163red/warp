@@ -528,6 +528,8 @@ use super::available_shells::AvailableShell;
 use super::block_list_viewport::FindMatchScrollLocation;
 use super::event::SshLoginStatus;
 use super::find::FindOptions;
+#[cfg(feature = "local_fs")]
+use super::model::ansi::EditFileValue;
 use super::model::ansi::{SystemDetails, WarpificationUnavailableReason};
 use super::model::block::{
     BlockSection, BlocklistEnvVarMetadata, LONG_RUNNING_COMMAND_DURATION_MS,
@@ -1739,6 +1741,10 @@ pub enum Event {
         source: CodeSource,
         layout: EditorLayout,
     },
+    /// Tell the pane group to open a file in the built-in editor on behalf of a
+    /// `warp edit` process that is blocking its caller until we are done.
+    #[cfg(feature = "local_fs")]
+    EditFileInWarp(EditFileValue),
     #[cfg(feature = "local_fs")]
     PreviewCodeInWarp {
         source: CodeSource,
@@ -11598,6 +11604,10 @@ impl TerminalView {
                 } else {
                     log::warn!("Got a FinishUpdate event with non-matching update id!");
                 }
+            }
+            ModelEvent::EditFile(_data) => {
+                #[cfg(feature = "local_fs")]
+                ctx.emit(Event::EditFileInWarp(_data.clone()));
             }
             ModelEvent::SelectedTextChanged => {
                 ctx.emit(Event::SelectedTextChanged);

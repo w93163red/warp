@@ -20,6 +20,8 @@ pub mod skill;
 pub mod agent;
 pub mod completions;
 pub mod config_file;
+#[cfg(not(target_family = "wasm"))]
+pub mod edit;
 pub mod environment;
 pub mod federate;
 pub mod harness_support;
@@ -565,6 +567,22 @@ pub enum Command {
         shell: Option<clap_complete::aot::Shell>,
     },
 
+    /// Open a file in Warp's built-in editor and wait until it is closed.
+    ///
+    /// Suitable for use as $EDITOR, $VISUAL, $KUBE_EDITOR or $GIT_EDITOR, so
+    /// that tools which shell out to an editor — `kubectl edit`, `git commit`,
+    /// `crontab -e` — edit in Warp instead of a terminal editor. Point it at
+    /// this binary; the name differs per release channel:
+    ///
+    ///     export KUBE_EDITOR="/path/to/this/binary edit"
+    ///
+    /// Outside a local Warp session (over SSH, or in another terminal) this
+    /// runs $WARP_EDIT_FALLBACK_EDITOR instead, so it is safe to export
+    /// unconditionally.
+    #[cfg(not(target_family = "wasm"))]
+    #[command(verbatim_doc_comment)]
+    Edit(crate::edit::EditArgs),
+
     /// Print debugging information and exit.
     #[clap(long_flag = "dump-debug-info")]
     DumpDebugInfo,
@@ -582,6 +600,10 @@ impl Command {
             Command::Worker(_) => false,
             Command::CommandLine(_) | Command::DumpDebugInfo => true,
             Command::Completions { .. } => true,
+            // Only writes diagnostics, but those go to stderr, and on Windows
+            // that still needs a console attached.
+            #[cfg(not(target_family = "wasm"))]
+            Command::Edit(_) => true,
             #[cfg(not(target_family = "wasm"))]
             Command::PrintTelemetryEvents => true,
         }

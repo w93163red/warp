@@ -107,6 +107,8 @@ mod icon;
 
 pub mod active_file;
 pub mod opened_files;
+#[cfg(feature = "local_fs")]
+pub mod pending_edit;
 pub use icon::icon_from_file_path;
 
 #[cfg_attr(not(target_family = "wasm"), path = "view.rs")]

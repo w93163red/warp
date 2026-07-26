@@ -275,6 +275,10 @@ pub trait Handler {
     /// Callback for the terminal to when user executes `clear` command.
     fn clear(&mut self, _data: ClearValue) {}
 
+    /// Callback emitted when `warp edit` is acting as the shell's `$EDITOR` and
+    /// a tool has asked for a file to be opened in Warp's built-in editor.
+    fn edit_file(&mut self, _data: EditFileValue) {}
+
     /// Callback for the terminal when the shell reports the current line editor
     /// input buffer (the reporting is itself triggered by Warp).
     fn input_buffer(&mut self, _data: InputBufferValue) {}

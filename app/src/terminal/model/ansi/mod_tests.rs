@@ -198,6 +198,11 @@ impl Handler for MockHandler {
         self.d_proto_hooks.push(DProtoHook::Clear { value: data });
     }
 
+    fn edit_file(&mut self, data: EditFileValue) {
+        self.d_proto_hooks
+            .push(DProtoHook::EditFile { value: data });
+    }
+
     fn input_buffer(&mut self, data: super::InputBufferValue) {
         self.d_proto_hooks
             .push(DProtoHook::InputBuffer { value: data })
@@ -734,6 +739,82 @@ fn parse_sourced_rc_file_hook_with_uname() {
                 tmux: None,
             }
         ),
+        _ => panic!("incorrect dcs value"),
+    }
+}
+
+/// The `EditFile` hook crosses a process boundary: `warp edit` builds it, and
+/// the terminal parses it. Building the bytes with the real sender rather than
+/// a literal is what makes this a contract test — renaming a field on either
+/// side fails here instead of silently hanging a user's `kubectl edit`.
+#[test]
+fn parse_edit_file_hook_emitted_by_warp_edit() {
+    let request = warp_cli::edit::EditRequest {
+        path: "/tmp/kubectl-edit-1234.yaml".to_owned(),
+        host: String::new(),
+        ack_path: "/tmp/warp-edit-abc.ack".to_owned(),
+        done_path: "/tmp/warp-edit-abc.done".to_owned(),
+        wait: true,
+    };
+
+    let (_, handler) = parse_bytes(request.escape_sequence().unwrap().as_bytes());
+
+    assert_eq!(handler.d_proto_hooks.len(), 1);
+    match handler.d_proto_hooks.first().unwrap() {
+        DProtoHook::EditFile { value } => assert_eq!(
+            *value,
+            EditFileValue {
+                path: PathBuf::from("/tmp/kubectl-edit-1234.yaml"),
+                host: String::new(),
+                ack_path: PathBuf::from("/tmp/warp-edit-abc.ack"),
+                done_path: PathBuf::from("/tmp/warp-edit-abc.done"),
+                wait: true,
+            }
+        ),
+        _ => panic!("incorrect dcs value"),
+    }
+}
+
+/// Paths are attacker-adjacent input: `kubectl edit` names its temp file, but
+/// the user names the directory it lives in.
+#[test]
+fn parse_edit_file_hook_with_a_path_containing_escape_characters() {
+    let hostile_path = "/tmp/we;ird\x07path\nwith\x1bescapes.yaml";
+    let request = warp_cli::edit::EditRequest {
+        path: hostile_path.to_owned(),
+        host: String::new(),
+        ack_path: "/tmp/warp-edit-abc.ack".to_owned(),
+        done_path: "/tmp/warp-edit-abc.done".to_owned(),
+        wait: true,
+    };
+
+    let (_, handler) = parse_bytes(request.escape_sequence().unwrap().as_bytes());
+
+    assert_eq!(handler.d_proto_hooks.len(), 1);
+    match handler.d_proto_hooks.first().unwrap() {
+        DProtoHook::EditFile { value } => {
+            assert_eq!(value.path, PathBuf::from(hostile_path));
+        }
+        _ => panic!("incorrect dcs value"),
+    }
+}
+
+/// `warp edit --no-wait` opens the file without blocking its caller, so nothing
+/// should be waiting on the done marker afterwards.
+#[test]
+fn parse_edit_file_hook_from_a_caller_that_is_not_waiting() {
+    let request = warp_cli::edit::EditRequest {
+        path: "/tmp/notes.md".to_owned(),
+        host: String::new(),
+        ack_path: "/tmp/warp-edit-abc.ack".to_owned(),
+        done_path: "/tmp/warp-edit-abc.done".to_owned(),
+        wait: false,
+    };
+
+    let (_, handler) = parse_bytes(request.escape_sequence().unwrap().as_bytes());
+
+    match handler.d_proto_hooks.first().unwrap() {
+        DProtoHook::EditFile { value } => assert!(!value.wait),
         _ => panic!("incorrect dcs value"),
     }
 }

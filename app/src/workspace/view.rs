@@ -126,7 +126,12 @@ use crate::util::file::external_editor::Editor;
 use crate::util::file::external_editor::EditorSettings;
 use crate::util::openable_file_type::FileTarget;
 #[cfg(feature = "local_fs")]
-use crate::util::openable_file_type::{resolve_file_target_with_editor_choice, EditorLayout};
+use crate::util::openable_file_type::{
+    is_file_openable_in_warp, resolve_file_target_with_editor_choice, EditorLayout,
+};
+
+#[cfg(feature = "local_fs")]
+use crate::{code::pending_edit::PendingEditsModel, terminal::model::ansi::EditFileValue};
 
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{plugin_manager_for, PluginModalKind};
@@ -5899,6 +5904,104 @@ impl Workspace {
             FileTarget::SystemGeneric => {
                 ctx.open_file_path(&path);
             }
+        }
+    }
+
+    /// Opens a file in the built-in code editor on behalf of a `warp edit`
+    /// process that a tool spawned as its `$EDITOR`.
+    ///
+    /// That process — and with it `kubectl edit`, `git commit`, or whatever
+    /// else is waiting on the editor — stays blocked until the editor tab is
+    /// closed. Every path out of this function therefore has to either open the
+    /// file or complete the edit; leaving neither done hangs the user's shell.
+    #[cfg(feature = "local_fs")]
+    fn edit_file_for_external_tool(&mut self, value: EditFileValue, ctx: &mut ViewContext<Self>) {
+        // Acknowledge first. Until this lands, `warp edit` is still willing to
+        // fall back to a real editor, which is what we want it to do if we
+        // cannot service the request at all.
+        if let Err(err) = std::fs::write(&value.ack_path, "") {
+            log::error!(
+                "Failed to acknowledge external edit of {}: {err:#}",
+                value.path.display()
+            );
+            return;
+        }
+
+        // Only files on this machine can be opened; `warp edit` does not emit
+        // the hook from remote sessions, so this is a malformed request rather
+        // than an expected case.
+        if !value.host.is_empty() {
+            log::warn!(
+                "Ignoring external edit request for a file on host {:?}",
+                value.host
+            );
+            self.complete_external_edit_immediately(&value);
+            return;
+        }
+
+        if !value.path.is_file() {
+            log::warn!(
+                "Ignoring external edit request for {}, which is not a file",
+                value.path.display()
+            );
+            self.complete_external_edit_immediately(&value);
+            return;
+        }
+
+        // Binary files have no useful representation in the editor. Completing
+        // the edit leaves the file untouched, which tools read as "cancelled".
+        if is_file_openable_in_warp(&value.path).is_none() {
+            log::warn!(
+                "Ignoring external edit request for {}, which cannot be opened in Warp",
+                value.path.display()
+            );
+            self.complete_external_edit_immediately(&value);
+            return;
+        }
+
+        let path = value.path.clone();
+
+        // Held until the editor tab has had its chance to claim it. If no tab
+        // does, dropping this completes the edit rather than stranding the
+        // caller. When the caller is not waiting there is nothing to complete,
+        // so the file is simply opened.
+        let pending = value.wait.then(|| {
+            PendingEditsModel::handle(ctx).update(ctx, |pending_edits, _ctx| {
+                pending_edits.register(path.clone(), value.done_path.clone())
+            })
+        });
+
+        let layout = *EditorSettings::as_ref(ctx).open_file_layout.value();
+        self.open_file_with_target(
+            path.clone(),
+            // Forced rather than resolved from settings: the request only makes
+            // sense if it opens in Warp, and honoring an external-editor
+            // preference here would mean handing the file to a second editor
+            // while the first is still waiting on it.
+            FileTarget::CodeEditor(layout),
+            None, /*line_col*/
+            CodeSource::Link {
+                path: path.clone(),
+                range_start: None,
+                range_end: None,
+            },
+            ctx,
+        );
+
+        if pending.is_some() {
+            PendingEditsModel::handle(ctx).update(ctx, |pending_edits, _ctx| {
+                pending_edits.forget(&path);
+            });
+        }
+        drop(pending);
+    }
+
+    /// Unblocks the waiting `warp edit` process without opening anything,
+    /// leaving the file untouched so the calling tool treats it as cancelled.
+    #[cfg(feature = "local_fs")]
+    fn complete_external_edit_immediately(&mut self, value: &EditFileValue) {
+        if value.wait {
+            crate::code::pending_edit::complete_edit(&value.done_path);
         }
     }
 
@@ -13613,6 +13716,10 @@ impl Workspace {
                     let layout = *EditorSettings::as_ref(ctx).open_file_layout.value();
                     self.open_file_notebook(path.clone(), Some(session.clone()), layout, ctx);
                 }
+            }
+            #[cfg(feature = "local_fs")]
+            pane_group::Event::EditFileInWarp(value) => {
+                self.edit_file_for_external_tool(value.clone(), ctx);
             }
             pane_group::Event::MoveToSpace {
                 cloud_object_type_and_id,

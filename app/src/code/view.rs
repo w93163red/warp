@@ -3,6 +3,8 @@ use crate::code::editor::view::CodeEditorRenderOptions;
 use crate::code::editor_management::CodeEditorStatus;
 use crate::code::global_buffer_model::GlobalBufferModel;
 use crate::code::local_code_editor::ShowFindReferencesCard;
+#[cfg(feature = "local_fs")]
+use crate::code::pending_edit::{PendingEditSession, PendingEditsModel};
 use crate::code::{ImmediateSaveError, SaveOutcome, SaveStatus};
 use crate::editor::InteractionState;
 use crate::input::Vector2F;
@@ -28,6 +30,8 @@ use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::vec2f;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "local_fs")]
+use std::sync::Arc;
 use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
@@ -216,6 +220,15 @@ pub struct TabData {
     editor_view: ViewHandle<LocalCodeEditorView>,
     mouse_state_handles: TabDataMouseStateHandles,
     preview: bool,
+    /// Set when this tab was opened by `warp edit` on behalf of a tool that is
+    /// blocked waiting on it, e.g. `kubectl edit`.
+    ///
+    /// The caller is unblocked when this is dropped, which is to say when the
+    /// tab goes away, however it goes away. It is shared rather than owned so
+    /// that cloning a tab — dragging it to another pane — does not read as the
+    /// user being finished with the file.
+    #[cfg(feature = "local_fs")]
+    pending_edit: Option<Arc<PendingEditSession>>,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +615,8 @@ impl CodeView {
             editor_view: code_editor,
             mouse_state_handles: Default::default(),
             preview,
+            #[cfg(feature = "local_fs")]
+            pending_edit: None,
         }
     }
 
@@ -719,10 +734,42 @@ impl CodeView {
             if let Some(line_col) = line_col {
                 self.jump_to_line_col_in_tab(existing_index, line_col, ctx);
             }
+            #[cfg(feature = "local_fs")]
+            self.claim_pending_edit(existing_index, ctx);
             return;
         }
 
         self.open_new_tab_for_path(path, line_col, ctx);
+    }
+
+    /// Takes ownership of the pending `warp edit` request for this tab's file,
+    /// if one is waiting.
+    ///
+    /// Called for every file opened in the editor; all but the handful that
+    /// came from `warp edit` find nothing to claim.
+    #[cfg(feature = "local_fs")]
+    fn claim_pending_edit(&mut self, tab_index: usize, ctx: &mut ViewContext<Self>) {
+        let Some(path) = self
+            .tab_group
+            .get(tab_index)
+            .and_then(|tab| tab.path.clone())
+        else {
+            return;
+        };
+
+        let claimed = PendingEditsModel::handle(ctx)
+            .update(ctx, |pending_edits, _ctx| pending_edits.claim(&path));
+
+        let Some(session) = claimed else {
+            return;
+        };
+
+        if let Some(tab) = self.tab_group.get_mut(tab_index) {
+            // Replacing an existing session here would complete that earlier
+            // edit, which is correct: the same file cannot be under two
+            // simultaneous edits in one tab.
+            tab.pending_edit = Some(session);
+        }
     }
 
     fn focus_existing_tab_if_present(
@@ -793,6 +840,9 @@ impl CodeView {
                 editor.set_pending_scroll(scroll_position, ctx);
             });
         }
+
+        #[cfg(feature = "local_fs")]
+        self.claim_pending_edit(active_tab_index, ctx);
 
         self.set_active_tab_index(active_tab_index, ctx);
     }

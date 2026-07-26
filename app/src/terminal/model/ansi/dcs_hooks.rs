@@ -82,6 +82,9 @@ pub(super) enum DProtoHook {
     ExitShell {
         value: ExitShellValue,
     },
+    EditFile {
+        value: EditFileValue,
+    },
 }
 
 impl DProtoHook {
@@ -106,6 +109,7 @@ impl DProtoHook {
             DProtoHook::SshTmuxInstaller { .. } => "SshTmuxInstaller",
             DProtoHook::TmuxInstallFailed { .. } => "TmuxInstallFailed",
             DProtoHook::ExitShell { .. } => "ExitShell",
+            DProtoHook::EditFile { .. } => "EditFile",
         }
     }
 
@@ -687,6 +691,43 @@ pub struct FinishUpdateValue {
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ExitShellValue {
     pub session_id: SessionId,
+}
+
+/// Received from the pty when `warp edit` is used as the shell's `$EDITOR` (or
+/// `$KUBE_EDITOR`, `$GIT_EDITOR`, ...) and a tool has spawned it to edit a file.
+///
+/// The `warp edit` process stays blocked until Warp writes [`Self::done_path`],
+/// which is what makes the calling tool — `kubectl edit`, say — wait for the
+/// user to finish before reading the file back.
+///
+/// Field names must stay in sync with `HookPayload` in
+/// `crates/warp_cli/src/edit.rs`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EditFileValue {
+    /// Absolute path of the file to open.
+    pub path: PathBuf,
+
+    /// Host the file lives on, or empty for the machine running this client.
+    ///
+    /// Always empty today: only local sessions emit this hook, since the
+    /// built-in editor cannot reach a remote filesystem. Remote sessions can
+    /// start populating it without a wire format change.
+    #[serde(default)]
+    pub host: String,
+
+    /// Marker file to create as soon as the request has been accepted.
+    ///
+    /// Its absence is how `warp edit` detects that nothing is listening and
+    /// falls back to a real editor rather than blocking forever.
+    pub ack_path: PathBuf,
+
+    /// Marker file to create once the user is done editing. Its contents are
+    /// the exit code `warp edit` should report to the calling tool.
+    pub done_path: PathBuf,
+
+    /// Whether the caller is blocked waiting for the edit to finish.
+    #[serde(default)]
+    pub wait: bool,
 }
 
 /// Custom serde deserializer that trims trailing null bytes.

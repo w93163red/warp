@@ -544,6 +544,10 @@ pub enum Event {
         /// The session that the path was opened from.
         session: Arc<Session>,
     },
+    /// Tell the workspace to open a file in the built-in editor on behalf of a
+    /// blocked `warp edit` process.
+    #[cfg(feature = "local_fs")]
+    EditFileInWarp(crate::terminal::model::ansi::EditFileValue),
     OpenWarpDriveLink {
         open_warp_drive_args: OpenWarpDriveObjectArgs,
     },

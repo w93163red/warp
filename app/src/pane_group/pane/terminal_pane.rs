@@ -814,6 +814,10 @@ fn handle_terminal_view_event(
                 });
             }
             #[cfg(feature = "local_fs")]
+            Event::EditFileInWarp(value) => {
+                ctx.emit(pane_group::Event::EditFileInWarp(value.clone()));
+            }
+            #[cfg(feature = "local_fs")]
             Event::PreviewCodeInWarp { source } => {
                 ctx.emit(pane_group::Event::PreviewCodeInWarp {
                     source: source.clone(),

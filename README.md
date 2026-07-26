@@ -1,97 +1,116 @@
-<a href="https://www.warp.dev">
-    <img width="1024" alt="Warp Agentic Development Environment product preview" src="https://github.com/user-attachments/assets/9976b2da-2edd-4604-a36c-8fd53719c6d4" />
-</a>
-&nbsp;
-<p align="center">
-  <a href="https://www.warp.dev"><img height="20" alt="Built with Warp" src="https://raw.githubusercontent.com/warpdotdev/brand-assets/main/Github/Built-With-Warp-Export@2x.png" /></a>
-</p>
+# lx-term
 
-<p align="center">
-  <a href="https://www.warp.dev">Website</a>
-  ·
-  <a href="https://www.warp.dev/code">Code</a>
-  ·
-  <a href="https://www.warp.dev/agents">Agents</a>
-  ·
-  <a href="https://www.warp.dev/terminal">Terminal</a>
-  ·
-  <a href="https://www.warp.dev/drive">Drive</a>
-  ·
-  <a href="https://docs.warp.dev">Docs</a>
-  ·
-  <a href="https://www.warp.dev/blog/how-warp-works">How Warp Works</a>
-</p>
+A privacy-focused fork of the [Warp](https://www.warp.dev) terminal, with the
+telemetry, crash reporting, auto-update, and account-login paths removed, and a
+handful of local quality-of-life features added on top.
+
+Everything that makes Warp a good terminal is still here — the block-based
+terminal, the built-in code editor with LSP support, panes and tabs, themes,
+workflows, and detection of the CLI agents you run yourself (Claude Code, Codex,
+Gemini CLI, and others). What is gone is everything that phoned home.
 
 > [!NOTE]
-> OpenAI is the founding sponsor of the new, open-source Warp repository, and the new agentic management workflows are powered by GPT models.
+> This is an independent fork, not affiliated with or supported by Warp. Report
+> issues here, not to the Warp team. Upstream lives at
+> [warpdotdev/warp](https://github.com/warpdotdev/warp).
 
-<h1></h1>
+## What's different from upstream
 
-## About
+### Nothing phones home
 
-[Warp](https://www.warp.dev) is an agentic development environment, born out of the terminal. Use Warp's built-in coding agent, or bring your own CLI agent (Claude Code, Codex, Gemini CLI, and others).
+- **Telemetry is hard-disabled.** `warpui::telemetry::telemetry_collection_enabled()`
+  returns `false`, and every send, batch, queue-to-disk, and flush path in
+  `app/src/server/telemetry/` checks it before doing anything. Queued events are
+  dropped rather than written out.
+- **Crash reporting is hard-disabled.** Sentry is never initialized, regardless
+  of the `CrashReporting` feature flag.
+- **Auto-update polling is disabled.** The client never asks the update server
+  what version it should be running. Update by rebuilding.
 
-## Installation
+### No account, no cloud
 
-You can [download Warp](https://www.warp.dev/download) and [read our docs](https://docs.warp.dev/) for platform-specific instructions.
+Credentials are never loaded — not from secure storage, not from a baked-in
+`WARP_USER_SECRET`, and not from `--api-key` (which is accepted and ignored so
+scripts don't break). The client runs permanently logged out, so cloud features
+that require a Warp account — Warp Drive sync, cloud agents, the hosted AI
+agent — are unavailable. Local CLI agents you launch yourself are unaffected.
 
-## Warp Contributions Overview Dashboard
+### Renamed
 
-Explore [build.warp.dev](https://build.warp.dev) to:
-- Follow project activity, contributors, and in-flight features
-- View top contributors and in-flight features
-- Track your own issues with GitHub sign-in
-- Click into active agent sessions in a web-compiled Warp terminal
+The OSS binary, process name, and macOS bundle are `lx-term`; logs go to
+`lx-term.log`. UI strings that named the product have been rebranded, and the
+bundled `oz-platform` skill and Oz agent defaults are removed.
 
-## Licensing
+### Added: edit files in the built-in editor from any tool
 
-Warp's UI framework (the `warpui_core` and `warpui` crates) are licensed under the [MIT license](LICENSE-MIT).
-
-The rest of the code in this repository is licensed under the [AGPL v3](LICENSE-AGPL).
-
-## Open Source & Contributing
-
-Warp's client codebase is open source and lives in this repository. We welcome community contributions and have designed a lightweight workflow to help new contributors get started. For the full contribution flow, read our [CONTRIBUTING.md](CONTRIBUTING.md) guide.
-
-> [!TIP]
-> **Chat with contributors and the Warp team** in the [`#oss-contributors`](https://warpcommunity.slack.com/archives/C0B0LM8N4DB) Slack channel — a good place for ad-hoc questions, design discussion, and pairing with maintainers. New here? [Join the Warp Slack community](https://go.warp.dev/join-preview) first, then jump into `#oss-contributors`.
-
-### Issue to PR
-
-Before filing, [search existing issues](https://github.com/warpdotdev/warp/issues?q=is%3Aissue+is%3Aopen+sort%3Areactions-%2B1-desc) for your bug or feature request. If nothing exists, [file an issue](https://github.com/warpdotdev/warp/issues/new/choose) using our templates. Security vulnerabilities should be reported privately as described in [CONTRIBUTING.md](CONTRIBUTING.md#reporting-security-issues).
-
-Once filed, a Warp maintainer reviews the issue and may apply a readiness label: [`ready-to-spec`](https://github.com/warpdotdev/warp/issues?q=is%3Aissue+is%3Aopen+label%3Aready-to-spec) signals the design is open for contributors to spec out, and [`ready-to-implement`](https://github.com/warpdotdev/warp/issues?q=is%3Aissue+is%3Aopen+label%3Aready-to-implement) signals the design is settled and code PRs are welcome. Anyone can pick up a labeled issue — mention **@oss-maintainers** on an issue if you'd like it considered for a readiness label.
-
-### Building the Repo Locally
-
-To build and run Warp from source:
+`lx-term edit` is a blocking editor shim, so tools that shell out to `$EDITOR`
+open the file in lx-term's own code editor instead of a terminal editor:
 
 ```bash
-./script/bootstrap   # platform-specific setup
-./script/run         # build and run Warp
+export KUBE_EDITOR="/path/to/lx-term edit"
+kubectl edit cm/some-config
+```
+
+The file opens in a split pane next to the still-blocked terminal. Save it and
+close the editor tab, and the waiting tool reads the file back and applies it.
+Works the same for `EDITOR`, `VISUAL`, and `GIT_EDITOR`.
+
+Outside a local lx-term session — over SSH, or in another terminal — it runs
+`$WARP_EDIT_FALLBACK_EDITOR` instead (defaulting to `vi`), so it is safe to
+export unconditionally. Pass `--no-wait` to open a file without blocking.
+
+### Added: title bar position
+
+`appearance.tabs.title_bar_position` moves the title bar to the `bottom` of the
+window instead of the `top`. Configurable from Settings → Appearance.
+
+## Building
+
+lx-term builds on macOS, Linux, and Windows.
+
+```bash
+./script/bootstrap   # platform-specific setup — installs build dependencies
+./script/run         # build and run
 ./script/presubmit   # fmt, clippy, and tests
 ```
 
-See [WARP.md](WARP.md) for the full engineering guide, including coding style, testing, and platform-specific notes.
+On Linux and Windows `./script/run` invokes `cargo run --bin lx-term`; on macOS
+it builds and launches a real `.app` bundle.
 
-## Joining the Team
+`./script/bootstrap` installs the native build dependencies, including `protoc`
+(needed by the remote-server crate) and the platform's development headers. If
+you skip it, expect build-script failures rather than compile errors.
 
-Interested in joining the team? See our [open roles](https://www.warp.dev/careers).
+`./script/test_edit_e2e.py target/debug/lx-term` exercises the `lx-term edit`
+shim end to end on a real pty, standing in for the client, so the blocking
+contract can be checked without a GUI.
 
-## Support and Questions
+See [WARP.md](WARP.md) for the full engineering guide — coding style, testing,
+and platform-specific notes.
 
-1. See our [docs](https://docs.warp.dev/) for a comprehensive guide to Warp's features.
-2. Join our [Slack Community](https://go.warp.dev/join-preview) to connect with other users and get help from the Warp team — contributors hang out in [`#oss-contributors`](https://warpcommunity.slack.com/archives/C0B0LM8N4DB).
-3. Try our [Preview build](https://www.warp.dev/download-preview) to test the latest experimental features.
-4. Mention **@oss-maintainers** on any issue to escalate to the team — for example, if you encounter problems with the automated agents.
+## Licensing
+
+The `warpui_core` and `warpui` crates are licensed under the
+[MIT license](LICENSE-MIT). The rest of the code in this repository is licensed
+under the [AGPL v3](LICENSE-AGPL). This fork does not change either license.
+
+## Upstream
+
+This fork tracks [warpdotdev/warp](https://github.com/warpdotdev/warp).
+Contributions that aren't specific to the changes above are usually better sent
+upstream — see their [CONTRIBUTING.md](CONTRIBUTING.md). Warp's own
+[docs](https://docs.warp.dev/) remain the reference for features this fork
+inherits unchanged.
 
 ## Code of Conduct
 
-We ask everyone to be respectful and empathetic. Warp follows the [Code of Conduct](CODE_OF_CONDUCT.md). To report violations, email warp-coc at warp.dev.
+We ask everyone to be respectful and empathetic; this repository follows the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Open Source Dependencies
 
-We'd like to call out a few of the [open source dependencies](https://docs.warp.dev/help/licenses) that have helped Warp to get off the ground:
+A few of the [open source dependencies](https://docs.warp.dev/help/licenses)
+this project is built on:
 
 - [Tokio](https://github.com/tokio-rs/tokio)
 - [NuShell](https://github.com/nushell/nushell)

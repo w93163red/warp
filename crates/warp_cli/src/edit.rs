@@ -31,7 +31,7 @@
 use std::{
     ffi::OsString,
     fs,
-    io::Write as _,
+    io::{IsTerminal as _, Read, Write as _},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -62,9 +62,14 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the marker files are checked.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Path argument that means "the contents are piped in on stdin" rather than
+/// naming a file, following the convention of `code -`, `vim -` and friends.
+const STDIN_PATH: &str = "-";
+
 #[derive(Debug, Clone, clap::Args)]
 pub struct EditArgs {
-    /// Path of the file to open in Warp's built-in editor.
+    /// Path of the file to open in Warp's built-in editor, or `-` to open what
+    /// is piped in on stdin (`kubectl get pods | warp edit -`).
     pub path: PathBuf,
 
     /// Return as soon as the file is opened instead of waiting for the editor
@@ -82,12 +87,24 @@ pub struct EditArgs {
 /// assume `Ok(())` means the file was edited, since a non-zero code is how a
 /// cancelled edit is reported to the calling tool.
 pub fn run(args: &EditArgs) -> Result<i32> {
-    let path = absolute_path(&args.path)
-        .with_context(|| format!("failed to resolve path {}", args.path.display()))?;
+    let input = if args.path.as_os_str() == STDIN_PATH {
+        EditInput::Stdin(stdin_to_temp_file()?)
+    } else {
+        EditInput::File(
+            absolute_path(&args.path)
+                .with_context(|| format!("failed to resolve path {}", args.path.display()))?,
+        )
+    };
+    let path = input.path();
 
     if !in_warp_local_session() {
-        return run_fallback_editor(&path);
+        return run_fallback_editor(path, &input);
     }
+
+    // Piped input has no calling tool waiting to read the file back, and the
+    // shell is holding up the rest of the pipeline until we exit, so there is
+    // nothing to block for. `code -` behaves the same way.
+    let wait = !args.no_wait && !input.is_stdin();
 
     let markers = MarkerPaths::new();
     let request = EditRequest {
@@ -98,21 +115,21 @@ pub fn run(args: &EditArgs) -> Result<i32> {
         host: String::new(),
         ack_path: markers.ack.to_string_lossy().into_owned(),
         done_path: markers.done.to_string_lossy().into_owned(),
-        wait: !args.no_wait,
+        wait,
     };
 
     if let Err(err) = write_hook_to_terminal(&request) {
         log_fallback(&format!("could not reach the terminal ({err:#})"));
-        return run_fallback_editor(&path);
+        return run_fallback_editor(path, &input);
     }
 
     if !wait_for_marker(&markers.ack, Some(ACK_TIMEOUT)) {
         log_fallback("Warp did not respond");
-        return run_fallback_editor(&path);
+        return run_fallback_editor(path, &input);
     }
     let _ = fs::remove_file(&markers.ack);
 
-    if args.no_wait {
+    if !wait {
         let _ = fs::remove_file(&markers.done);
         return Ok(0);
     }
@@ -125,6 +142,59 @@ pub fn run(args: &EditArgs) -> Result<i32> {
     let _ = fs::remove_file(&markers.done);
 
     Ok(exit_code)
+}
+
+/// Where the contents being edited came from.
+enum EditInput {
+    /// A file the caller named, which is what tools using us as `$EDITOR` do.
+    File(PathBuf),
+    /// Data piped in on stdin, spooled to this temporary file.
+    Stdin(PathBuf),
+}
+
+impl EditInput {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(path) | Self::Stdin(path) => path,
+        }
+    }
+
+    fn is_stdin(&self) -> bool {
+        matches!(self, Self::Stdin(_))
+    }
+}
+
+/// Spools stdin into a temporary file, since the editor opens paths rather than
+/// streams.
+///
+/// The file is deliberately left behind. Nothing waits for the editor to be
+/// closed in this mode, so there is no point at which deleting it would be safe,
+/// and the buffer stays attached to it for saving. It goes in the system temp
+/// directory, which the OS cleans on its own schedule.
+fn stdin_to_temp_file() -> Result<PathBuf> {
+    if std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "'-' means read the contents from stdin, but stdin is a terminal; \
+             pipe something in, e.g. `kubectl get pods | warp edit -`"
+        ));
+    }
+
+    spool_to_temp_file(&mut std::io::stdin().lock())
+}
+
+/// Reads `reader` to the end and writes it to a fresh file in the temp
+/// directory, returning that path.
+fn spool_to_temp_file(reader: &mut impl Read) -> Result<PathBuf> {
+    let mut contents = Vec::new();
+    reader
+        .read_to_end(&mut contents)
+        .context("failed to read stdin")?;
+
+    let path = std::env::temp_dir().join(format!("warp-stdin-{}.txt", uuid::Uuid::new_v4()));
+    fs::write(&path, contents)
+        .with_context(|| format!("failed to write stdin to {}", path.display()))?;
+
+    Ok(path)
 }
 
 /// The payload of the `EditFile` shell hook.
@@ -222,6 +292,23 @@ fn open_controlling_terminal() -> Result<fs::File> {
     Err(anyhow!("no controlling terminal on this platform"))
 }
 
+/// Opens the controlling terminal for reading, to give a fallback editor a
+/// usable stdin when ours was a pipe.
+#[cfg(unix)]
+fn open_controlling_terminal_for_read() -> Result<fs::File> {
+    fs::File::open("/dev/tty").context("failed to open /dev/tty")
+}
+
+#[cfg(windows)]
+fn open_controlling_terminal_for_read() -> Result<fs::File> {
+    fs::File::open("CONIN$").context("failed to open CONIN$")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_controlling_terminal_for_read() -> Result<fs::File> {
+    Err(anyhow!("no controlling terminal on this platform"))
+}
+
 /// Blocks until `marker` exists, giving up after `timeout` if one is given.
 ///
 /// Returns whether the marker appeared.
@@ -261,7 +348,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 ///
 /// This is what makes `EDITOR="warp edit"` safe to set unconditionally: outside
 /// a Warp session we behave like whatever editor the user actually wanted.
-fn run_fallback_editor(path: &Path) -> Result<i32> {
+fn run_fallback_editor(path: &Path, input: &EditInput) -> Result<i32> {
     let editor = fallback_editor();
 
     // The variable holds a command line, not a bare program name ("code -w",
@@ -272,9 +359,24 @@ fn run_fallback_editor(path: &Path) -> Result<i32> {
         .ok_or_else(|| anyhow!("no fallback editor to run; check ${FALLBACK_EDITOR_ENV}"))?;
     let program_args: Vec<OsString> = parts.map(OsString::from).collect();
 
-    let status = command::blocking::Command::new(program)
-        .args(&program_args)
-        .arg(path)
+    let mut command = command::blocking::Command::new(program);
+    command.args(&program_args).arg(path);
+
+    // Our stdin is the pipe the contents came from, and it is at EOF. Handing
+    // that to a terminal editor would leave it unable to read the user's
+    // keystrokes, so point the child at the terminal instead.
+    if input.is_stdin() {
+        match open_controlling_terminal_for_read() {
+            Ok(terminal) => {
+                command.stdin(terminal);
+            }
+            Err(err) => {
+                eprintln!("warp edit: could not reattach stdin to the terminal ({err:#})");
+            }
+        }
+    }
+
+    let status = command
         .status()
         .with_context(|| format!("failed to run fallback editor {program:?}"))?;
 

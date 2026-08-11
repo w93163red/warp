@@ -154,3 +154,48 @@ fn absolute_paths_are_left_alone() {
 
     assert_eq!(absolute_path(&path).expect("resolves"), path);
 }
+
+#[test]
+fn piped_input_is_spooled_to_a_file_byte_for_byte() {
+    // Bytes a line-oriented copy would mangle: no trailing newline, a CR, and
+    // something non-UTF-8.
+    let contents: &[u8] = b"NAME READY\r\npod-a 1/1\xff";
+
+    let path = spool_to_temp_file(&mut &contents[..]).expect("spools");
+
+    assert_eq!(fs::read(&path).expect("readable"), contents);
+    fs::remove_file(&path).expect("cleanup");
+}
+
+#[test]
+fn each_spool_gets_its_own_file() {
+    let first = spool_to_temp_file(&mut &b"one"[..]).expect("spools");
+    let second = spool_to_temp_file(&mut &b"two"[..]).expect("spools");
+
+    assert_ne!(first, second);
+    assert_eq!(fs::read(&first).expect("readable"), b"one");
+    assert_eq!(fs::read(&second).expect("readable"), b"two");
+
+    fs::remove_file(&first).expect("cleanup");
+    fs::remove_file(&second).expect("cleanup");
+}
+
+#[test]
+fn empty_input_still_produces_a_file_to_open() {
+    let path = spool_to_temp_file(&mut &b""[..]).expect("spools");
+
+    assert!(path.is_file());
+    assert_eq!(fs::read(&path).expect("readable"), b"");
+    fs::remove_file(&path).expect("cleanup");
+}
+
+#[test]
+fn stdin_input_reports_itself_so_the_caller_is_not_blocked() {
+    let stdin = EditInput::Stdin(PathBuf::from("/tmp/warp-stdin-abc.txt"));
+    let file = EditInput::File(PathBuf::from("/tmp/resource.yaml"));
+
+    assert!(stdin.is_stdin());
+    assert!(!file.is_stdin());
+    assert_eq!(stdin.path(), Path::new("/tmp/warp-stdin-abc.txt"));
+    assert_eq!(file.path(), Path::new("/tmp/resource.yaml"));
+}

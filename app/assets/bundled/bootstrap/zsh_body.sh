@@ -643,6 +643,19 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
   #
   # The widget is looked up at invocation time rather than at bootstrap, so bindings
   # added later by the user's rc files or by a plugin manager are still picked up.
+  #
+  # The widget runs bracketed by the same preexec/precmd hooks a real command emits.
+  # Widgets worth binding are usually full-screen programs, and Warp only routes
+  # output to the alt screen -- and only forwards keystrokes to the program instead
+  # of to its own input editor -- while a block is actually running. A widget invoked
+  # from ZLE emits no preexec of its own, so without this its drawing lands in the
+  # background-output path meant for typeahead and comes out garbled. This is the
+  # same lifecycle any full-screen command goes through.
+  #
+  # Closing the block with warp_precmd also re-reports the working directory, which
+  # is how a directory change made inside the widget (yazi's `y`) gets picked up:
+  # precmd would otherwise not run again until the next real command.
+  #
   # Afterwards the buffer the widget left behind is reported back through the same
   # InputBuffer hook used for typeahead, which is what moves a command selected in
   # e.g. atuin into Warp's input editor.
@@ -652,9 +665,14 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
     read -k 1 key || return
     binding=$(bindkey -- "$key" 2>/dev/null)
     widget="${binding##* }"
-    if [[ -n "$widget" && "$widget" != "undefined-key" ]]; then
-      zle "$widget"
+    if [[ -z "$widget" || "$widget" == "undefined-key" ]]; then
+      warp_report_input
+      return
     fi
+
+    warp_preexec "$widget"
+    zle "$widget"
+    warp_precmd
     warp_report_input
   }
   zle -N warp_run_bound_widget

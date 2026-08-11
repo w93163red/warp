@@ -7905,6 +7905,20 @@ impl TerminalView {
         ctx.notify();
     }
 
+    /// Asks the shell to run the widget the user has bound to `key_byte` in their own config.
+    ///
+    /// The shell side of this is `warp_run_bound_widget` in the bootstrap script, bound to ESC-k:
+    /// it reads the key byte written after that prefix, looks up the widget bound to it, runs it,
+    /// and reports the buffer the widget left behind back through the `InputBuffer` hook. Warp's
+    /// usual typeahead path then moves that buffer into the input editor, which is what makes a
+    /// command picked in e.g. atuin land in the input.
+    ///
+    /// The write goes through the normal queue, so it waits for the shell's line editor to be
+    /// active instead of landing in the middle of a running program.
+    fn run_bound_shell_widget(&mut self, key_byte: u8, ctx: &mut ViewContext<Self>) {
+        self.write_to_pty(vec![escape_sequences::C0::ESC, b'k', key_byte], ctx);
+    }
+
     pub(crate) fn write_to_pty<B: Into<Cow<'static, [u8]>>>(
         &mut self,
         data: B,
@@ -20496,6 +20510,9 @@ impl TerminalView {
             }
             InputEvent::CtrlD => {
                 ctx.emit(Event::CtrlD);
+            }
+            InputEvent::RunBoundShellWidget { key_byte } => {
+                self.run_bound_shell_widget(*key_byte, ctx);
             }
             InputEvent::CtrlC { cleared_buffer_len } => {
                 self.handle_ctrl_c_input_event(*cleared_buffer_len, ctx);

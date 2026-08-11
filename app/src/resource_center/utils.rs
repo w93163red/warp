@@ -26,6 +26,10 @@ pub const BLOCKS_KEYBINDINGS: &[&str] = &[
 
 pub const INPUT_EDITOR_KEYBINDINGS: &[&str] = &[
     "input:clear_screen",
+    "input:run_bound_shell_widget_1",
+    "input:run_bound_shell_widget_2",
+    "input:run_bound_shell_widget_3",
+    "input:run_bound_shell_widget_4",
     "editor:delete_word_left",
     "editor:delete_word_right",
     "editor:insert_last_word_previous_command",
@@ -45,6 +49,7 @@ pub const INPUT_EDITOR_KEYBINDINGS: &[&str] = &[
     "editor_view:cut_word_right",
     "editor_view:delete",
     "editor_view:delete_all_left",
+    "editor_view:yank",
     "editor_view:delete_all_right",
     "editor_view:down",
     "editor_view:end",

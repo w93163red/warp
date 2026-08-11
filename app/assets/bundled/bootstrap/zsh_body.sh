@@ -366,6 +366,12 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
       bindkey -r '\ew'
       bindkey '\ew' warp_change_prompt_modes_to_warp_prompt
 
+      # Introduce the keybinding used to run a user-bound ZLE widget on Warp's behalf.
+      # This is arbitrarily bound to ESC-k ("k" for key); the key to dispatch on is
+      # written by Warp immediately after this prefix. See warp_run_bound_widget.
+      bindkey -r '\ek'
+      bindkey '\ek' warp_run_bound_widget
+
       local escaped_pwd
       if [ -n "${WSL_DISTRO_NAME:-}" ]; then
         # In WSL, avoid symlinks b/c on Windows `std::fs` is unable to resolve symlink inside WSL containers.
@@ -627,6 +633,31 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
     BUFFER=""
   }
   zle -N warp_report_input
+
+  # Runs whichever ZLE widget the user has bound to a key, on Warp's behalf.
+  #
+  # Warp's input editor consumes every keystroke, so keys the user bound in their rc
+  # files (atuin on ^R, yazi on ^Y, fzf, ...) never reach ZLE. For the keys assigned to
+  # the "Send key to shell" bindings, Warp instead writes ESC-k followed by the key's
+  # control byte to the pty, which lands here.
+  #
+  # The widget is looked up at invocation time rather than at bootstrap, so bindings
+  # added later by the user's rc files or by a plugin manager are still picked up.
+  # Afterwards the buffer the widget left behind is reported back through the same
+  # InputBuffer hook used for typeahead, which is what moves a command selected in
+  # e.g. atuin into Warp's input editor.
+  function warp_run_bound_widget {
+    local key binding widget
+    # The key to dispatch on is sent immediately after the ESC-k prefix.
+    read -k 1 key || return
+    binding=$(bindkey -- "$key" 2>/dev/null)
+    widget="${binding##* }"
+    if [[ -n "$widget" && "$widget" != "undefined-key" ]]; then
+      zle "$widget"
+    fi
+    warp_report_input
+  }
+  zle -N warp_run_bound_widget
 
   function clear() {
       warp_send_json_message "{\"hook\": \"Clear\", \"value\": {}}"

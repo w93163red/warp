@@ -272,11 +272,6 @@ pub fn init(ctx: &mut AppContext) {
             id!("EditorView") & !id!("IMEOpen"),
         ),
         FixedBinding::new(
-            "ctrl-y",
-            EditorAction::Yank,
-            id!("EditorView") & !id!("IMEOpen"),
-        ),
-        FixedBinding::new(
             "shift-tab",
             EditorAction::ShiftTab,
             id!("EditorView") & !id!("IMEOpen"),
@@ -820,6 +815,12 @@ pub fn init(ctx: &mut AppContext) {
         // to clear all blocks within the blocklist.
         .with_mac_key_binding("cmd-backspace")
         .with_linux_or_windows_key_binding("ctrl-y"),
+        EditableBinding::new("editor_view:yank", "Yank", EditorAction::Yank)
+            .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
+            // Only bound on mac. On Linux/Windows ctrl-y deletes a line (see
+            // `editor_view:delete_all_left`), which is registered as an editable binding and so
+            // already took precedence over this one when it was a fixed binding.
+            .with_mac_key_binding("ctrl-y"),
         EditableBinding::new(
             "editor_view:insert_newline",
             "Insert newline",

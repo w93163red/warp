@@ -1,6 +1,11 @@
 use futures_lite::future::yield_now;
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use warpui::{AppContext, SingletonEntity};
+
+use super::atuin;
 
 use crate::search::async_snapshot_data_source::AsyncSnapshotDataSource;
 use crate::search::command_search::searcher::CommandSearchItemAction;
@@ -39,6 +44,43 @@ fn history_data_source_from_shared(
         },
         fuzzy_match_history,
     )
+}
+
+/// How long atuin's history is reused before it is read from disk again.
+///
+/// Reading it is fast but not free, and command search is opened often. A
+/// command run in another terminal shows up within this window; one run in Warp
+/// is in Warp's own history immediately and does not wait on this.
+const ATUIN_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Cached result of the last read of atuin's history.
+///
+/// `None` inside the option means atuin is not set up on this machine, which is
+/// cached like any other answer so that a missing database is not looked for on
+/// every keystroke.
+static ATUIN_ENTRIES: Mutex<Option<(Instant, Option<Arc<[Arc<HistoryEntry>]>>)>> =
+    Mutex::new(None);
+
+/// Creates a data source over atuin's history, if atuin is set up on this
+/// machine.
+///
+/// This is a second source rather than something merged into the session's
+/// history because the two answer different questions: Warp's history is what
+/// this machine ran in Warp, atuin's is everything the user's shells have run,
+/// including on other machines.
+pub(crate) fn atuin_history_data_source(
+) -> Option<AsyncSnapshotDataSource<HistorySnapshot, CommandSearchItemAction>> {
+    let mut cached = ATUIN_ENTRIES.lock().unwrap_or_else(|err| err.into_inner());
+
+    let is_stale = cached
+        .as_ref()
+        .is_none_or(|(loaded_at, _)| loaded_at.elapsed() >= ATUIN_CACHE_TTL);
+    if is_stale {
+        *cached = Some((Instant::now(), atuin::load_shared_entries()));
+    }
+
+    let commands = cached.as_ref().and_then(|(_, entries)| entries.clone())?;
+    Some(history_data_source_from_shared(commands))
 }
 
 pub(crate) fn history_data_source_for_session(

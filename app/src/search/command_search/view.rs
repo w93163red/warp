@@ -43,7 +43,7 @@ use crate::{
     },
     send_telemetry_from_ctx,
     server::{ids::ServerId, server_api::ai::AIClient, telemetry::TelemetryEvent},
-    settings::AISettings,
+    settings::{AISettings, InputSettings},
     terminal::{
         input::MenuPositioning,
         model::session::SessionId,
@@ -56,7 +56,7 @@ use crate::{
 use super::{
     ai_queries::AIQueriesDataSource,
     env_var_collections::EnvVarCollectionDataSource,
-    history::history_data_source_for_session,
+    history::{atuin_history_data_source, history_data_source_for_session},
     notebooks::notebooks_data_source,
     warp_ai::WarpAIDataSource,
     workflows::{cloud_workflows_data_source, WorkflowsDataSource},
@@ -300,6 +300,24 @@ impl CommandSearchView {
                     AIQueriesDataSource::new(),
                     HashSet::from([QueryFilter::PromptHistory]),
                 );
+            }
+
+            // Registered separately from the session's history so that atuin's
+            // commands are searchable even before Warp's own history is ready,
+            // and so that a machine without atuin costs nothing here.
+            if *InputSettings::as_ref(ctx).search_atuin_history {
+                if let Some(source) = atuin_history_data_source() {
+                    mixer.add_async_source(
+                        source,
+                        HashSet::from([QueryFilter::History]),
+                        AddAsyncSourceOptions {
+                            debounce_interval: Some(Duration::from_millis(50)),
+                            run_in_zero_state: true,
+                            run_when_unfiltered: true,
+                        },
+                        ctx,
+                    );
+                }
             }
 
             if History::as_ref(ctx).is_queryable(&session_id) {

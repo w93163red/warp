@@ -1,3 +1,4 @@
+mod atuin;
 mod history_data_source;
 mod history_search_item;
 

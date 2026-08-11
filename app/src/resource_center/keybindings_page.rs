@@ -22,7 +22,6 @@ use crate::{
     command_palette::PRIORITIZED_KEYBINDINGS,
     search_bar::SearchBar,
     settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier},
-    terminal::input::is_bound_shell_widget_binding,
     util::bindings::filter_bindings_including_keystroke,
     workspace::WorkspaceAction,
 };
@@ -149,11 +148,7 @@ impl KeybindingsView {
             .filter_map(|lens| CommandBinding::from_lens(lens, ctx))
             .chain(get_additional_keybindings())
             .filter(|a| {
-                // Unassigned bindings are hidden, since there are a lot of them and a row with no
-                // keystroke is mostly noise. The "Send key to shell" bindings are the exception:
-                // they ship unassigned on purpose, so hiding them would leave no way to reach
-                // them.
-                (a.trigger.is_some() || is_bound_shell_widget_binding(&a.name))
+                a.trigger.is_some()
                     && !a
                         .description
                         .in_context(DescriptionContext::Default)

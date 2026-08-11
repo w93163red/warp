@@ -988,11 +988,6 @@ pub enum Event {
     SyncInput(SyncInputType),
     ShowCommandSearch(CommandSearchOptions),
     CtrlD,
-    /// Asks the shell to run the widget it has bound to `key_byte`.
-    /// See [`InputAction::RunBoundShellWidget`].
-    RunBoundShellWidget {
-        key_byte: u8,
-    },
     CtrlC {
         // The number of chars cleared from the buffer, if the ctrl-c triggered a buffer clear.
         cleared_buffer_len: usize,
@@ -1110,14 +1105,6 @@ pub enum InputAction {
     FocusInputBox,
     CtrlR,
     CtrlD,
-    /// Hands the triggering keystroke to the shell's line editor so that a widget the user has
-    /// bound to it runs, instead of Warp's input editor consuming the key.
-    /// See [`Input::run_bound_shell_widget`].
-    RunBoundShellWidget {
-        /// Which of the "Send key to shell" bindings fired, used to look that binding's
-        /// currently assigned keystroke back up.
-        slot: usize,
-    },
     Up,
     PageUp,
     PageDown,
@@ -1792,55 +1779,6 @@ impl DeferredRemoteOperations {
     }
 }
 
-/// Names of the "Send key to shell" bindings. None of them are bound to a keystroke by default;
-/// the user assigns keys to them to hand those keys to widgets they've bound in their shell
-/// (atuin on ctrl-r, yazi on ctrl-y, fzf, ...). See [`InputAction::RunBoundShellWidget`].
-pub const BOUND_SHELL_WIDGET_BINDING_NAMES: [&str; 4] = [
-    "input:run_bound_shell_widget_1",
-    "input:run_bound_shell_widget_2",
-    "input:run_bound_shell_widget_3",
-    "input:run_bound_shell_widget_4",
-];
-
-/// Descriptions for [`BOUND_SHELL_WIDGET_BINDING_NAMES`], in the same order.
-const BOUND_SHELL_WIDGET_BINDING_DESCRIPTIONS: [&str; 4] = [
-    "Send key to shell instead of Warp (1)",
-    "Send key to shell instead of Warp (2)",
-    "Send key to shell instead of Warp (3)",
-    "Send key to shell instead of Warp (4)",
-];
-
-/// Whether `binding_name` is one of the "Send key to shell" bindings.
-///
-/// These are the only bindings that are worth showing in the keybindings page while still
-/// unassigned, since assigning one is the whole point of them existing.
-pub fn is_bound_shell_widget_binding(binding_name: &str) -> bool {
-    BOUND_SHELL_WIDGET_BINDING_NAMES.contains(&binding_name)
-}
-
-/// Maps a ctrl-<letter> keystroke to the control byte a terminal would send for it, which is what
-/// the shell's line editor dispatches on.
-///
-/// Returns `None` for anything else: keystrokes without a single-control-byte representation
-/// can't be looked up with `bindkey` on the shell side. ctrl-[ is excluded even though it does
-/// have one, because it is ESC, which would be read as the start of another escape sequence.
-fn control_byte_for_keystroke(keystroke: &Keystroke) -> Option<u8> {
-    if !keystroke.ctrl || keystroke.alt || keystroke.cmd || keystroke.meta {
-        return None;
-    }
-
-    let mut chars = keystroke.key.chars();
-    let key = chars.next()?;
-    if chars.next().is_some() {
-        return None;
-    }
-
-    match key.to_ascii_lowercase() {
-        key @ 'a'..='z' => Some(key as u8 - b'a' + 1),
-        _ => None,
-    }
-}
-
 pub fn init(app: &mut AppContext) {
     use warpui::keymap::macros::*;
 
@@ -1891,24 +1829,6 @@ pub fn init(app: &mut AppContext) {
     )
     .with_context_predicate(id!("Input"))
     .with_key_binding("ctrl-l")]);
-
-    // Unbound by default: assigning a key here takes that key away from whatever it does in
-    // Warp, so it is opt-in. The bindings only apply while the shell is sitting at an
-    // interactive prompt, which is what the `ShellLineEditor` context tracks.
-    app.register_editable_bindings(
-        BOUND_SHELL_WIDGET_BINDING_NAMES
-            .iter()
-            .copied()
-            .zip(BOUND_SHELL_WIDGET_BINDING_DESCRIPTIONS)
-            .enumerate()
-            .map(|(slot, (name, description))| {
-                EditableBinding::new(name, description, InputAction::RunBoundShellWidget { slot })
-                    .with_context_predicate(
-                        id!("Input") & id!("ShellLineEditor") & !id!("VoltronActive"),
-                    )
-            })
-            .collect::<Vec<_>>(),
-    );
 
     app.register_editable_bindings([
         EditableBinding::new(
@@ -10957,33 +10877,6 @@ impl Input {
         ctx.emit(Event::CtrlD);
     }
 
-    /// Hands the keystroke assigned to one of the "Send key to shell" bindings over to the
-    /// shell's line editor, so a widget the user bound to it there (atuin, yazi, fzf, ...) runs
-    /// instead of Warp handling the key itself.
-    ///
-    /// The keystroke is looked back up from the binding rather than carried on the action, so
-    /// re-assigning the binding takes effect without re-registering anything.
-    fn run_bound_shell_widget(&mut self, slot: usize, ctx: &mut ViewContext<Self>) {
-        let Some(binding_name) = BOUND_SHELL_WIDGET_BINDING_NAMES.get(slot) else {
-            return;
-        };
-
-        let Some(keystroke) = bindings::keybinding_name_to_keystroke(binding_name, ctx) else {
-            return;
-        };
-
-        let Some(key_byte) = control_byte_for_keystroke(&keystroke) else {
-            log::warn!(
-                "{binding_name} is bound to {}, which has no control byte for the shell to \
-                 dispatch on; only ctrl-<letter> keystrokes can be sent to the shell.",
-                keystroke.displayed()
-            );
-            return;
-        };
-
-        ctx.emit(Event::RunBoundShellWidget { key_byte });
-    }
-
     fn ctrl_r(&mut self, ctx: &mut ViewContext<Self>) {
         if self.suggestions_mode_model.as_ref(ctx).is_history_up() {
             // Iterate through menu if we're already in history substring mode and
@@ -14769,7 +14662,6 @@ impl TypedActionView for Input {
             InputAction::PageUp => self.editor_page_up(ctx),
             InputAction::PageDown => self.editor_page_down(ctx),
             InputAction::CtrlD => self.ctrl_d(ctx),
-            InputAction::RunBoundShellWidget { slot } => self.run_bound_shell_widget(*slot, ctx),
             InputAction::CtrlR => self.ctrl_r(ctx),
             InputAction::ClearScreen => self.clear_screen(ctx),
             InputAction::SelectAndRefreshVoltron(feature_name) => {
@@ -15139,27 +15031,6 @@ impl View for Input {
             .is_active_and_long_running()
         {
             ctx.set.insert("LongRunningCommand");
-        }
-
-        // Keys assigned to the "Send key to shell" bindings are only handed to the shell while it
-        // is sitting at an interactive prompt with its line editor active. Anywhere else -- during
-        // a command, in a full-screen program, before bootstrap -- the key keeps whatever meaning
-        // it has in Warp. Only zsh has the widget that receives these keys today.
-        let is_zsh_session = self
-            .active_block_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.session_id())
-            .and_then(|session_id| self.sessions.as_ref(app).get(session_id))
-            .is_some_and(|session| session.shell().shell_type() == ShellType::Zsh);
-        if is_zsh_session
-            && model_lock.block_list().is_bootstrapped()
-            && !model_lock.is_alt_screen_active()
-            && !model_lock
-                .block_list()
-                .active_block()
-                .is_active_and_long_running()
-        {
-            ctx.set.insert("ShellLineEditor");
         }
 
         if model_lock.is_block_list_empty() {

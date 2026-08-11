@@ -147,6 +147,13 @@ impl SearchItem for HistorySearchItem {
         OrderedFloat(self.match_result.score as f64)
     }
 
+    /// The command itself, so the same command recorded by more than one source
+    /// -- Warp's own history and atuin's, which both see everything run in Warp
+    /// -- is offered once rather than once per source.
+    fn dedup_key(&self) -> Option<String> {
+        Some(self.entry.command.clone())
+    }
+
     fn accept_result(&self) -> CommandSearchItemAction {
         CommandSearchItemAction::AcceptHistory(AcceptedHistoryItem {
             command: self.entry.command.clone(),

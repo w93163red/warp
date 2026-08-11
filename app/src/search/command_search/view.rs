@@ -4,7 +4,7 @@ use async_channel::Sender;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::Vector2F;
 
-use crate::search::mixer::AddAsyncSourceOptions;
+use crate::search::mixer::{AddAsyncSourceOptions, DedupeStrategy};
 use lazy_static::lazy_static;
 use std::{collections::HashSet, ops::Range, sync::Arc, time::Duration};
 use warp_core::features::FeatureFlag;
@@ -146,7 +146,14 @@ impl CommandSearchView {
             ctx.notify();
         });
 
-        let mixer = ctx.add_model(|_| CommandSearchMixer::new());
+        let mixer = ctx.add_model(|_| {
+            let mut mixer = CommandSearchMixer::new();
+            // Warp's history and atuin's overlap completely for anything run in
+            // Warp, so without this the same command is offered twice. Only
+            // items that opt in by returning a dedup key are affected.
+            mixer.set_dedupe_strategy(DedupeStrategy::HighestScore);
+            mixer
+        });
 
         let search_bar = ctx.add_typed_action_view(|ctx| {
             SearchBar::new(

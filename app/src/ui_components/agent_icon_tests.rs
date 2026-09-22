@@ -14,18 +14,19 @@ use chrono::Utc;
 use warp_cli::agent::Harness;
 
 use super::{
-    agent_conversation_entry_icon_variant, agent_icon_variant_for_run,
-    agent_icon_variant_from_terminal_inputs, CLISessionInputs, TerminalIconInputs,
+    CLISessionInputs, TerminalIconInputs, agent_conversation_entry_icon_variant,
+    agent_icon_variant_for_run, agent_icon_variant_from_terminal_inputs,
 };
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent_conversations_model::entry::{
-    AgentConversationBackingData, AgentConversationCapabilities, AgentConversationCreator,
-    AgentConversationDisplayData, AgentConversationIdentity,
+    AgentConversationBackingData, AgentConversationCapabilities, AgentConversationDisplayData,
+    AgentConversationIdentity, AgentConversationPrincipal,
 };
 use crate::ai::agent_conversations_model::{
     AgentConversationEntry, AgentConversationEntryId, AgentConversationProvenance,
     AgentRunDisplayStatus,
 };
+use crate::ai::ambient_agents::ExecutionLocation;
 use crate::terminal::CLIAgent;
 use crate::ui_components::icon_with_status::IconWithStatusVariant;
 
@@ -60,7 +61,8 @@ impl AgentIconFields {
                 is_ambient: *is_ambient,
             }),
             IconWithStatusVariant::Neutral { .. }
-            | IconWithStatusVariant::NeutralElement { .. } => None,
+            | IconWithStatusVariant::NeutralElement { .. }
+            | IconWithStatusVariant::CustomAvatar { .. } => None,
         }
     }
 }
@@ -383,7 +385,7 @@ fn local_claude_vs_cloud_claude_differ_only_by_is_ambient() {
 }
 
 #[test]
-fn non_ambient_entry_uses_display_harness() {
+fn entry_icon_uses_harness_and_execution_location() {
     let conversation_id = AIConversationId::new();
     let entry = AgentConversationEntry {
         id: AgentConversationEntryId::Conversation(conversation_id),
@@ -394,13 +396,15 @@ fn non_ambient_entry_uses_display_harness() {
             session_id: None,
         },
         provenance: AgentConversationProvenance::CloudSyncedConversation,
+        execution_location: None,
         display: AgentConversationDisplayData {
             title: "Codex conversation".to_string(),
             initial_query: None,
             created_at: Utc::now(),
             last_updated: Utc::now(),
             status: AgentRunDisplayStatus::ConversationSucceeded,
-            creator: AgentConversationCreator::default(),
+            creator: AgentConversationPrincipal::default(),
+            executor: None,
             request_usage: None,
             run_time: None,
             session_status: None,
@@ -426,7 +430,7 @@ fn non_ambient_entry_uses_display_harness() {
         },
     };
 
-    let variant = agent_conversation_entry_icon_variant(&entry).unwrap();
+    let variant = agent_conversation_entry_icon_variant(&entry);
     assert_eq!(
         AgentIconFields::from_variant(&variant).unwrap(),
         AgentIconFields {
@@ -436,4 +440,23 @@ fn non_ambient_entry_uses_display_harness() {
             is_ambient: false,
         }
     );
+    assert!(!entry.is_cloud_agent_run());
+
+    let mut task_backed_local = entry.clone();
+    task_backed_local.provenance = AgentConversationProvenance::AmbientRun;
+    task_backed_local.backing.has_ambient_run = true;
+    task_backed_local.identity.ambient_agent_task_id =
+        Some("00000000-0000-0000-0000-000000000001".parse().unwrap());
+    assert!(task_backed_local.is_cloud_agent_run());
+
+    task_backed_local.execution_location = Some(ExecutionLocation::Local);
+    let variant = agent_conversation_entry_icon_variant(&task_backed_local);
+    assert!(!AgentIconFields::from_variant(&variant).unwrap().is_ambient);
+    assert!(!task_backed_local.is_cloud_agent_run());
+
+    let mut remote_task = task_backed_local;
+    remote_task.execution_location = Some(ExecutionLocation::Remote);
+    let variant = agent_conversation_entry_icon_variant(&remote_task);
+    assert!(AgentIconFields::from_variant(&variant).unwrap().is_ambient);
+    assert!(remote_task.is_cloud_agent_run());
 }

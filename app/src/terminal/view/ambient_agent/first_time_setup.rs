@@ -3,30 +3,28 @@
 //! This view is displayed as an overlay when users first try to use cloud agent mode
 //! and need to create an environment.
 
-use crate::{
-    ai::{
-        cloud_environments, request_usage_model::AMBIENT_AGENT_TRIAL_CREDIT_THRESHOLD,
-        AIRequestUsageModel,
-    },
-    appearance::Appearance,
-    server::{cloud_objects::update_manager::UpdateManager, ids::ClientId},
-    settings_view::update_environment_form::{
-        AuthSource, EnvironmentFormInitArgs, GithubAuthRedirectTarget, UpdateEnvironmentForm,
-        UpdateEnvironmentFormEvent,
-    },
-    ui_components::blended_colors,
-};
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill};
-use warpui::{
-    elements::{
-        new_scrollable::SingleAxisConfig, Align, Border, ChildView, ClippedScrollStateHandle,
-        ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Expanded, Flex,
-        FormattedTextElement, HighlightedHyperlink, NewScrollable, ParentElement, Radius, Text,
-    },
-    fonts::{Properties, Weight},
-    AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
+use warp_errors::report_error;
+use warpui::elements::new_scrollable::SingleAxisConfig;
+use warpui::elements::{
+    Align, Border, ChildView, ClippedScrollStateHandle, ConstrainedBox, Container, CornerRadius,
+    CrossAxisAlignment, Element, Expanded, Flex, FormattedTextElement, HighlightedHyperlink,
+    NewScrollable, ParentElement, Radius, Text,
 };
+use warpui::fonts::{Properties, Weight};
+use warpui::{AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle};
+
+use crate::ai::ambient_agents::github_auth_url::{AuthSource, GithubAuthRedirectTarget};
+use crate::ai::request_usage_model::AMBIENT_AGENT_TRIAL_CREDIT_THRESHOLD;
+use crate::ai::{AIRequestUsageModel, cloud_environments};
+use crate::appearance::Appearance;
+use crate::server::cloud_objects::update_manager::UpdateManager;
+use crate::server::ids::ClientId;
+use crate::settings_view::update_environment_form::{
+    EnvironmentFormInitArgs, UpdateEnvironmentForm, UpdateEnvironmentFormEvent,
+};
+use crate::ui_components::blended_colors;
 
 /// Max width for the content area (matches Figma: 592px)
 const CONTENT_MAX_WIDTH: f32 = 592.;
@@ -99,7 +97,7 @@ impl FirstTimeCloudAgentSetupView {
                 };
 
                 let Some(owner) = owner else {
-                    log::error!("Unable to create environment: not logged in");
+                    report_error!("Unable to create environment: not logged in");
                     // Reset form before emitting cancelled event
                     self.reset_form(ctx);
                     ctx.emit(FirstTimeCloudAgentSetupViewEvent::Cancelled);
@@ -162,10 +160,7 @@ impl FirstTimeCloudAgentSetupView {
             FormattedTextFragment::plain_text(
                 "Use Oz cloud agents to run parallel agents, build agents that run autonomously, and check in on your agents from anywhere. ",
             ),
-            FormattedTextFragment::hyperlink(
-                "Visit docs",
-                "https://docs.warp.dev/agent-platform/cloud-agents/overview",
-            ),
+            FormattedTextFragment::hyperlink("Visit docs", "https://docs.warp.dev/platform/"),
         ];
         column.add_child(
             FormattedTextElement::new(

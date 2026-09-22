@@ -1,14 +1,13 @@
+use std::cmp::Ordering;
+use std::fmt::{self, Display};
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::LazyLock;
+
 use itertools::{EitherOrBoth, Itertools};
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{
-    cmp::Ordering,
-    fmt::{self, Display},
-    ops::Range,
-    path::PathBuf,
-    sync::LazyLock,
-};
 use strsim::jaro_winkler;
 lazy_static! {
     /// Regex to parse a line number from a string in the format "{number}|{line}"
@@ -150,6 +149,7 @@ impl AIRequestedCodeDiff {
                 fuzzy_match_failures,
                 noop_deltas,
                 missing_line_numbers: _,
+                fuzzy_match_failure_details: _,
             }) => {
                 let update_deltas_empty = match &self.diff_type {
                     DiffType::Update { deltas, .. } => deltas.is_empty(),
@@ -283,6 +283,35 @@ fn unmatched_line_suffix<'a>(search_line: &str, file_line: &'a str) -> Option<&'
     }
 }
 
+/// Preserve the unmatched suffix of the final matched file line when the LLM emitted only a
+/// partial final line.
+///
+/// When search and replace have the same line count, preserve the suffix to maintain the legacy
+/// behavior for simple partial-line replacements. When line counts differ, only preserve it if the
+/// replacement's final line still carries the same partial context as the search's final line.
+fn append_unmatched_line_suffix(search: &str, file_line: &str, insertion: &mut String) {
+    let Some(search_last_line) = lines(search).last() else {
+        return;
+    };
+    let Some(suffix) = unmatched_line_suffix(search_last_line, file_line) else {
+        return;
+    };
+
+    let search_line_count = lines(search).count();
+    let insertion_line_count = lines(insertion).count();
+    let Some(insertion_last_line) = lines(insertion).last() else {
+        return;
+    };
+
+    if search_line_count != insertion_line_count
+        && search_last_line.trim_start() != insertion_last_line.trim_start()
+    {
+        return;
+    }
+
+    let insertion_point = insertion.trim_end_matches('\n').len();
+    insertion.insert_str(insertion_point, suffix);
+}
 /// We told the model not to include line numbers for the replacement content. However, it can
 /// still happen. Try to remove them here.
 /// https://github.com/warpdotdev/warp-server/blob/d9c1b6d1443290f2355979ae552d41af01a63bde/logic/ai/prompt/tools/suggest_diff.yaml#L34-L34
@@ -295,7 +324,7 @@ fn remove_extra_line_num_prefix(replace: String) -> String {
         .join("\n")
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct DiffMatchFailures {
     /// Failures to perform a fuzzy match with content.
     pub fuzzy_match_failures: u8,
@@ -303,6 +332,18 @@ pub struct DiffMatchFailures {
     pub noop_deltas: u8,
     /// Search blocks that are missing line numbers.
     pub missing_line_numbers: u8,
+    /// Identifiers for blocks that failed to fuzzy match. Skipped for telemetry.
+    #[serde(skip)]
+    pub fuzzy_match_failure_details: Vec<DiffMatchFailure>,
+}
+
+/// Identifies a search/hunk block that failed to match, without carrying file content.
+///
+/// `block_number` is 1-based and refers to the block's position among all blocks for the file in
+/// the original tool call (not merely among failures).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffMatchFailure {
+    pub block_number: usize,
 }
 
 /// Fix two common issues with responses from the models that request code actions:
@@ -367,7 +408,7 @@ pub fn fuzzy_match_v4a_diffs(
 
     let file_lines: Vec<&str> = file_content.lines().collect();
 
-    for diff in diffs {
+    for (block_index, diff) in diffs.iter().enumerate() {
         // Check for no-op diffs
         if diff.old == diff.new {
             log::info!("Ignoring V4A diff with identical old and new content.");
@@ -398,6 +439,9 @@ pub fn fuzzy_match_v4a_diffs(
             None => {
                 log::warn!("Failed to find matching location for V4A diff");
                 failures.fuzzy_match_failures += 1;
+                failures.fuzzy_match_failure_details.push(DiffMatchFailure {
+                    block_number: block_index + 1,
+                });
             }
         }
     }
@@ -464,7 +508,7 @@ fn fuzzy_match_file_diffs(
 
     let target_lines: Vec<&str> = lines(file_content).collect();
 
-    for diff in diffs {
+    for (block_index, diff) in diffs.iter().enumerate() {
         #[cfg(debug_assertions)]
         log::debug!("{diff:#?}");
 
@@ -582,13 +626,12 @@ fn fuzzy_match_file_diffs(
                 // the delta would replace the entire line and drop the unmatched
                 // suffix. Detect this and preserve the suffix in the insertion.
                 let mut insertion = diff.replace.clone();
-                if range.end >= 2 && lines(&search).count() == lines(&insertion).count() {
-                    if let Some(suffix) = lines(&search)
-                        .last()
-                        .and_then(|last| unmatched_line_suffix(last, target_lines[range.end - 2]))
-                    {
-                        insertion.push_str(suffix);
-                    }
+                if range.end >= 2 {
+                    append_unmatched_line_suffix(
+                        &search,
+                        target_lines[range.end - 2],
+                        &mut insertion,
+                    );
                 }
                 deltas.push(DiffDelta {
                     replacement_line_range: range.start..range.end,
@@ -597,6 +640,9 @@ fn fuzzy_match_file_diffs(
             }
             None => {
                 failures.fuzzy_match_failures += 1;
+                failures.fuzzy_match_failure_details.push(DiffMatchFailure {
+                    block_number: block_index + 1,
+                });
             }
         }
     }

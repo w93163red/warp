@@ -3,42 +3,42 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, Local};
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use futures::{select, FutureExt};
+use futures::{FutureExt, select};
 use futures_lite::pin;
 use itertools::Itertools;
 use parking_lot::FairMutex;
 use warp_core::command::ExitCode;
 use warp_core::execution_mode::AppExecutionMode;
+use warp_core::features::FeatureFlag;
 use warp_util::path::ShellFamily;
 use warpui::r#async::{Spawnable, Timer};
 use warpui::{Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
+use super::lrc_activity::{LrcActivityMonitor, SAMPLE_INTERVAL};
+use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
 use crate::ai::agent::{
-    AIAgentActionId, AIAgentActionType, AIAgentPtyWriteMode, ReadShellCommandOutputResult,
-    RequestCommandOutputResult, ShellCommandDelay, ShellCommandError,
+    AIAgentActionId, AIAgentActionResultType, AIAgentActionType, AIAgentPtyWriteMode, LrcActivity,
+    ReadShellCommandOutputResult, RequestCommandOutputResult, ShellCommandDelay, ShellCommandError,
     TransferShellCommandControlToUserResult, WriteToLongRunningShellCommandResult,
 };
-use crate::ai::blocklist::permissions::CommandExecutionPermission;
 use crate::ai::blocklist::BlocklistAIPermissions;
+use crate::ai::blocklist::action_model::recording_controller::RecordingController;
+use crate::ai::blocklist::permissions::CommandExecutionPermission;
 use crate::ai::execution_profiles::WriteToPtyPermission;
+use crate::terminal::TerminalModel;
 use crate::terminal::event::BlockMetadataReceivedEvent;
 use crate::terminal::model::block::{
-    formatted_terminal_contents_for_input, Block, BlockId, CURSOR_MARKER,
+    Block, BlockId, CURSOR_MARKER, formatted_terminal_contents_for_input,
 };
+use crate::terminal::model::session::SessionType;
+use crate::terminal::model::session::active_session::ActiveSession;
+use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::terminal::shell::ShellType;
-use crate::{
-    ai::agent::AIAgentActionResultType,
-    terminal::{
-        model::session::active_session::ActiveSession,
-        model_events::{ModelEvent, ModelEventDispatcher},
-        TerminalModel,
-    },
-};
-use crate::{send_telemetry_from_ctx, TelemetryEvent};
-
-use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
+use crate::workspaces::user_workspaces::TeamContext;
+use crate::{TelemetryEvent, send_telemetry_from_ctx};
 
 pub struct ShellCommandExecutor {
     active_session: ModelHandle<ActiveSession>,
@@ -51,6 +51,9 @@ pub struct ShellCommandExecutor {
     terminal_view_id: EntityId,
     /// Sender to notify when user hands control back to agent after TransferShellCommandControlToUser.
     control_handback_sender: Option<oneshot::Sender<()>>,
+    /// Liveness signals for the long-running commands this agent is monitoring.
+    /// Shared with the snapshot futures, which have no `ModelContext`.
+    activity_monitor: Arc<LrcActivityMonitor>,
 }
 
 impl ShellCommandExecutor {
@@ -76,10 +79,59 @@ impl ShellCommandExecutor {
             force_refresh_senders: HashMap::new(),
             terminal_view_id,
             control_handback_sender: None,
+            activity_monitor: Arc::new(LrcActivityMonitor::new()),
         }
     }
 
-    fn handle_terminal_model_event(&mut self, event: &ModelEvent, _ctx: &mut ModelContext<Self>) {
+    /// Begins collecting liveness signals for the command this action will
+    /// snapshot, starting the sampler if it is not already running.
+    ///
+    /// Returns a guard that must be held for the lifetime of the action.
+    /// Sampling is deliberately scoped to actions that can produce a snapshot,
+    /// so ordinary terminal use never pays for it.
+    fn begin_monitoring(&mut self, ctx: &mut ModelContext<Self>) -> LrcMonitoringGuard {
+        // Process signals describe this machine, so they say nothing about a
+        // command running on another host. Remote sessions report no activity.
+        let is_local = matches!(
+            self.active_session.as_ref(ctx).session_type(ctx),
+            Some(SessionType::Local)
+        );
+        self.activity_monitor
+            .set_monitoring_enabled(is_local && lrc_activity_signals_supported());
+
+        let guard = LrcMonitoringGuard {
+            monitor: self.activity_monitor.clone(),
+        };
+        if self.activity_monitor.arm() {
+            self.sample_activity(ctx);
+        }
+        guard
+    }
+
+    /// Takes one activity sample, rescheduling itself until no monitored
+    /// command and no in-flight action remain.
+    fn sample_activity(&mut self, ctx: &mut ModelContext<Self>) {
+        let monitor = self.activity_monitor.clone();
+        let terminal_model = self.terminal_model.clone();
+        ctx.spawn(
+            async move {
+                Timer::after(SAMPLE_INTERVAL).await;
+                monitor.sample(&terminal_model)
+            },
+            move |me, keep_sampling, ctx| {
+                if keep_sampling {
+                    me.sample_activity(ctx);
+                }
+            },
+        );
+    }
+
+    fn handle_terminal_model_event(
+        &mut self,
+        _: ModelHandle<ModelEventDispatcher>,
+        event: &ModelEvent,
+        _ctx: &mut ModelContext<Self>,
+    ) {
         // We wait for precmd for the block _after_ the requested command's block so that
         // downstream checks for current working directory are fresh. The precmd hook is when
         // the shell relays current working directory to warp.
@@ -106,7 +158,8 @@ impl ShellCommandExecutor {
     pub(super) fn should_autoexecute(
         &self,
         input: ExecuteActionInput,
-        ctx: &mut ModelContext<Self>,
+        scope: &TeamContext<'_>,
+        ctx: &ModelContext<Self>,
     ) -> bool {
         let blocklist_permissions = BlocklistAIPermissions::as_ref(ctx);
         match &input.action.action {
@@ -131,6 +184,7 @@ impl ShellCommandExecutor {
                     is_read_only.unwrap_or(false),
                     *is_risky,
                     Some(self.terminal_view_id),
+                    scope,
                     ctx,
                 );
                 if let CommandExecutionPermission::Allowed(reason) = autoexecution_permission {
@@ -139,12 +193,9 @@ impl ShellCommandExecutor {
                         ctx
                     );
                 } else if let CommandExecutionPermission::Denied(reason) = autoexecution_permission
+                    && AppExecutionMode::as_ref(ctx).is_autonomous()
                 {
-                    if AppExecutionMode::as_ref(ctx).is_autonomous() {
-                        log::warn!(
-                            "Command denied during autonomous execution, reason: {reason:?}"
-                        );
-                    }
+                    log::warn!("Command denied during autonomous execution, reason: {reason:?}");
                 }
                 autoexecution_permission.is_allowed()
             }
@@ -160,6 +211,7 @@ impl ShellCommandExecutor {
                     let should_autoexecute = match blocklist_permissions.can_write_to_pty(
                         &input.conversation_id,
                         Some(self.terminal_view_id),
+                        scope,
                         ctx,
                     ) {
                         WriteToPtyPermission::AlwaysAllow => true,
@@ -211,7 +263,7 @@ impl ShellCommandExecutor {
         &mut self,
         input: ExecuteActionInput,
         ctx: &mut ModelContext<Self>,
-    ) -> impl Into<AnyActionExecution> {
+    ) -> impl Into<AnyActionExecution> + use<> {
         let model = self.terminal_model.lock();
 
         // Determine the action we want to take based on the input.
@@ -241,6 +293,17 @@ impl ShellCommandExecutor {
                         RequestCommandOutputResult::CancelledBeforeExecution,
                     ));
                 }
+                // If another conversation has taken over the agent view since this command
+                // was requested, cancel instead of executing.
+                let is_displaced_by_other_conversation = model
+                    .block_list()
+                    .active_conversation_id()
+                    .is_some_and(|active_id| active_id != input.conversation_id);
+                if is_displaced_by_other_conversation {
+                    return ActionExecution::Sync(AIAgentActionResultType::RequestCommandOutput(
+                        RequestCommandOutputResult::CancelledBeforeExecution,
+                    ));
+                }
                 // If the command might use pager and can't be interacted with,
                 // we pipe its output to cat so we can prevent activating the altscreen.
                 // The parentheses here ensures the command always gets evaluated first.
@@ -250,6 +313,14 @@ impl ShellCommandExecutor {
                     } else {
                         command.clone()
                     };
+                // Let the recording controller decide whether this command's
+                // on-screen work should be kept in an active computer-use
+                // recording, opening an action group before it starts if so.
+                let conversation_id = input.conversation_id;
+                let opened_recording_group = RecordingController::handle(ctx)
+                    .update(ctx, |controller, _| {
+                        controller.maybe_begin_action_group(conversation_id, command)
+                    });
                 ctx.emit(ShellCommandExecutorEvent::ExecuteCommand {
                     action_id: action_id.clone(),
                     command: decorated_command,
@@ -260,13 +331,31 @@ impl ShellCommandExecutor {
                 drop(model);
 
                 ActionExecution::new_async(
-                    self.action_result_future(block_selector.clone(), None),
+                    self.action_result_future(block_selector.clone(), None, ctx),
                     move |result, ctx| {
                         // Remove the senders from the maps.
                         if let Some(handle) = handle.upgrade(ctx) {
                             handle.update(ctx, |me, _| {
                                 me.block_finished_senders.remove(&block_selector);
                                 me.force_refresh_senders.remove(&block_selector);
+                            });
+                        }
+
+                        if opened_recording_group {
+                            RecordingController::handle(ctx).update(ctx, |controller, _| {
+                                match &result {
+                                    // Commit regardless of exit code: failed browser
+                                    // automation is still on-screen work worth keeping.
+                                    ActionResult::CommandFinished { .. } => {
+                                        controller.commit_action_group_now(conversation_id);
+                                    }
+                                    ActionResult::Cancelled | ActionResult::BlockNotFound => {
+                                        controller.discard_action_group(conversation_id);
+                                    }
+                                    // Still running; the group stays open until a later
+                                    // poll observes the finished block.
+                                    ActionResult::LongRunningCommandSnapshot { .. } => {}
+                                }
                             });
                         }
 
@@ -291,12 +380,16 @@ impl ShellCommandExecutor {
                 if block.finished() {
                     let output: String = block.output_with_secrets_unobfuscated();
                     let exit_code = block.exit_code();
+                    let start_ts = block.start_ts().cloned();
+                    let completed_ts = block.completed_ts().cloned();
                     return ActionExecution::Sync(
                         AIAgentActionResultType::WriteToLongRunningShellCommand(
                             WriteToLongRunningShellCommandResult::CommandFinished {
                                 block_id: block.id().clone(),
                                 output,
                                 exit_code,
+                                start_ts,
+                                completed_ts,
                             },
                         ),
                     );
@@ -320,6 +413,7 @@ impl ShellCommandExecutor {
                     self.action_result_future(
                         block_selector.clone(),
                         Some(ShellCommandDelay::Duration(Duration::from_millis(200))),
+                        ctx,
                     ),
                     move |result, ctx| {
                         // Remove the senders from the maps.
@@ -344,20 +438,32 @@ impl ShellCommandExecutor {
                     let command = block.command_with_secrets_unobfuscated(false);
                     let output: String = block.output_with_secrets_unobfuscated();
                     let exit_code = block.exit_code();
+                    let start_ts = block.start_ts().cloned();
+                    let completed_ts = block.completed_ts().cloned();
+                    // A finished poll settles any action group left open by a
+                    // long-running `playwright-cli` command; no-op when no
+                    // group is pending.
+                    let conversation_id = input.conversation_id;
+                    RecordingController::handle(ctx).update(ctx, |controller, _| {
+                        controller.commit_action_group_now(conversation_id);
+                    });
                     return ActionExecution::Sync(AIAgentActionResultType::ReadShellCommandOutput(
                         ReadShellCommandOutputResult::CommandFinished {
                             command,
                             block_id: block_id.clone(),
                             output,
                             exit_code,
+                            start_ts,
+                            completed_ts,
                         },
                     ));
                 }
                 drop(model);
 
                 let block_selector = BlockSelector::Id(block_id.clone());
+                let conversation_id = input.conversation_id;
                 ActionExecution::new_async(
-                    self.action_result_future(block_selector.clone(), delay.clone()),
+                    self.action_result_future(block_selector.clone(), delay.clone(), ctx),
                     move |result, ctx| {
                         // Remove the senders from the maps.
                         if let Some(handle) = handle.upgrade(ctx) {
@@ -365,6 +471,17 @@ impl ShellCommandExecutor {
                                 me.block_finished_senders.remove(&block_selector);
                                 me.force_refresh_senders.remove(&block_selector);
                             });
+                        }
+
+                        match &result {
+                            ActionResult::CommandFinished { .. } => {
+                                RecordingController::handle(ctx).update(ctx, |controller, _| {
+                                    controller.commit_action_group_now(conversation_id);
+                                });
+                            }
+                            ActionResult::LongRunningCommandSnapshot { .. }
+                            | ActionResult::Cancelled
+                            | ActionResult::BlockNotFound => {}
                         }
 
                         action_result_for_read_shell_command_output(command.clone(), result)
@@ -404,10 +521,13 @@ impl ShellCommandExecutor {
                     .insert(block_selector.clone(), block_finished_tx);
 
                 // Build the future that captures terminal model and block data.
+                let monitoring = self.begin_monitoring(ctx);
+                let monitor = self.activity_monitor.clone();
                 let transfer_future = {
                     let terminal_model = self.terminal_model.clone();
                     let block_id = block_id.clone();
                     async move {
+                        let _monitoring = monitoring;
                         pin!(handback_rx);
                         pin!(block_finished_rx);
 
@@ -431,10 +551,13 @@ impl ShellCommandExecutor {
                                 match model.block_list().block_with_id(&block_id) {
                                     Some(block) => {
                                         if block.finished() {
+                                            monitor.forget(block.id());
                                             ActionResult::CommandFinished {
                                                 block_id: block.id().clone(),
                                                 output: block.output_with_secrets_unobfuscated(),
                                                 exit_code: block.exit_code(),
+                                                start_ts: block.start_ts().cloned(),
+                                                completed_ts: block.completed_ts().cloned(),
                                             }
                                         } else {
                                             let grid_contents = if model.is_alt_screen_active() {
@@ -456,6 +579,7 @@ impl ShellCommandExecutor {
                                                 cursor: CURSOR_MARKER,
                                                 is_alt_screen_active: model.is_alt_screen_active(),
                                                 is_preempted: false,
+                                                activity: monitor.report(block.id()),
                                             }
                                         }
                                     }
@@ -496,7 +620,13 @@ impl ShellCommandExecutor {
         &mut self,
         block_selector: BlockSelector,
         delay: Option<ShellCommandDelay>,
-    ) -> impl Spawnable<Output = ActionResult> {
+        ctx: &mut ModelContext<Self>,
+    ) -> impl Spawnable<Output = ActionResult> + use<> {
+        // Held for the lifetime of the future so liveness sampling runs for as
+        // long as this action might report a snapshot.
+        let monitoring = self.begin_monitoring(ctx);
+        let monitor = self.activity_monitor.clone();
+
         // Create a channel to notify us when we receive block metadata.
         let (block_metadata_received_tx, block_metadata_received_rx) = oneshot::channel();
         self.block_finished_senders
@@ -522,6 +652,7 @@ impl ShellCommandExecutor {
         }
 
         async move {
+            let _monitoring = monitoring;
             // If we support long-running commands, set up a timeout after which we'll
             // treat the command as long-running and give the agent a snapshot of the
             // current state.  Otherwise, we'll wait indefinitely for the command to
@@ -570,13 +701,17 @@ impl ShellCommandExecutor {
             // At this point, we've either received block metadata or we've timed out.
             // Check the current state of the block and produce a result accordingly.
             let model = terminal_model.lock();
-            let result = match block_selector.get_block(&model) {
+
+            match block_selector.get_block(&model) {
                 Some(block) => {
                     if block.finished() {
+                        monitor.forget(block.id());
                         ActionResult::CommandFinished {
                             block_id: block.id().clone(),
                             output: block.output_with_secrets_unobfuscated(),
                             exit_code: block.exit_code(),
+                            start_ts: block.start_ts().cloned(),
+                            completed_ts: block.completed_ts().cloned(),
                         }
                     } else {
                         let grid_contents = if model.is_alt_screen_active() {
@@ -599,13 +734,12 @@ impl ShellCommandExecutor {
                             cursor: CURSOR_MARKER,
                             is_alt_screen_active: model.is_alt_screen_active(),
                             is_preempted,
+                            activity: monitor.report(block.id()),
                         }
                     }
                 }
                 None => ActionResult::BlockNotFound,
-            };
-
-            result
+            }
         }
     }
 
@@ -650,10 +784,10 @@ impl ShellCommandExecutor {
             .cloned();
         drop(terminal_model);
 
-        if let Some(selector) = matching_selector {
-            if let Some(sender) = self.force_refresh_senders.remove(&selector) {
-                let _ = sender.send(());
-            }
+        if let Some(selector) = matching_selector
+            && let Some(sender) = self.force_refresh_senders.remove(&selector)
+        {
+            let _ = sender.send(());
         }
     }
 
@@ -693,17 +827,22 @@ fn action_result_for_requested_command(
             block_id,
             output,
             exit_code,
+            start_ts,
+            completed_ts,
         } => AIAgentActionResultType::RequestCommandOutput(RequestCommandOutputResult::Completed {
             command,
             block_id,
             output,
             exit_code,
+            start_ts,
+            completed_ts,
         }),
         ActionResult::LongRunningCommandSnapshot {
             block_id,
             grid_contents,
             cursor,
             is_alt_screen_active,
+            activity,
             ..
         } => AIAgentActionResultType::RequestCommandOutput(
             RequestCommandOutputResult::LongRunningCommandSnapshot {
@@ -712,6 +851,7 @@ fn action_result_for_requested_command(
                 grid_contents,
                 cursor: cursor.to_owned(),
                 is_alt_screen_active,
+                activity,
             },
         ),
         ActionResult::BlockNotFound | ActionResult::Cancelled => {
@@ -731,11 +871,15 @@ fn action_result_for_write_to_long_running_shell_command(
             block_id,
             output,
             exit_code,
+            start_ts,
+            completed_ts,
         } => AIAgentActionResultType::WriteToLongRunningShellCommand(
             WriteToLongRunningShellCommandResult::CommandFinished {
                 block_id,
                 output,
                 exit_code,
+                start_ts,
+                completed_ts,
             },
         ),
         ActionResult::LongRunningCommandSnapshot {
@@ -744,6 +888,7 @@ fn action_result_for_write_to_long_running_shell_command(
             cursor,
             is_alt_screen_active,
             is_preempted,
+            activity,
         } => AIAgentActionResultType::WriteToLongRunningShellCommand(
             WriteToLongRunningShellCommandResult::Snapshot {
                 block_id,
@@ -751,6 +896,7 @@ fn action_result_for_write_to_long_running_shell_command(
                 cursor: cursor.to_owned(),
                 is_alt_screen_active,
                 is_preempted,
+                activity,
             },
         ),
         ActionResult::Cancelled => AIAgentActionResultType::WriteToLongRunningShellCommand(
@@ -772,12 +918,16 @@ fn action_result_for_read_shell_command_output(
             output,
             exit_code,
             block_id,
+            start_ts,
+            completed_ts,
         } => AIAgentActionResultType::ReadShellCommandOutput(
             ReadShellCommandOutputResult::CommandFinished {
                 command,
                 block_id,
                 output,
                 exit_code,
+                start_ts,
+                completed_ts,
             },
         ),
         ActionResult::LongRunningCommandSnapshot {
@@ -786,6 +936,7 @@ fn action_result_for_read_shell_command_output(
             cursor,
             is_alt_screen_active,
             is_preempted,
+            activity,
         } => AIAgentActionResultType::ReadShellCommandOutput(
             ReadShellCommandOutputResult::LongRunningCommandSnapshot {
                 command,
@@ -794,6 +945,7 @@ fn action_result_for_read_shell_command_output(
                 cursor: cursor.to_owned(),
                 is_alt_screen_active,
                 is_preempted,
+                activity,
             },
         ),
         ActionResult::Cancelled => {
@@ -814,11 +966,15 @@ fn action_result_for_transfer_shell_command_control_to_user(
             block_id,
             output,
             exit_code,
+            start_ts,
+            completed_ts,
         } => AIAgentActionResultType::TransferShellCommandControlToUser(
             TransferShellCommandControlToUserResult::CommandFinished {
                 block_id,
                 output,
                 exit_code,
+                start_ts,
+                completed_ts,
             },
         ),
         ActionResult::LongRunningCommandSnapshot {
@@ -827,6 +983,7 @@ fn action_result_for_transfer_shell_command_control_to_user(
             cursor,
             is_alt_screen_active,
             is_preempted,
+            activity,
         } => AIAgentActionResultType::TransferShellCommandControlToUser(
             TransferShellCommandControlToUserResult::Snapshot {
                 block_id,
@@ -834,6 +991,7 @@ fn action_result_for_transfer_shell_command_control_to_user(
                 cursor: cursor.to_owned(),
                 is_alt_screen_active,
                 is_preempted,
+                activity,
             },
         ),
         ActionResult::Cancelled => AIAgentActionResultType::TransferShellCommandControlToUser(
@@ -882,6 +1040,8 @@ enum ActionResult {
         block_id: BlockId,
         output: String,
         exit_code: ExitCode,
+        start_ts: Option<DateTime<Local>>,
+        completed_ts: Option<DateTime<Local>>,
     },
     LongRunningCommandSnapshot {
         block_id: BlockId,
@@ -889,7 +1049,33 @@ enum ActionResult {
         cursor: &'static str,
         is_alt_screen_active: bool,
         is_preempted: bool,
+        /// Evidence that the command is still doing work, for snapshots where
+        /// the grid alone cannot distinguish silence from a hang.
+        activity: Option<LrcActivity>,
     },
     Cancelled,
     BlockNotFound,
 }
+
+/// Whether liveness signals are trustworthy enough to collect on this platform.
+///
+/// Wasm has no local process table to read at all.
+fn lrc_activity_signals_supported() -> bool {
+    !cfg!(target_family = "wasm") && FeatureFlag::LrcActivitySignal.is_enabled()
+}
+
+/// Keeps liveness sampling armed for as long as an action that might report a
+/// snapshot is in flight.
+struct LrcMonitoringGuard {
+    monitor: Arc<LrcActivityMonitor>,
+}
+
+impl Drop for LrcMonitoringGuard {
+    fn drop(&mut self) {
+        self.monitor.disarm();
+    }
+}
+
+#[cfg(test)]
+#[path = "shell_command_tests.rs"]
+mod tests;

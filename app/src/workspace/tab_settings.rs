@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use settings::{
-    macros::define_settings_group, RespectUserSyncSetting, SupportedPlatforms, SyncToCloud,
-};
+use settings::macros::define_settings_group;
+use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 use warp_core::ui::theme::AnsiColorIdentifier;
 
 #[derive(
@@ -32,6 +31,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "general.new_tab_placement",
     description: "Where new tabs are placed in the tab bar.",
@@ -63,6 +63,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.tab_close_button_position",
     description: "Position of the close button on tabs.",
@@ -91,6 +92,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.title_bar_position",
     description: "Position of the title bar.",
@@ -128,6 +130,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.workspace_decoration_visibility",
     description: "When workspace decorations such as the tab bar are visible.",
@@ -220,6 +223,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.directory_tab_colors",
     max_table_depth: 0,
@@ -230,8 +234,7 @@ settings::macros::implement_setting_for_enum!(
 impl DirectoryTabColors {
     /// Returns the configured tab color for a directory using longest-prefix matching.
     /// Returns `None` if no configured directory is a prefix of `dir`.
-    pub fn color_for_directory(&self, dir: &Path) -> Option<DirectoryTabColor> {
-        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    pub fn color_for_directory(&self, canonical_dir: &Path) -> Option<DirectoryTabColor> {
         self.0
             .iter()
             .filter_map(|(configured_path, color)| {
@@ -250,11 +253,17 @@ impl DirectoryTabColors {
     /// Returns a new value with the given directory's color updated.
     pub fn with_color(&self, path: &Path, color: DirectoryTabColor) -> Self {
         let mut map = self.0.clone();
-
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        map.insert(canonical.to_string_lossy().to_string(), color);
+        map.insert(canonical_directory_key(path), color);
         Self(map)
     }
+}
+
+/// Canonicalizes `path` into the string key used in [`DirectoryTabColors`].
+pub fn canonical_directory_key(path: &Path) -> String {
+    dunce::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
 }
 
 #[derive(
@@ -308,6 +317,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.tabs.header_toolbar_chip_selection",
     description: "Configuration for the header toolbar chips in the vertical tab panel header.",
@@ -339,6 +349,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.view_mode",
     description: "Display mode for the vertical tab bar.",
@@ -370,6 +381,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.display_granularity",
     description: "Granularity of rows displayed in the vertical tabs panel.",
@@ -401,6 +413,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.tab_item_mode",
     description: "Tab item display mode in vertical tabs.",
@@ -433,6 +446,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.primary_info",
     description: "The primary information displayed on vertical tabs.",
@@ -465,6 +479,7 @@ settings::macros::implement_setting_for_enum!(
     TabSettings,
     SupportedPlatforms::ALL,
     SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    surface: settings::SettingSurfaces::GUI,
     private: false,
     toml_path: "appearance.vertical_tabs.compact_subtitle",
     description: "Subtitle shown on compact vertical tabs.",
@@ -476,6 +491,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.tabs.show_indicators_button",
         description: "Whether to show activity indicators on tabs.",
@@ -485,6 +501,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "code.editor.show_code_review_button",
         description: "Whether to show the code review button on tabs.",
@@ -494,6 +511,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "code.editor.show_code_review_diff_stats",
         description: "Whether to show lines added/removed counts on the code review button.",
@@ -503,6 +521,7 @@ define_settings_group!(TabSettings, settings: [
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.tabs.preserve_active_tab_color",
         description: "Whether to preserve the active tab's color when switching tabs.",
@@ -512,6 +531,7 @@ define_settings_group!(TabSettings, settings: [
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.enabled",
         description: "Whether to display tabs vertically instead of horizontally.",
@@ -521,15 +541,27 @@ define_settings_group!(TabSettings, settings: [
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.show_panel_in_restored_windows",
         description: "When restoring a window, open the vertical tabs panel even if it was closed when the session was saved.",
+    },
+    hide_title_bar_search_bar_in_vertical_tabs: HideTitleBarSearchBarInVerticalTabs {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.vertical_tabs.hide_title_bar_search_bar",
+        description: "When using the vertical tab layout, hide the search bar in the title bar. Search stays available via the command palette and keyboard shortcuts.",
     },
     use_latest_user_prompt_as_conversation_title_in_tab_names: UseLatestUserPromptAsConversationTitleInTabNames {
         type: bool,
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.use_latest_prompt_as_title",
         description: "Whether vertical tab names for agent conversations use the latest user prompt.",
@@ -544,6 +576,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.show_pr_link",
         description: "Whether to show PR links on vertical tabs.",
@@ -553,6 +586,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.show_diff_stats",
         description: "Whether to show diff stats on vertical tabs.",
@@ -562,6 +596,7 @@ define_settings_group!(TabSettings, settings: [
         default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.show_details_on_hover",
         description: "Whether to show a details sidecar when hovering over a vertical tab.",

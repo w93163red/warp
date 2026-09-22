@@ -85,7 +85,7 @@ you skip it, expect build-script failures rather than compile errors.
 shim end to end on a real pty, standing in for the client, so the blocking
 contract can be checked without a GUI.
 
-See [WARP.md](WARP.md) for the full engineering guide — coding style, testing,
+See [AGENTS.md](AGENTS.md) for the full engineering guide — coding style, testing,
 and platform-specific notes.
 
 ## Licensing

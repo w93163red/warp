@@ -7,7 +7,10 @@ pub enum ManagedSecretType {
     AnthropicApiKey,
     AnthropicBedrockAccessKey,
     AnthropicBedrockApiKey,
+    AwsEcrCredential,
+    DockerRegistry,
     Dotenvx,
+    OpenaiApiKey,
     RawValue,
 }
 
@@ -18,7 +21,10 @@ impl ManagedSecretType {
             ManagedSecretType::AnthropicApiKey => "anthropic_api_key",
             ManagedSecretType::AnthropicBedrockAccessKey => "anthropic_bedrock_access_key",
             ManagedSecretType::AnthropicBedrockApiKey => "anthropic_bedrock_api_key",
+            ManagedSecretType::AwsEcrCredential => "aws_ecr_credential",
+            ManagedSecretType::DockerRegistry => "docker_registry",
             ManagedSecretType::Dotenvx => "dotenvx",
+            ManagedSecretType::OpenaiApiKey => "openai_api_key",
             ManagedSecretType::RawValue => "raw_value",
         }
     }

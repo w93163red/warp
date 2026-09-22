@@ -21,16 +21,20 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use command::r#async::Command;
 use command::Stdio;
+use command::r#async::Command;
 use futures::future::join_all;
 use tokio::fs as tokio_fs;
+use warp_util::standardized_path::StandardizedPath;
+use warpui::AppContext;
 use warpui::r#async::FutureExt as _;
 
 use crate::ai::agent::conversation::AIConversation;
 use crate::ai::agent::{AIAgentAction, AIAgentActionType, AIAgentOutputMessageType};
-use crate::ai::blocklist::agent_view::agent_input_footer::sort_environments_by_recency;
-use crate::ai::cloud_environments::{CloudAmbientAgentEnvironment, GithubRepo};
+use crate::ai::cloud_environments::{
+    CloudAmbientAgentEnvironment, GithubRepo, sort_environments_by_recency,
+};
+use crate::cloud_object::CloudObjectLookup as _;
 use crate::server::ids::SyncId;
 
 /// Cap on how many of the conversation's action results we scan for paths,
@@ -189,6 +193,36 @@ fn parse_github_repo(remote_url: &str) -> Option<GithubRepo> {
     Some(GithubRepo::new(owner, repo))
 }
 
+/// Resolve a single directory path to its enclosing git repo and parsed GitHub
+/// remote, if any.
+pub(crate) async fn resolve_repo_for_path(path: &Path) -> Option<TouchedRepo> {
+    let git_root = find_git_root(path).await?;
+    let repo_id = git_origin_url(&git_root)
+        .await
+        .as_deref()
+        .and_then(parse_github_repo);
+    Some(TouchedRepo { git_root, repo_id })
+}
+
+/// Suggests the available environment whose configured repositories overlap
+/// the Git repository containing `path`.
+pub fn suggest_handoff_environment(
+    path: PathBuf,
+    ctx: &AppContext,
+) -> impl std::future::Future<Output = Option<SyncId>> + Send + 'static {
+    let environments = CloudAmbientAgentEnvironment::get_all(ctx);
+    async move {
+        let touched_repo = resolve_repo_for_path(&path).await?;
+        pick_handoff_overlap_env(
+            &TouchedWorkspace {
+                repos: vec![touched_repo],
+                orphan_files: Vec::new(),
+            },
+            environments,
+        )
+    }
+}
+
 /// Pick the env that has the most overlap with the touched repos, breaking ties by
 /// recency. Returns `None` when no env contains any of the touched repos (or when
 /// `envs` is empty / the workspace touched no GitHub-mapped repos).
@@ -266,16 +300,23 @@ pub(crate) fn pick_handoff_overlap_env(
 /// write actions (plus the cwd of every exchange that ran shell commands),
 /// capped to the most recent [`MAX_TOOL_CALLS_TO_SCAN`] action results.
 ///
-/// The returned vec is deduplicated and may contain both absolute and
+/// Returns [`StandardizedPath`] values — every surviving path has been validated
+/// as absolute via [`StandardizedPath::try_new`], which handles both Unix and
+/// Windows encodings so remote POSIX paths are recognised correctly even on
+/// a Windows client.
+///
+/// The returned vec is deduplicated and may contain both directly-absolute and
 /// resolved-against-`working_directory` paths. Per-path filesystem checks
 /// (does the path exist? does it have a `.git` ancestor?) happen later in
 /// [`derive_touched_workspace`].
-pub(crate) fn extract_paths_from_conversation(conversation: &AIConversation) -> Vec<PathBuf> {
+pub(crate) fn extract_paths_from_conversation(
+    conversation: &AIConversation,
+) -> Vec<StandardizedPath> {
     // Walk exchanges newest-first so we can stop once we've consumed the cap.
     // Within each exchange we count every `Action` message against the budget
     // and bail early if we hit it mid-exchange.
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut paths: Vec<StandardizedPath> = Vec::new();
+    let mut seen: HashSet<StandardizedPath> = HashSet::new();
     let mut tool_calls_remaining = MAX_TOOL_CALLS_TO_SCAN;
 
     for exchange in conversation.all_exchanges().into_iter().rev() {
@@ -286,11 +327,11 @@ pub(crate) fn extract_paths_from_conversation(conversation: &AIConversation) -> 
 
         // Track the per-exchange cwd unconditionally (it doesn't count as a tool
         // call). Covers `RunShellCommand` cwds without walking action results.
-        if let Some(cwd) = cwd {
-            let cwd_path = PathBuf::from(cwd);
-            if cwd_path.is_absolute() && seen.insert(cwd_path.clone()) {
-                paths.push(cwd_path);
-            }
+        if let Some(cwd) = cwd
+            && let Ok(sp) = StandardizedPath::try_new(cwd)
+            && seen.insert(sp.clone())
+        {
+            paths.push(sp);
         }
 
         let Some(output) = exchange.output_status.output() else {
@@ -318,8 +359,8 @@ pub(crate) fn extract_paths_from_conversation(conversation: &AIConversation) -> 
 fn extract_action_paths(
     action: &AIAgentAction,
     cwd: Option<&str>,
-    paths: &mut Vec<PathBuf>,
-    seen: &mut HashSet<PathBuf>,
+    paths: &mut Vec<StandardizedPath>,
+    seen: &mut HashSet<StandardizedPath>,
 ) {
     match &action.action {
         // Write actions: the agent authored or replaced these files. Safe to
@@ -355,40 +396,49 @@ fn extract_action_paths(
         | AIAgentActionType::CreateDocuments(_)
         | AIAgentActionType::UseComputer(_)
         | AIAgentActionType::RequestComputerUse(_)
+        | AIAgentActionType::StartRecording { .. }
+        | AIAgentActionType::StopRecording { .. }
         | AIAgentActionType::ReadSkill(_)
         | AIAgentActionType::FetchConversation { .. }
-        | AIAgentActionType::StartAgent { .. }
         | AIAgentActionType::SendMessageToAgent { .. }
         | AIAgentActionType::TransferShellCommandControlToUser { .. }
         | AIAgentActionType::AskUserQuestion { .. }
-        | AIAgentActionType::RunAgents(_) => {}
+        | AIAgentActionType::RunAgents(_)
+        | AIAgentActionType::WaitForEvents { .. } => {}
     }
 }
 
 /// Push `raw` into `paths` after resolving it against `cwd` if necessary.
+/// Uses [`StandardizedPath`] for platform-aware absolute-path detection so
+/// POSIX remote paths are handled correctly even on Windows clients.
 /// Empty / `None` entries are ignored.
 fn push_resolved(
     raw: Option<&str>,
     cwd: Option<&str>,
-    paths: &mut Vec<PathBuf>,
-    seen: &mut HashSet<PathBuf>,
+    paths: &mut Vec<StandardizedPath>,
+    seen: &mut HashSet<StandardizedPath>,
 ) {
     let Some(raw) = raw else { return };
     let raw = raw.trim();
     if raw.is_empty() {
         return;
     }
-    let candidate = Path::new(raw);
-    let resolved = if candidate.is_absolute() {
-        candidate.to_path_buf()
+    // Try to validate as an absolute path using StandardizedPath, which
+    // correctly handles both Unix and Windows path encodings.
+    let sp = if let Ok(sp) = StandardizedPath::try_new(raw) {
+        sp
     } else if let Some(cwd) = cwd {
-        Path::new(cwd).join(candidate)
+        // Relative path — resolve against the exchange cwd.
+        let joined = format!("{cwd}/{raw}");
+        match StandardizedPath::try_new(&joined) {
+            Ok(sp) => sp,
+            Err(_) => return,
+        }
     } else {
-        // No cwd context, no absolute path — we have nothing actionable.
         return;
     };
-    if seen.insert(resolved.clone()) {
-        paths.push(resolved);
+    if seen.insert(sp.clone()) {
+        paths.push(sp);
     }
 }
 

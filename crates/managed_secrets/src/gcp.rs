@@ -1,10 +1,8 @@
-use std::{
-    collections::HashMap,
-    ffi::OsString,
-    io::Write,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -99,6 +97,12 @@ impl GcpCredentials {
             config_file,
             output_file,
         })
+    }
+
+    /// Path to the credential configuration file that GCP SDKs and the
+    /// `gcloud` CLI discover via `GOOGLE_APPLICATION_CREDENTIALS`.
+    pub fn config_file_path(&self) -> &Path {
+        self.config_file.path()
     }
 
     /// Environment variables to set in a session in order to use this GCP

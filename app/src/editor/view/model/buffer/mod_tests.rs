@@ -2,20 +2,21 @@
 // which is at odds with this clippy rule.
 #![allow(clippy::single_range_in_vec_init)]
 
-use crate::editor::{soft_wrap::ClampDirection, tests::RandomCharIter};
-use async_channel::Receiver;
-use test::Network;
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::pin::{Pin, pin};
 
-use super::*;
+use async_channel::Receiver;
 use enclose::enclose;
 use futures::StreamExt;
 use rand::prelude::StdRng;
-use std::{
-    cmp::Ordering,
-    collections::HashSet,
-    pin::{pin, Pin},
-};
-use warpui::{color::ColorU, App, ModelHandle};
+use test::Network;
+use warpui::color::ColorU;
+use warpui::{App, ModelHandle};
+
+use super::*;
+use crate::editor::soft_wrap::ClampDirection;
+use crate::editor::tests::RandomCharIter;
 
 fn visible_text_styles(buffer: &Buffer) -> Vec<Option<TextStyle>> {
     buffer
@@ -2731,7 +2732,7 @@ fn test_random_concurrent_operations() {
                 let replica_id = replica_ids[replica_index].clone();
                 let (buffer, ops_rx) = &buffers[replica_index];
                 let mut ops_rx = ops_rx.clone();
-                if mutation_count > 0 && rng.gen() {
+                if mutation_count > 0 && rng.r#gen() {
                     let mutation_type = buffer.update(&mut app, |buffer, ctx| {
                         buffer.randomly_mutate(&mut rng, ctx)
                     });
@@ -3788,9 +3789,11 @@ fn test_receiving_selection_change_before_edit() {
                 .expect("can apply selection change to replica 2");
 
             assert_eq!(buffer.text(), "abc");
-            assert!(buffer
-                .selections_for_replica(replica_1_id.clone())
-                .is_empty(),);
+            assert!(
+                buffer
+                    .selections_for_replica(replica_1_id.clone())
+                    .is_empty(),
+            );
         });
 
         buffer_2.update(&mut app, |buffer, ctx| {

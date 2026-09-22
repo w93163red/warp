@@ -1,29 +1,51 @@
-use pathfinder_geometry::vector::vec2f;
-use session_sharing_protocol::sharer::SessionSourceType;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
+
+use chrono::Utc;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use futures::channel::oneshot;
+use pathfinder_geometry::vector::vec2f;
+use persistence::model::ConversationUsageMetadata;
+use session_sharing_protocol::sharer::SessionSourceType;
 use warp_multi_agent_api::{self as api, client_action as api_client_action};
-
-use crate::ai::agent::conversation::ConversationStatus;
-use crate::ai::agent::AIAgentInput;
-use crate::ai::agent_conversations_model::{AgentConversationsModel, AgentRunDisplayStatus};
-use crate::ai::ambient_agents::task::TaskCreatorInfo;
-use crate::ai::ambient_agents::{AgentSource, AmbientAgentTask, AmbientAgentTaskState};
-use crate::ai::blocklist::history_model::BlocklistAIHistoryModel;
-use crate::auth::user::TEST_USER_UID;
 use warpui::platform::WindowStyle;
-use warpui::{App, ViewHandle};
-
-use crate::context_chips::prompt_type::PromptType;
-use crate::editor::InteractionState;
-
-use crate::terminal::model::blocks::{ToTotalIndex as _, INLINE_BANNER_HEIGHT};
-use crate::terminal::view::shared_session::test_utils::terminal_view_for_viewer;
-use crate::terminal::TerminalView;
-use crate::test_util::add_window_with_terminal;
-use crate::test_util::terminal::initialize_app_for_terminal_view;
-use crate::{assert_lines_approx_eq, FeatureFlag};
+use warpui::{App, EntityId, TypedActionView, ViewHandle};
 
 use super::*;
+use crate::ai::agent::api::ServerConversationToken;
+use crate::ai::agent::conversation::{
+    AIAgentHarness, AIConversation, ConversationStatus, ServerAIConversationMetadata,
+};
+use crate::ai::agent::{AIAgentInput, UserQueryMode};
+use crate::ai::agent_conversations_model::{
+    AgentConversationsModel, AgentConversationsModelEvent, AgentRunDisplayStatus,
+};
+use crate::ai::ambient_agents::task::{TaskPrincipalInfo, TaskStatusErrorCode, TaskStatusMessage};
+use crate::ai::ambient_agents::{
+    AgentSource, AmbientAgentTask, AmbientAgentTaskId, AmbientAgentTaskState,
+};
+use crate::ai::blocklist::history_model::BlocklistAIHistoryModel;
+use crate::auth::user::TEST_USER_UID;
+use crate::cloud_object::{Owner, Revision, ServerMetadata, ServerPermissions};
+use crate::context_chips::prompt_type::PromptType;
+use crate::editor::InteractionState;
+use crate::pane_group::{BackingView, PaneConfigurationEvent};
+use crate::server::ids::ServerId;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::server::server_api::ai::SpawnAgentRequest;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::server::team_scope::RequestTeamScope;
+use crate::terminal::TerminalView;
+use crate::terminal::model::blocks::{INLINE_BANNER_HEIGHT, ToTotalIndex as _};
+use crate::terminal::model::terminal_model::ConversationTranscriptViewerStatus;
+use crate::terminal::view::shared_session::test_utils::terminal_view_for_viewer;
+use crate::terminal::view::{AIQueryRouting, TerminalAction, resolve_ai_query_routing};
+use crate::test_util::add_window_with_terminal;
+use crate::test_util::terminal::initialize_app_for_terminal_view;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+use crate::workspaces::user_workspaces::TeamlessScopeForTest;
+use crate::{FeatureFlag, assert_lines_approx_eq};
 
 #[test]
 fn test_prompt_context_menu_items_shared_session_viewer_no_edit_prompt() {
@@ -65,6 +87,186 @@ fn test_prompt_context_menu_items_shared_session_viewer_no_edit_prompt() {
             assert!(items[2].fields().unwrap().is_disabled());
         });
     })
+}
+
+#[test]
+fn test_on_ambient_agent_execution_ended_enables_followup_input_for_editable_non_owner_finished_view()
+ {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task = create_cloud_mode_task_for_user("another-user");
+        let task_id = task.task_id;
+
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::Oz,
+            current_user_owner_permissions(),
+        );
+        let initial_block_height_items = terminal.read(&app, |view, _| {
+            view.model.lock().block_list().block_heights().items().len()
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            let mut model = view.model.lock();
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
+            model.set_shared_session_status(SharedSessionStatus::FinishedViewer);
+            drop(model);
+
+            view.on_ambient_agent_execution_ended(ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let model = view.model.lock();
+            assert_eq!(
+                model.block_list().block_heights().items().len(),
+                initial_block_height_items
+            );
+            assert!(matches!(
+                model.shared_session_status(),
+                SharedSessionStatus::NotShared
+            ));
+            assert!(view.conversation_ended_tombstone_view_id.is_none());
+            assert_eq!(view.pending_cloud_followup_task_id, Some(task_id));
+            assert!(view.is_input_box_visible(&model, ctx));
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Editable
+            );
+        });
+    });
+}
+
+#[test]
+fn test_begin_viewing_ambient_session_creates_and_wires_model_for_link_join_viewer() {
+    // REMOTE-2047: a raw shared_session link that turns out to be an ambient run starts as a
+    // plain viewer with no ambient view model. begin_viewing_ambient_session (invoked from the
+    // viewer SessionJoined handler) must create + wire the model, record the task, and mark the
+    // live session so follow-ups route to the sharer while the run is live.
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task_id = "33333333-3333-3333-3333-333333333333"
+            .parse::<AmbientAgentTaskId>()
+            .expect("hardcoded task id parses");
+        let session_id = SessionId::new();
+
+        terminal.read(&app, |view, _| {
+            assert!(
+                view.ambient_agent_view_model().is_none(),
+                "a generic shared-session viewer starts without an ambient view model"
+            );
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.begin_viewing_ambient_session(task_id, session_id, ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let model = view
+                .ambient_agent_view_model()
+                .expect("begin_viewing_ambient_session should create the ambient view model")
+                .as_ref(ctx);
+            assert_eq!(model.task_id(), Some(task_id));
+            assert!(
+                !model.is_ready_for_cloud_followup_prompt(),
+                "the recorded live session must gate cloud follow-up while the run is live"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_begin_viewing_ambient_session_emits_view_model_created_event_once() {
+    // REMOTE-2047: `PaneGroup::create_shared_session_viewer` wires the viewer
+    // `TerminalManager` to the lazily-created ambient model by subscribing to
+    // `Event::AmbientAgentViewModelCreated`. That wiring is what routes a post-session-end
+    // follow-up to a new VM, so guard the contract that lazily creating the model emits the
+    // event exactly once (idempotent reuse must not re-emit).
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task_id = "55555555-5555-5555-5555-555555555555"
+            .parse::<AmbientAgentTaskId>()
+            .expect("hardcoded task id parses");
+        let session_id = SessionId::new();
+
+        let created_events = Rc::new(RefCell::new(0usize));
+        let created_events_for_cb = created_events.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_view, event, _ctx| {
+                if matches!(
+                    event,
+                    crate::terminal::view::Event::AmbientAgentViewModelCreated
+                ) {
+                    *created_events_for_cb.borrow_mut() += 1;
+                }
+            });
+        });
+
+        // Lazy create: a link-join viewer has no ambient model until it discovers the run.
+        terminal.update(&mut app, |view, ctx| {
+            view.begin_viewing_ambient_session(task_id, session_id, ctx);
+        });
+        assert_eq!(
+            *created_events.borrow(),
+            1,
+            "lazily creating the ambient view model must emit AmbientAgentViewModelCreated"
+        );
+
+        // Idempotent: a second call reuses the existing model and must not re-emit.
+        terminal.update(&mut app, |view, ctx| {
+            view.begin_viewing_ambient_session(task_id, session_id, ctx);
+        });
+        assert_eq!(
+            *created_events.borrow(),
+            1,
+            "reusing the existing ambient view model must not re-emit the event"
+        );
+    });
+}
+
+#[test]
+fn test_begin_viewing_ambient_session_reuses_existing_model_for_cloud_pane() {
+    // The upfront cloud-mode path already created the ambient view model at construction;
+    // begin_viewing_ambient_session must reuse it (idempotent) rather than replacing it.
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task_id = "44444444-4444-4444-4444-444444444444"
+            .parse::<AmbientAgentTaskId>()
+            .expect("hardcoded task id parses");
+        let session_id = SessionId::new();
+
+        let original_model_id = terminal.read(&app, |view, _| {
+            view.ambient_agent_view_model()
+                .expect("cloud mode terminal has an ambient view model")
+                .id()
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.begin_viewing_ambient_session(task_id, session_id, ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal still has an ambient view model");
+            assert_eq!(
+                model.id(),
+                original_model_id,
+                "begin_viewing_ambient_session must reuse the existing model, not replace it"
+            );
+            assert_eq!(model.as_ref(ctx).task_id(), Some(task_id));
+        });
+    });
 }
 
 #[test]
@@ -405,7 +607,8 @@ fn test_on_session_share_ended_restores_size_after_viewer_driven_resize() {
 }
 
 #[test]
-fn test_on_session_share_ended_inserts_tombstone_for_ambient_session_under_cloud_mode_setup_v2() {
+fn test_on_session_share_ended_does_not_insert_tombstone_for_ambient_session_under_cloud_mode_setup_v2()
+ {
     let _flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
 
     App::test((), |mut app| async move {
@@ -417,15 +620,64 @@ fn test_on_session_share_ended_inserts_tombstone_for_ambient_session_under_cloud
         terminal.update(&mut app, |view, ctx| {
             view.model
                 .lock()
-                .set_shared_session_source_type(SessionSourceType::AmbientAgent { task_id: None });
+                .set_shared_session_source(SharedSessionSource::ambient_agent(None));
             view.on_session_share_ended(ctx);
         });
 
         terminal.read(&app, |view, _| {
             let final_block_height_items =
                 view.model.lock().block_list().block_heights().items().len();
-            // Shared session ended banner + conversation ended tombstone.
-            assert_eq!(final_block_height_items, initial_block_height_items + 2);
+            // Only shared session ended banner. Ended-state continuation UI is
+            // driven by the task resolver path under CloudModeSetupV2.
+            assert_eq!(final_block_height_items, initial_block_height_items + 1);
+            assert!(view.conversation_ended_tombstone_view_id.is_none());
+        });
+    });
+}
+
+#[test]
+fn test_on_session_share_ended_skips_cloud_continuation_for_user_share_with_task_id() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let task = create_cloud_mode_task_for_user("another-user");
+        let task_id = task.task_id;
+
+        AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
+            model.insert_task_for_test(task);
+        });
+        let initial_block_height_items = terminal.read(&app, |view, _| {
+            view.model.lock().block_list().block_heights().items().len()
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_shared_session_source(SharedSessionSource::user(Some(task_id.to_string())));
+
+            view.on_session_share_ended(ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let model = view.model.lock();
+            assert_eq!(
+                model.block_list().block_heights().items().len(),
+                initial_block_height_items + 1
+            );
+            assert!(view.conversation_ended_tombstone_view_id.is_none());
+            assert_eq!(view.pending_cloud_followup_task_id, None);
+            assert!(view.is_input_box_visible(&model, ctx));
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Editable
+            );
         });
     });
 }
@@ -441,15 +693,18 @@ fn create_cloud_mode_task_for_user(creator_uid: &str) -> AmbientAgentTask {
         created_at: now,
         started_at: Some(now),
         updated_at: now,
+        run_time: Some("PT1S".parse().unwrap()),
         status_message: None,
         source: Some(AgentSource::CloudMode),
+        execution_location: None,
         session_id: None,
         session_link: None,
-        creator: Some(TaskCreatorInfo {
+        creator: Some(TaskPrincipalInfo {
             creator_type: "USER".to_string(),
             uid: creator_uid.to_string(),
             display_name: None,
         }),
+        executor: None,
         conversation_id: None,
         request_usage: None,
         is_sandbox_running: false,
@@ -457,7 +712,221 @@ fn create_cloud_mode_task_for_user(creator_uid: &str) -> AmbientAgentTask {
         artifacts: vec![],
         last_event_sequence: None,
         children: vec![],
+        debug_agent_available: false,
+        scope: None,
     }
+}
+
+fn insert_cloud_mode_task_with_server_metadata(
+    app: &mut App,
+    terminal_view_id: EntityId,
+    mut task: AmbientAgentTask,
+    harness: AIAgentHarness,
+    permissions: ServerPermissions,
+) {
+    let task_id = task.task_id;
+    let conversation_token = task_id.to_string();
+    task.conversation_id = Some(conversation_token.clone());
+
+    AgentConversationsModel::handle(app).update(app, |model, _| {
+        model.insert_task_for_test(task);
+    });
+    BlocklistAIHistoryModel::handle(app).update(app, |model, ctx| {
+        let conversation_id =
+            model.start_new_conversation(terminal_view_id, false, false, false, ctx);
+        model.set_server_conversation_token_for_conversation(
+            conversation_id,
+            conversation_token.clone(),
+        );
+        model.set_server_metadata_for_conversation(
+            conversation_id,
+            server_conversation_metadata(harness, task_id, conversation_token, permissions),
+            ctx,
+        );
+    });
+}
+
+fn server_conversation_metadata(
+    harness: AIAgentHarness,
+    ambient_agent_task_id: AmbientAgentTaskId,
+    server_conversation_token: String,
+    permissions: ServerPermissions,
+) -> ServerAIConversationMetadata {
+    ServerAIConversationMetadata {
+        title: "Conversation".to_string(),
+        working_directory: None,
+        harness,
+        usage: ConversationUsageMetadata {
+            was_summarized: false,
+            context_window_usage: 0.0,
+            credits_spent: 0.0,
+            platform_credits_spent: 0.0,
+            total_provider_cost_in_cents: None,
+            credits_spent_for_last_block: None,
+            charged_usage_for_last_block: None,
+            total_charged_usage: None,
+            token_usage: vec![],
+            tool_usage_metadata: Default::default(),
+            context_window_segments: Vec::new(),
+        },
+        metadata: ServerMetadata {
+            uid: ServerId::default(),
+            revision: Revision::now(),
+            metadata_last_updated_ts: Utc::now().into(),
+            trashed_ts: None,
+            folder_id: None,
+            is_welcome_object: false,
+            creator_uid: None,
+            last_editor_uid: None,
+            current_editor_uid: None,
+        },
+        creator: None,
+        permissions,
+        ambient_agent_task_id: Some(ambient_agent_task_id),
+        server_conversation_token: ServerConversationToken::new(server_conversation_token),
+        artifacts: vec![],
+    }
+}
+
+fn current_user_owner_permissions() -> ServerPermissions {
+    server_permissions(Owner::mock_current_user())
+}
+
+fn server_permissions(space: Owner) -> ServerPermissions {
+    ServerPermissions {
+        space,
+        guests: vec![],
+        anyone_link_sharing: None,
+        permissions_last_updated_ts: Utc::now().into(),
+    }
+}
+
+fn configure_ambient_details_panel_test(
+    app: &mut App,
+    terminal: &ViewHandle<TerminalView>,
+    task: AmbientAgentTask,
+) -> AmbientAgentTaskId {
+    let task_id = task.task_id;
+    AgentConversationsModel::handle(app).update(app, |model, _| {
+        model.insert_task_for_test(task);
+    });
+    terminal.update(app, |view, _| {
+        view.model
+            .lock()
+            .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
+    });
+    task_id
+}
+
+#[test]
+fn test_conversation_details_auto_open_policy_defaults_to_open_for_ambient_shared_session() {
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task_id = configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.update(&mut app, |view, ctx| {
+            assert_eq!(
+                view.ambient_agent_task_id_for_details_panel(ctx),
+                Some(task_id)
+            );
+            assert!(!view.is_conversation_details_panel_open);
+            assert!(!view.has_auto_opened_conversation_details_panel);
+
+            view.maybe_auto_open_conversation_details_panel(ctx);
+
+            assert!(view.is_conversation_details_panel_open);
+            assert!(view.has_auto_opened_conversation_details_panel);
+            assert!(
+                view.conversation_details_panel
+                    .as_ref(ctx)
+                    .task_display_status_for_test()
+                    .is_some(),
+                "auto-open should fetch details when details are available"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_suppressed_conversation_details_auto_open_consumes_initial_open_but_manual_toggle_works() {
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.update(&mut app, |view, ctx| {
+            view.suppress_initial_conversation_details_panel_auto_open();
+
+            view.maybe_auto_open_conversation_details_panel(ctx);
+
+            assert!(!view.is_conversation_details_panel_open);
+            assert!(view.has_auto_opened_conversation_details_panel);
+            assert!(
+                view.conversation_details_panel
+                    .as_ref(ctx)
+                    .task_display_status_for_test()
+                    .is_none(),
+                "suppressed auto-open should not fetch details"
+            );
+
+            view.handle_action(&TerminalAction::ToggleConversationDetailsPanel, ctx);
+
+            assert!(view.is_conversation_details_panel_open);
+            assert!(
+                view.conversation_details_panel
+                    .as_ref(ctx)
+                    .task_display_status_for_test()
+                    .is_some(),
+                "manual toggle should fetch details after suppressed auto-open"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_child_shared_session_link_keeps_default_conversation_details_auto_open() {
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task_id = configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.update(&mut app, |view, ctx| {
+            let parent_conversation_id =
+                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+                    history_model.start_new_conversation(view.id(), false, false, false, ctx)
+                });
+            let mut child_conversation = AIConversation::new(true, false);
+            child_conversation.set_parent_conversation_id(parent_conversation_id);
+            child_conversation.set_task_id(task_id);
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+                history_model.restore_conversations(view.id(), vec![child_conversation], ctx);
+            });
+
+            view.maybe_auto_open_conversation_details_panel(ctx);
+
+            assert!(view.is_conversation_details_panel_open);
+            assert!(view.has_auto_opened_conversation_details_panel);
+            assert!(
+                view.conversation_details_panel
+                    .as_ref(ctx)
+                    .task_display_status_for_test()
+                    .is_some(),
+                "child task metadata alone should not suppress direct-link auto-open"
+            );
+        });
+    });
 }
 
 fn cloud_mode_terminal_for_test(app: &mut App) -> ViewHandle<TerminalView> {
@@ -467,6 +936,416 @@ fn cloud_mode_terminal_for_test(app: &mut App) -> ViewHandle<TerminalView> {
         TerminalView::new_for_test_with_cloud_mode(tips_model, None, true, ctx)
     });
     terminal
+}
+
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+fn handoff_request_for_test() -> SpawnAgentRequest {
+    SpawnAgentRequest {
+        prompt: Some("Continue".to_owned()),
+        mode: UserQueryMode::Normal,
+        config: None,
+        title: None,
+        team: Some(false),
+        agent_identity_uid: None,
+        skill: None,
+        attachments: Vec::new(),
+        interactive: Some(true),
+        parent_run_id: None,
+        runtime_skills: Vec::new(),
+        referenced_attachments: Vec::new(),
+        conversation_id: None,
+        initial_snapshot_token: None,
+        snapshot_disabled: None,
+        orchestration_handoff: None,
+    }
+}
+
+#[test]
+fn test_ambient_session_join_auto_opens_details_panel() {
+    let _cloud_mode_flag = FeatureFlag::CloudMode.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let firebase_uid = UserUid::new("mock_firebase_uid");
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ViewPending);
+            view.on_session_share_joined(
+                ParticipantId::new(),
+                firebase_uid,
+                ReplicaId::random(),
+                Box::new(ParticipantList::default()),
+                SessionId::new(),
+                SessionSourceType::AmbientAgent { task_id: None },
+                ctx,
+            );
+        });
+
+        terminal.read(&app, |view, _| {
+            assert!(view.is_conversation_details_panel_open);
+            assert!(view.has_auto_opened_conversation_details_panel);
+        });
+    });
+}
+
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+#[test]
+fn test_local_to_cloud_handoff_session_join_keeps_details_panel_hidden() {
+    let _cloud_mode_flag = FeatureFlag::CloudMode.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let firebase_uid = UserUid::new("mock_firebase_uid");
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ViewPending);
+            let ambient_agent_view_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have an ambient agent view model")
+                .clone();
+            ambient_agent_view_model.update(ctx, |model, ctx| {
+                let (cancel, _) = oneshot::channel();
+                model.begin_local_to_cloud_handoff(
+                    handoff_request_for_test(),
+                    RequestTeamScope::from_scope(&TeamlessScopeForTest),
+                    cancel,
+                    ctx,
+                );
+            });
+
+            view.on_session_share_joined(
+                ParticipantId::new(),
+                firebase_uid,
+                ReplicaId::random(),
+                Box::new(ParticipantList::default()),
+                SessionId::new(),
+                SessionSourceType::AmbientAgent { task_id: None },
+                ctx,
+            );
+        });
+
+        terminal.read(&app, |view, _| {
+            assert!(!view.is_conversation_details_panel_open);
+            assert!(!view.has_auto_opened_conversation_details_panel);
+        });
+    });
+}
+
+#[test]
+fn test_cloud_cloud_handoff_session_join_keeps_closed_details_panel_hidden() {
+    let _cloud_mode_flag = FeatureFlag::CloudMode.override_enabled(true);
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        let task_id = task.task_id;
+        let firebase_uid = UserUid::new("mock_firebase_uid");
+
+        AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
+            model.insert_task_for_test(task);
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            let ambient_agent_view_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .clone();
+            ambient_agent_view_model.update(ctx, |model, ctx| {
+                model.enter_viewing_existing_session(task_id, ctx);
+            });
+
+            assert!(!view.is_conversation_details_panel_open);
+            assert!(!view.has_auto_opened_conversation_details_panel);
+
+            view.enable_cloud_followup_input(task_id, ctx);
+            view.handle_ambient_agent_event(
+                &crate::terminal::view::ambient_agent::AmbientAgentViewModelEvent::ExecutionSessionReady {
+                    session_id: SessionId::new(),
+                },
+                ctx,
+            );
+
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ViewPending);
+            view.on_session_share_joined(
+                ParticipantId::new(),
+                firebase_uid,
+                ReplicaId::random(),
+                Box::new(ParticipantList::default()),
+                SessionId::new(),
+                SessionSourceType::AmbientAgent {
+                    task_id: Some(task_id.to_string()),
+                },
+                ctx,
+            );
+        });
+
+        terminal.read(&app, |view, _| {
+            assert!(!view.is_conversation_details_panel_open);
+            assert!(view.has_auto_opened_conversation_details_panel);
+        });
+    });
+}
+
+#[test]
+fn test_cloud_cloud_handoff_session_join_respects_details_panel_closed_after_followup_input() {
+    let _cloud_mode_flag = FeatureFlag::CloudMode.override_enabled(true);
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        let task_id = task.task_id;
+        let firebase_uid = UserUid::new("mock_firebase_uid");
+
+        AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
+            model.insert_task_for_test(task);
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            let ambient_agent_view_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .clone();
+            ambient_agent_view_model.update(ctx, |model, ctx| {
+                model.enter_viewing_existing_session(task_id, ctx);
+            });
+
+            view.is_conversation_details_panel_open = true;
+            view.fetch_and_update_conversation_details_panel(ctx);
+            assert!(view.is_conversation_details_panel_open);
+
+            view.enable_cloud_followup_input(task_id, ctx);
+            view.handle_action(&TerminalAction::ToggleConversationDetailsPanel, ctx);
+            assert!(!view.is_conversation_details_panel_open);
+            assert!(!view.has_auto_opened_conversation_details_panel);
+
+            view.handle_ambient_agent_event(
+                &crate::terminal::view::ambient_agent::AmbientAgentViewModelEvent::ExecutionSessionReady {
+                    session_id: SessionId::new(),
+                },
+                ctx,
+            );
+
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ViewPending);
+            view.on_session_share_joined(
+                ParticipantId::new(),
+                firebase_uid,
+                ReplicaId::random(),
+                Box::new(ParticipantList::default()),
+                SessionId::new(),
+                SessionSourceType::AmbientAgent {
+                    task_id: Some(task_id.to_string()),
+                },
+                ctx,
+            );
+        });
+
+        terminal.read(&app, |view, _| {
+            assert!(!view.is_conversation_details_panel_open);
+            assert!(view.has_auto_opened_conversation_details_panel);
+        });
+    });
+}
+#[test]
+fn test_restored_ambient_view_resolves_cta_from_view_model_task_id() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task = create_cloud_mode_task_for_user("another-user");
+        let task_id = task.task_id;
+
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::ClaudeCode,
+            current_user_owner_permissions(),
+        );
+
+        terminal.update(&mut app, |view, ctx| {
+            let ambient_agent_view_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .clone();
+            ambient_agent_view_model.update(ctx, |model, ctx| {
+                model.enter_viewing_existing_session(task_id, ctx);
+            });
+
+            {
+                let model = view.model.lock();
+                assert!(!model.is_shared_ambient_agent_session());
+                assert!(model.conversation_transcript_viewer_status().is_none());
+            }
+
+            let state = view
+                .cloud_conversation_continuation_ui_state(ctx)
+                .expect("ambient view model task ID should pass the continuation gate");
+            assert!(matches!(
+                state,
+                CloudConversationContinuationUiState::Tombstone {
+                    cta: Some(TombstoneCta::ContinueInCloud { task_id: resolved_task_id })
+                } if resolved_task_id == task_id
+            ));
+        });
+    });
+}
+
+/// Resolves the follow-up routing for `view` using the same source of truth as the submission
+/// path (`Input::ai_query_routing`) and the footer live-VM indicator.
+fn query_routing(view: &TerminalView, ctx: &AppContext) -> AIQueryRouting {
+    let model = view.model.lock();
+    resolve_ai_query_routing(view.id(), view.ambient_agent_view_model(), &model, ctx)
+}
+
+#[test]
+fn test_continue_in_cloud_tombstone_routes_third_party_followup_to_new_cloud_vm() {
+    // REMOTE-2047: a third-party harness (Claude Code, etc.) run that ended surfaces a "Continue"
+    // tombstone instead of an inline follow-up input. While the pane is still a finished (read-only)
+    // viewer the follow-up routing is `UnconnectedReadOnly` (submission blocked with a toast).
+    // Clicking Continue (`start_cloud_followup_from_tombstone`) clears the finished-viewer state and
+    // enables the input, so the routing must flip to `NewCloudVm` and the follow-up starts a new
+    // cloud VM via cloud-to-cloud handoff.
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        let task_id = task.task_id;
+
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::ClaudeCode,
+            current_user_owner_permissions(),
+        );
+
+        terminal.update(&mut app, |view, ctx| {
+            let ambient_agent_view_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .clone();
+            ambient_agent_view_model.update(ctx, |model, ctx| {
+                model.enter_viewing_existing_session(task_id, ctx);
+            });
+            // Simulate the live shared session ending: the pane is now a finished (read-only)
+            // viewer of the ended ambient run.
+            {
+                let mut model = view.model.lock();
+                model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    task_id.to_string(),
+                )));
+                model.set_shared_session_status(SharedSessionStatus::FinishedViewer);
+            }
+
+            // The ended third-party run resolves to the "Continue in cloud" tombstone.
+            assert!(matches!(
+                view.cloud_conversation_continuation_ui_state(ctx),
+                Some(CloudConversationContinuationUiState::Tombstone {
+                    cta: Some(TombstoneCta::ContinueInCloud { task_id: resolved }),
+                }) if resolved == task_id
+            ));
+
+            // Before clicking Continue, the finished viewer is read-only and follow-ups are blocked.
+            assert_eq!(
+                query_routing(view, ctx),
+                AIQueryRouting::UnconnectedReadOnly
+            );
+
+            // Click "Continue" on the tombstone (the real handler for that button).
+            view.start_cloud_followup_from_tombstone(task_id, ctx);
+
+            // Continue cleared the finished-viewer state, so the pane is editable...
+            assert!(matches!(
+                view.model.lock().shared_session_status(),
+                SharedSessionStatus::NotShared
+            ));
+            // ...and the follow-up now starts a new cloud VM instead of being blocked.
+            assert_eq!(
+                query_routing(view, ctx),
+                AIQueryRouting::NewCloudVm { task_id }
+            );
+        });
+    });
+}
+
+#[test]
+fn test_restored_oz_edit_access_non_owner_finished_view_uses_followup_input_without_tombstone() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task = create_cloud_mode_task_for_user("another-user");
+        let task_id = task.task_id;
+
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::Oz,
+            current_user_owner_permissions(),
+        );
+
+        terminal.update(&mut app, |view, ctx| {
+            view.input().update(ctx, |input, ctx| {
+                input.editor().update(ctx, |editor, ctx| {
+                    editor.set_interaction_state(InteractionState::Selectable, ctx);
+                });
+            });
+            let ambient_agent_view_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .clone();
+            ambient_agent_view_model.update(ctx, |model, ctx| {
+                model.enter_viewing_existing_session(task_id, ctx);
+            });
+            let initial_block_height_items = {
+                let mut model = view.model.lock();
+                model.set_shared_session_status(SharedSessionStatus::FinishedViewer);
+                model.block_list().block_heights().items().len()
+            };
+
+            view.insert_conversation_ended_tombstone_with_resolved_cta(ctx);
+
+            assert_eq!(
+                view.model.lock().block_list().block_heights().items().len(),
+                initial_block_height_items
+            );
+            assert!(view.conversation_ended_tombstone_view_id.is_none());
+            assert_eq!(view.pending_cloud_followup_task_id, Some(task_id));
+            {
+                let model = view.model.lock();
+                assert!(matches!(
+                    model.shared_session_status(),
+                    SharedSessionStatus::NotShared
+                ));
+                assert!(view.is_input_box_visible(&model, ctx));
+            }
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Editable
+            );
+        });
+    });
 }
 
 #[test]
@@ -480,9 +1359,13 @@ fn test_on_session_share_ended_enables_followup_input_without_tombstone_for_owne
         let task = create_cloud_mode_task_for_user(TEST_USER_UID);
         let task_id = task.task_id;
 
-        AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
-            model.insert_task_for_test(task);
-        });
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::Oz,
+            current_user_owner_permissions(),
+        );
         let initial_block_height_items = terminal.read(&app, |view, _| {
             view.model.lock().block_list().block_heights().items().len()
         });
@@ -490,9 +1373,9 @@ fn test_on_session_share_ended_enables_followup_input_without_tombstone_for_owne
         terminal.update(&mut app, |view, ctx| {
             view.model
                 .lock()
-                .set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                    task_id: Some(task_id.to_string()),
-                });
+                .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    task_id.to_string(),
+                )));
             view.on_session_share_ended(ctx);
         });
 
@@ -515,14 +1398,73 @@ fn test_on_session_share_ended_enables_followup_input_without_tombstone_for_owne
 }
 
 #[test]
-fn test_on_session_share_ended_inserts_tombstone_for_owned_ambient_session_without_handoff() {
-    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(false);
+fn test_on_session_share_ended_shows_tombstone_for_github_action_ambient_session() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let mut task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        task.source = Some(AgentSource::GitHubAction);
+        let task_id = task.task_id;
+
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::Oz,
+            current_user_owner_permissions(),
+        );
+        let initial_block_height_items = terminal.read(&app, |view, _| {
+            view.model.lock().block_list().block_heights().items().len()
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    task_id.to_string(),
+                )));
+            view.on_session_share_ended(ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let model = view.model.lock();
+            assert_eq!(
+                model.block_list().block_heights().items().len(),
+                initial_block_height_items + 2
+            );
+            assert!(view.conversation_ended_tombstone_view_id.is_some());
+            assert_eq!(view.pending_cloud_followup_task_id, None);
+            assert!(!view.is_input_box_visible(&model, ctx));
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Selectable
+            );
+        });
+    });
+}
+
+#[test]
+fn test_on_session_share_ended_hides_input_for_no_cta_tombstone() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
     let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
 
     App::test((), |mut app| async move {
         let terminal = terminal_view_for_viewer(&mut app);
-        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        let mut task = create_cloud_mode_task_for_user("another-user");
         let task_id = task.task_id;
+        task.state = AmbientAgentTaskState::Failed;
+        task.status_message = Some(TaskStatusMessage {
+            message: "Environment setup failed: Failed to run setup command".to_string(),
+            error_code: Some(TaskStatusErrorCode::EnvironmentSetupFailed),
+            session_debug_until: None,
+            debug_agent_active: false,
+        });
 
         AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
             model.insert_task_for_test(task);
@@ -532,19 +1474,76 @@ fn test_on_session_share_ended_inserts_tombstone_for_owned_ambient_session_witho
         });
 
         terminal.update(&mut app, |view, ctx| {
+            view.input().update(ctx, |input, ctx| {
+                input.editor().update(ctx, |editor, ctx| {
+                    editor.set_interaction_state(InteractionState::Editable, ctx);
+                });
+            });
             view.model
                 .lock()
-                .set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                    task_id: Some(task_id.to_string()),
-                });
+                .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    task_id.to_string(),
+                )));
+
+            view.on_session_share_ended(ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let model = view.model.lock();
+            assert_eq!(
+                model.block_list().block_heights().items().len(),
+                initial_block_height_items + 2
+            );
+            assert!(view.conversation_ended_tombstone_view_id.is_some());
+            assert!(!view.is_input_box_visible(&model, ctx));
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Selectable
+            );
+        });
+    });
+}
+
+#[test]
+fn test_on_session_share_ended_does_not_insert_tombstone_for_owned_ambient_session_without_handoff()
+{
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(false);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        let task_id = task.task_id;
+
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::Oz,
+            current_user_owner_permissions(),
+        );
+        let initial_block_height_items = terminal.read(&app, |view, _| {
+            view.model.lock().block_list().block_heights().items().len()
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    task_id.to_string(),
+                )));
             view.on_session_share_ended(ctx);
         });
 
         terminal.read(&app, |view, ctx| {
             let final_block_height_items =
                 view.model.lock().block_list().block_heights().items().len();
-            assert_eq!(final_block_height_items, initial_block_height_items + 2);
-            assert!(view.conversation_ended_tombstone_view_id.is_some());
+            assert_eq!(final_block_height_items, initial_block_height_items + 1);
+            assert!(view.conversation_ended_tombstone_view_id.is_none());
             assert_eq!(view.pending_cloud_followup_task_id, None);
             assert_eq!(
                 view.input()
@@ -554,6 +1553,8 @@ fn test_on_session_share_ended_inserts_tombstone_for_owned_ambient_session_witho
                     .interaction_state(ctx),
                 InteractionState::Selectable
             );
+            let model = view.model.lock();
+            assert!(view.should_publish_shared_session_input_editor_update(&model, ctx));
         });
     });
 }
@@ -568,9 +1569,13 @@ fn test_on_session_share_ended_clears_frozen_followup_input_for_owned_ambient_se
         let task = create_cloud_mode_task_for_user(TEST_USER_UID);
         let task_id = task.task_id;
 
-        AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
-            model.insert_task_for_test(task);
-        });
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::Oz,
+            current_user_owner_permissions(),
+        );
 
         terminal.update(&mut app, |view, ctx| {
             view.input().update(ctx, |input, ctx| {
@@ -579,9 +1584,9 @@ fn test_on_session_share_ended_clears_frozen_followup_input_for_owned_ambient_se
             });
             view.model
                 .lock()
-                .set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                    task_id: Some(task_id.to_string()),
-                });
+                .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    task_id.to_string(),
+                )));
             view.on_session_share_ended(ctx);
         });
 
@@ -601,8 +1606,8 @@ fn test_on_session_share_ended_clears_frozen_followup_input_for_owned_ambient_se
 }
 
 #[test]
-fn test_on_session_share_ended_does_not_insert_tombstone_for_non_ambient_session_under_cloud_mode_setup_v2(
-) {
+fn test_on_session_share_ended_does_not_insert_tombstone_for_non_ambient_session_under_cloud_mode_setup_v2()
+ {
     let _flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
 
     App::test((), |mut app| async move {
@@ -614,7 +1619,7 @@ fn test_on_session_share_ended_does_not_insert_tombstone_for_non_ambient_session
         terminal.update(&mut app, |view, ctx| {
             view.model
                 .lock()
-                .set_shared_session_source_type(SessionSourceType::default());
+                .set_shared_session_source(SharedSessionSource::user(None));
             view.on_session_share_ended(ctx);
         });
 
@@ -634,11 +1639,21 @@ fn test_on_ambient_agent_execution_ended_inserts_tombstone_when_handoff_enabled(
 
     App::test((), |mut app| async move {
         let terminal = terminal_view_for_viewer(&mut app);
+        let task = create_cloud_mode_task_for_user("another-user");
+        let task_id = task.task_id;
+        AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
+            model.insert_task_for_test(task);
+        });
         let initial_block_height_items = terminal.read(&app, |view, _| {
             view.model.lock().block_list().block_heights().items().len()
         });
 
         terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    task_id.to_string(),
+                )));
             view.on_ambient_agent_execution_ended(ctx);
             view.on_ambient_agent_execution_ended(ctx);
         });
@@ -653,7 +1668,7 @@ fn test_on_ambient_agent_execution_ended_inserts_tombstone_when_handoff_enabled(
 }
 
 #[test]
-fn test_on_ambient_agent_execution_ended_enables_followup_input_without_tombstone_for_owned_task() {
+fn test_on_ambient_agent_execution_ended_enables_followup_for_owned_task_without_metadata() {
     let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
     let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
 
@@ -661,7 +1676,6 @@ fn test_on_ambient_agent_execution_ended_enables_followup_input_without_tombston
         let terminal = terminal_view_for_viewer(&mut app);
         let task = create_cloud_mode_task_for_user(TEST_USER_UID);
         let task_id = task.task_id;
-
         AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
             model.insert_task_for_test(task);
         });
@@ -671,9 +1685,113 @@ fn test_on_ambient_agent_execution_ended_enables_followup_input_without_tombston
 
         terminal.update(&mut app, |view, ctx| {
             let mut model = view.model.lock();
-            model.set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                task_id: Some(task_id.to_string()),
-            });
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
+            model.set_shared_session_status(SharedSessionStatus::NotShared);
+            drop(model);
+
+            view.on_ambient_agent_execution_ended(ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let final_block_height_items =
+                view.model.lock().block_list().block_heights().items().len();
+            assert_eq!(final_block_height_items, initial_block_height_items);
+            assert!(view.conversation_ended_tombstone_view_id.is_none());
+            assert_eq!(view.pending_cloud_followup_task_id, Some(task_id));
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Editable
+            );
+        });
+    });
+}
+
+#[test]
+fn test_on_ambient_agent_execution_ended_shows_tombstone_for_github_action_ambient_session() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let mut task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        task.source = Some(AgentSource::GitHubAction);
+        let task_id = task.task_id;
+
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::Oz,
+            current_user_owner_permissions(),
+        );
+        let initial_block_height_items = terminal.read(&app, |view, _| {
+            view.model.lock().block_list().block_heights().items().len()
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            let mut model = view.model.lock();
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
+            model.set_shared_session_status(SharedSessionStatus::NotShared);
+            drop(model);
+
+            view.on_ambient_agent_execution_ended(ctx);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let model = view.model.lock();
+            assert_eq!(
+                model.block_list().block_heights().items().len(),
+                initial_block_height_items + 1
+            );
+            assert!(view.conversation_ended_tombstone_view_id.is_some());
+            assert_eq!(view.pending_cloud_followup_task_id, None);
+            assert!(!view.is_input_box_visible(&model, ctx));
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Selectable
+            );
+        });
+    });
+}
+
+#[test]
+fn test_on_ambient_agent_execution_ended_enables_followup_input_without_tombstone_for_owned_task() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        let task_id = task.task_id;
+
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::Oz,
+            current_user_owner_permissions(),
+        );
+        let initial_block_height_items = terminal.read(&app, |view, _| {
+            view.model.lock().block_list().block_heights().items().len()
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            let mut model = view.model.lock();
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
             model.set_shared_session_status(SharedSessionStatus::NotShared);
             drop(model);
 
@@ -714,9 +1832,9 @@ fn test_restored_owned_tombstone_hides_input_until_continue() {
 
         terminal.update(&mut app, |view, ctx| {
             let mut model = view.model.lock();
-            model.set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                task_id: Some(task_id.to_string()),
-            });
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
             model.set_shared_session_status(SharedSessionStatus::NotShared);
             drop(model);
 
@@ -727,8 +1845,16 @@ fn test_restored_owned_tombstone_hides_input_until_continue() {
             ambient_agent_view_model.update(ctx, |model, ctx| {
                 model.enter_viewing_existing_session(task_id, ctx);
             });
+            view.input().update(ctx, |input, ctx| {
+                input.editor().update(ctx, |editor, ctx| {
+                    editor.set_interaction_state(InteractionState::Selectable, ctx);
+                });
+            });
 
-            view.insert_conversation_ended_tombstone(ctx);
+            view.insert_conversation_ended_tombstone_with_cta(
+                Some(TombstoneCta::ContinueInCloud { task_id }),
+                ctx,
+            );
             assert!(view.conversation_ended_tombstone_view_id.is_some());
             {
                 let model = view.model.lock();
@@ -742,6 +1868,205 @@ fn test_restored_owned_tombstone_hides_input_until_continue() {
                 let model = view.model.lock();
                 assert!(view.is_input_box_visible(&model, ctx));
             }
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Editable
+            );
+        });
+    });
+}
+
+/// REMOTE-2208: a cloud run whose environment is retained after a failure keeps a reachable
+/// shared session, but the pane may already have been switched to the ended-run view
+/// (`FinishedViewer` status, ended-conversation tombstone, non-editable input). Reattaching to
+/// the retained session must restore a writable, interactive terminal rather than leaving the
+/// user on a read-only pane with no input box.
+#[test]
+fn test_prepare_for_live_session_reattach_restores_interactive_input() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task_id = create_cloud_mode_task_for_user(TEST_USER_UID).task_id;
+
+        terminal.update(&mut app, |view, ctx| {
+            let mut model = view.model.lock();
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
+            model.set_shared_session_status(SharedSessionStatus::FinishedViewer);
+            drop(model);
+
+            view.input().update(ctx, |input, ctx| {
+                input.editor().update(ctx, |editor, ctx| {
+                    editor.set_interaction_state(InteractionState::Selectable, ctx);
+                });
+            });
+            view.insert_conversation_ended_tombstone_with_cta(None, ctx);
+
+            assert!(view.conversation_ended_tombstone_view_id.is_some());
+            {
+                let model = view.model.lock();
+                assert!(model.is_read_only());
+                assert!(!view.is_input_box_visible(&model, ctx));
+            }
+
+            view.prepare_for_live_session_reattach(ctx);
+
+            assert!(
+                view.conversation_ended_tombstone_view_id.is_none(),
+                "the ended-conversation tombstone must be cleared before rejoining"
+            );
+            {
+                let model = view.model.lock();
+                assert!(!model.is_read_only());
+                assert!(view.is_input_box_visible(&model, ctx));
+            }
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Editable
+            );
+        });
+    });
+}
+
+/// REMOTE-2208: the user-visible symptom of the bug was that the tab opened for a retained
+/// failed run accepted no typing. This asserts the behavior itself rather than the flags behind
+/// it: text typed into the pane's input is dropped while it is still in the ended-run state, and
+/// lands in the buffer once the pane has been prepared for the retained-session rejoin.
+#[test]
+fn test_prepare_for_live_session_reattach_accepts_typed_text() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task_id = create_cloud_mode_task_for_user(TEST_USER_UID).task_id;
+
+        terminal.update(&mut app, |view, ctx| {
+            let mut model = view.model.lock();
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
+            model.set_shared_session_status(SharedSessionStatus::FinishedViewer);
+            drop(model);
+
+            view.input().update(ctx, |input, ctx| {
+                input.editor().update(ctx, |editor, ctx| {
+                    editor.set_interaction_state(InteractionState::Selectable, ctx);
+                });
+            });
+            view.insert_conversation_ended_tombstone_with_cta(None, ctx);
+
+            // The ended-run pane swallows typing: this is exactly what the reporter saw.
+            view.input().update(ctx, |input, ctx| {
+                input.editor().update(ctx, |editor, ctx| {
+                    editor.insert_selected_text("echo hello-from-retained", ctx);
+                });
+            });
+            assert_eq!(
+                view.input().as_ref(ctx).buffer_text(ctx),
+                "",
+                "an ended-run pane must not accept typed text"
+            );
+
+            view.prepare_for_live_session_reattach(ctx);
+
+            view.input().update(ctx, |input, ctx| {
+                input.editor().update(ctx, |editor, ctx| {
+                    editor.insert_selected_text("echo hello-from-retained", ctx);
+                });
+            });
+            assert_eq!(
+                view.input().as_ref(ctx).buffer_text(ctx),
+                "echo hello-from-retained",
+                "a pane rejoining a retained session must accept typed text"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_deep_linked_ambient_continuation_refreshes_when_task_data_arrives() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        let task_id = task.task_id;
+
+        terminal.update(&mut app, |view, ctx| {
+            // Mirrors opening a cloud conversation directly (for example, a
+            // Warp-on-Web deep link) before AgentConversationsModel has loaded
+            // the ambient task. The restored pane only has the task id from
+            // conversation metadata, so it first renders the conservative
+            // ended-session UI.
+            let mut model = view.model.lock();
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
+            model.set_shared_session_status(SharedSessionStatus::FinishedViewer);
+            drop(model);
+
+            let ambient_agent_view_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .clone();
+            ambient_agent_view_model.update(ctx, |model, ctx| {
+                model.enter_viewing_existing_session(task_id, ctx);
+            });
+
+            view.insert_conversation_ended_tombstone_with_resolved_cta(ctx);
+
+            assert!(view.conversation_ended_tombstone_view_id.is_some());
+            assert_eq!(view.pending_cloud_followup_task_id, None);
+            {
+                let model = view.model.lock();
+                assert!(matches!(
+                    model.shared_session_status(),
+                    SharedSessionStatus::FinishedViewer
+                ));
+                assert!(!view.is_input_box_visible(&model, ctx));
+            }
+        });
+
+        AgentConversationsModel::handle(&app).update(&mut app, |model, ctx| {
+            // Once the task fetch or initial task sync finishes, the terminal
+            // subscription should re-resolve the continuation state and replace
+            // the conservative tombstone with owned follow-up input.
+            model.insert_task_for_test(task);
+            ctx.emit(AgentConversationsModelEvent::TasksUpdated);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(view.conversation_ended_tombstone_view_id.is_none());
+            assert_eq!(view.pending_cloud_followup_task_id, Some(task_id));
+            {
+                let model = view.model.lock();
+                assert!(matches!(
+                    model.shared_session_status(),
+                    SharedSessionStatus::NotShared
+                ));
+                assert!(view.is_input_box_visible(&model, ctx));
+            }
+            assert_eq!(
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Editable
+            );
         });
     });
 }
@@ -764,9 +2089,9 @@ fn test_on_ambient_agent_execution_ended_keeps_live_owned_session_on_session_sha
 
         terminal.update(&mut app, |view, ctx| {
             let mut model = view.model.lock();
-            model.set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                task_id: Some(task_id.to_string()),
-            });
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
             model.set_shared_session_status(SharedSessionStatus::executor());
             drop(model);
             view.on_ambient_agent_execution_ended(ctx);
@@ -798,9 +2123,9 @@ fn test_try_submit_pending_cloud_followup_allows_repeat_submission_for_owned_tas
 
         terminal.update(&mut app, |view, ctx| {
             let mut model = view.model.lock();
-            model.set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                task_id: Some(task_id.to_string()),
-            });
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
             model.set_shared_session_status(SharedSessionStatus::executor());
             drop(model);
 
@@ -812,7 +2137,7 @@ fn test_try_submit_pending_cloud_followup_allows_repeat_submission_for_owned_tas
                 model.enter_viewing_existing_session(task_id, ctx);
             });
 
-            view.enable_owned_cloud_followup_input(task_id, ctx);
+            view.enable_cloud_followup_input(task_id, ctx);
             assert!(view.try_submit_pending_cloud_followup("follow up".to_string(), ctx));
             assert_eq!(view.pending_cloud_followup_task_id, Some(task_id));
             assert!(view.try_submit_pending_cloud_followup("second follow up".to_string(), ctx));
@@ -822,6 +2147,49 @@ fn test_try_submit_pending_cloud_followup_allows_repeat_submission_for_owned_tas
                     .as_ref(ctx)
                     .pending_followup_prompt(),
                 Some("second follow up")
+            );
+        });
+    });
+}
+
+#[test]
+fn test_try_submit_pending_cloud_followup_rejects_task_source_that_blocks_followups() {
+    let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
+    let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let terminal = cloud_mode_terminal_for_test(&mut app);
+        let mut task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        task.source = Some(AgentSource::GitHubAction);
+        let task_id = task.task_id;
+
+        AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
+            model.insert_task_for_test(task);
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    task_id.to_string(),
+                )));
+
+            let ambient_agent_view_model = view
+                .ambient_agent_view_model()
+                .expect("cloud mode terminal should have ambient model")
+                .clone();
+            ambient_agent_view_model.update(ctx, |model, ctx| {
+                model.enter_viewing_existing_session(task_id, ctx);
+            });
+
+            view.enable_cloud_followup_input(task_id, ctx);
+            assert!(!view.try_submit_pending_cloud_followup("follow up".to_string(), ctx));
+            assert_eq!(view.pending_cloud_followup_task_id, None);
+            assert_eq!(
+                ambient_agent_view_model
+                    .as_ref(ctx)
+                    .pending_followup_prompt(),
+                None
             );
         });
     });
@@ -839,7 +2207,7 @@ fn test_shared_followup_on_existing_conversation_converts_user_query_input() {
         let conversation_id =
             BlocklistAIHistoryModel::handle(&app).update(&mut app, |model, ctx| {
                 let conversation_id =
-                    model.start_new_conversation(terminal_view_id, false, false, ctx);
+                    model.start_new_conversation(terminal_view_id, false, false, false, ctx);
                 model.set_server_conversation_token_for_conversation(
                     conversation_id,
                     conversation_token.to_string(),
@@ -893,6 +2261,7 @@ fn test_shared_followup_on_existing_conversation_converts_user_query_input() {
                                 api_client_action::AddMessagesToTask {
                                     task_id: root_task_id.to_string(),
                                     messages: vec![api::Message {
+                                        fetched_memories: vec![],
                                         id: "user-message".to_string(),
                                         task_id: root_task_id.to_string(),
                                         server_message_data: String::new(),
@@ -904,6 +2273,9 @@ fn test_shared_followup_on_existing_conversation_converts_user_query_input() {
                                                 referenced_attachments: HashMap::new(),
                                                 mode: None,
                                                 intended_agent: Default::default(),
+                                                origin: None,
+                                                author: None,
+                                                source_message: None,
                                             },
                                         )),
                                         request_id: request_id.to_string(),
@@ -931,7 +2303,7 @@ fn test_shared_followup_on_existing_conversation_converts_user_query_input() {
                 .and_then(|exchange| exchange.input.first())
                 .expect("shared-session replay should reconstruct the user query input");
             assert!(matches!(input, AIAgentInput::UserQuery { .. }));
-            assert_eq!(input.user_query().as_deref(), Some(followup_query));
+            assert_eq!(input.display_query().as_deref(), Some(followup_query));
         });
     });
 }
@@ -945,16 +2317,19 @@ fn test_non_owned_tombstone_is_removed_for_followup_and_reinserted_after_complet
         let terminal = cloud_mode_terminal_for_test(&mut app);
         let task = create_cloud_mode_task_for_user("another-user");
         let task_id = task.task_id;
-
-        AgentConversationsModel::handle(&app).update(&mut app, |model, _| {
-            model.insert_task_for_test(task);
-        });
+        insert_cloud_mode_task_with_server_metadata(
+            &mut app,
+            terminal.id(),
+            task,
+            AIAgentHarness::ClaudeCode,
+            current_user_owner_permissions(),
+        );
 
         terminal.update(&mut app, |view, ctx| {
             let mut model = view.model.lock();
-            model.set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                task_id: Some(task_id.to_string()),
-            });
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
             model.set_shared_session_status(SharedSessionStatus::FinishedViewer);
             drop(model);
 
@@ -968,8 +2343,7 @@ fn test_non_owned_tombstone_is_removed_for_followup_and_reinserted_after_complet
 
             let initial_block_height_items =
                 view.model.lock().block_list().block_heights().items().len();
-
-            view.insert_conversation_ended_tombstone(ctx);
+            view.insert_conversation_ended_tombstone_with_resolved_cta(ctx);
             assert!(view.conversation_ended_tombstone_view_id.is_some());
             assert_eq!(
                 view.model.lock().block_list().block_heights().items().len(),
@@ -979,13 +2353,29 @@ fn test_non_owned_tombstone_is_removed_for_followup_and_reinserted_after_complet
             view.start_cloud_followup_from_tombstone(task_id, ctx);
             assert_eq!(view.pending_cloud_followup_task_id, Some(task_id));
             assert!(view.conversation_ended_tombstone_view_id.is_none());
+            {
+                let model = view.model.lock();
+                assert!(matches!(
+                    model.shared_session_status(),
+                    SharedSessionStatus::NotShared
+                ));
+                assert!(view.is_input_box_visible(&model, ctx));
+                assert_eq!(
+                    model.block_list().block_heights().items().len(),
+                    initial_block_height_items
+                );
+            }
             assert_eq!(
-                view.model.lock().block_list().block_heights().items().len(),
-                initial_block_height_items
+                view.input()
+                    .as_ref(ctx)
+                    .editor()
+                    .as_ref(ctx)
+                    .interaction_state(ctx),
+                InteractionState::Editable
             );
 
             view.handle_ambient_agent_event(
-                &crate::terminal::view::ambient_agent::AmbientAgentViewModelEvent::FollowupSessionReady {
+                &crate::terminal::view::ambient_agent::AmbientAgentViewModelEvent::ExecutionSessionReady {
                     session_id: SessionId::new(),
                 },
                 ctx,
@@ -1004,7 +2394,6 @@ fn test_non_owned_tombstone_is_removed_for_followup_and_reinserted_after_complet
 fn test_on_ambient_agent_execution_ended_refreshes_open_details_panel_to_terminal_status() {
     let _cloud_mode_flag = FeatureFlag::CloudMode.override_enabled(true);
     let _handoff_flag = FeatureFlag::HandoffCloudCloud.override_enabled(true);
-    let _orchestration_v2_flag = FeatureFlag::OrchestrationV2.override_enabled(true);
     let _setup_v2_flag = FeatureFlag::CloudModeSetupV2.override_enabled(true);
 
     App::test((), |mut app| async move {
@@ -1021,7 +2410,8 @@ fn test_on_ambient_agent_execution_ended_refreshes_open_details_panel_to_termina
             model.insert_task_for_test(task);
         });
         BlocklistAIHistoryModel::handle(&app).update(&mut app, |model, ctx| {
-            let conversation_id = model.start_new_conversation(terminal.id(), false, false, ctx);
+            let conversation_id =
+                model.start_new_conversation(terminal.id(), false, false, false, ctx);
             model.assign_run_id_for_conversation(
                 conversation_id,
                 task_id.to_string(),
@@ -1039,9 +2429,9 @@ fn test_on_ambient_agent_execution_ended_refreshes_open_details_panel_to_termina
 
         terminal.update(&mut app, |view, ctx| {
             let mut model = view.model.lock();
-            model.set_shared_session_source_type(SessionSourceType::AmbientAgent {
-                task_id: Some(task_id.to_string()),
-            });
+            model.set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                task_id.to_string(),
+            )));
             model.set_shared_session_status(SharedSessionStatus::executor());
             drop(model);
 
@@ -1100,6 +2490,394 @@ fn test_on_ambient_agent_execution_ended_inserts_tombstone_without_handoff() {
                 view.model.lock().block_list().block_heights().items().len();
             assert_eq!(final_block_height_items, initial_block_height_items + 1);
             assert!(view.conversation_ended_tombstone_view_id.is_some());
+        });
+    });
+}
+
+#[test]
+fn passive_suggestions_suppressed_for_shared_ambient_viewer() {
+    // A link-join viewer of a shared *cloud-agent* session starts with no ambient view model
+    // (it is created lazily at `SessionJoined` and never propagated back to the
+    // passive-suggestions model). In this case, we still should not send passive suggestion requests.
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+
+        terminal.read(&app, |view, _| {
+            assert!(
+                view.ambient_agent_view_model().is_none(),
+                "a link-join shared-session viewer starts without an ambient view model"
+            );
+        });
+
+        // A non-ambient (user) shared-session viewer must still get passive suggestions:
+        // the fix must not over-suppress ordinary shared sessions.
+        let suppressed_for_user_viewer = terminal.update(&mut app, |view, ctx| {
+            view.passive_suggestions_models
+                .maa
+                .update(ctx, |model, ctx| {
+                    model.is_ambient_agent_session_for_test(ctx)
+                })
+        });
+        assert!(
+            !suppressed_for_user_viewer,
+            "passive suggestions must not be suppressed for a non-ambient shared-session viewer"
+        );
+
+        // Once the viewer discovers it is viewing an ambient (cloud-agent) run, passive
+        // suggestions must be suppressed even though the ambient view model is still absent.
+        let suppressed_for_ambient_viewer = terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .set_shared_session_source(SharedSessionSource::ambient_agent(Some(
+                    "44444444-4444-4444-4444-444444444444".to_string(),
+                )));
+            view.passive_suggestions_models
+                .maa
+                .update(ctx, |model, ctx| {
+                    model.is_ambient_agent_session_for_test(ctx)
+                })
+        });
+        assert!(
+            suppressed_for_ambient_viewer,
+            "passive suggestions must be suppressed for a shared cloud-agent viewer"
+        );
+    });
+}
+
+// APP-5027 regression: "Copy link" / "Copy session sharing link" must not silently do
+// nothing when the Manager has no session id (e.g. during ViewPending / SharePending).
+
+#[test]
+fn test_copy_shared_session_link_does_not_write_clipboard_when_session_pending() {
+    // copy_shared_session_link was a silent no-op when the Manager had no session_id
+    // (e.g. ViewPending while the cloud agent environment is still setting up).
+    // With the fix it shows an error toast AND does NOT write the join link to the clipboard.
+    // This test asserts the new observable behavior (the toast), not just the clipboard-unchanged
+    // invariant that also held on the old silent no-op path.
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(Manager::new);
+        let toast_stack_handle = app.add_singleton_model(|_| crate::workspace::ToastStack);
+
+        // Subscribe to ToastStack events so we can assert the error toast is emitted.
+        let toast_text = Rc::new(RefCell::new(None::<String>));
+        let toast_text_clone = toast_text.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_model(&toast_stack_handle, move |_, event, _| {
+                if let crate::workspace::ToastStackEvent::AddEphemeralToast { toast, .. } = event {
+                    *toast_text_clone.borrow_mut() = Some(toast.main_text().to_string());
+                }
+            });
+        });
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let link_change_events = Rc::new(RefCell::new(0));
+        let link_change_events_for_subscription = link_change_events.clone();
+        let pane_configuration = terminal.read(&app, |view, _| view.pane_configuration().clone());
+        app.update(|ctx| {
+            ctx.subscribe_to_model(&pane_configuration, move |_, event, _| {
+                if matches!(event, PaneConfigurationEvent::SharedSessionLinkChanged) {
+                    *link_change_events_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        // Put the terminal in ViewPending state without registering a session_id with the Manager.
+        // This simulates a cloud agent environment still setting up (no join yet).
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ViewPending);
+        });
+
+        // Write a sentinel to the clipboard so we can detect if it is overwritten.
+        terminal.update(&mut app, |_, ctx| {
+            ctx.clipboard()
+                .write(warpui::clipboard::ClipboardContent::plain_text(
+                    "sentinel".to_string(),
+                ));
+        });
+
+        // Call copy_shared_session_link. With the fix, it shows an error toast and returns early.
+        terminal.update(&mut app, |view, ctx| {
+            view.copy_shared_session_link(SharedSessionActionSource::RightClickMenu, ctx);
+        });
+
+        // Assert the error toast was shown — this is the new, observable behavior that proves
+        // the fix is active. Without the fix, no toast would be emitted.
+        assert_eq!(
+            toast_text.borrow().as_deref(),
+            Some("Sharing link not yet available"),
+            "copy_shared_session_link must show an error toast when no session_id is registered"
+        );
+
+        // Belt-and-suspenders: clipboard must also remain unchanged.
+        let clipboard_text = terminal.update(&mut app, |_, ctx| ctx.clipboard().read().plain_text);
+        assert_eq!(
+            clipboard_text, "sentinel",
+            "copy_shared_session_link must not write the join link when no session_id is registered"
+        );
+
+        // A previous ended session id must not become copyable again while a new share attempt is
+        // pending on the same terminal.
+        terminal.update(&mut app, |_, ctx| {
+            let window_id = ctx.window_id();
+            Manager::handle(ctx).update(ctx, |manager, ctx| {
+                manager.started_share(terminal.downgrade(), SessionId::new(), window_id, ctx);
+                manager.stopped_share(terminal.id(), ctx);
+            });
+        });
+        *toast_text.borrow_mut() = None;
+
+        terminal.update(&mut app, |view, ctx| {
+            view.attempt_to_share_session(
+                SharedSessionScrollbackType::None,
+                None,
+                SharedSessionSource::user(None),
+                false,
+                ctx,
+            );
+        });
+        assert_eq!(
+            *link_change_events.borrow(),
+            1,
+            "starting a new share must refresh cached link and QR surfaces"
+        );
+
+        terminal.update(&mut app, |view, ctx| {
+            view.copy_shared_session_link(SharedSessionActionSource::RightClickMenu, ctx);
+        });
+
+        assert_eq!(
+            toast_text.borrow().as_deref(),
+            Some("Sharing link not yet available"),
+            "a retained ended id must not be copied while a new session is pending"
+        );
+        let clipboard_text = terminal.update(&mut app, |_, ctx| ctx.clipboard().read().plain_text);
+        assert_eq!(
+            clipboard_text, "sentinel",
+            "a retained ended id must not overwrite the clipboard during a pending retry"
+        );
+    });
+}
+
+#[test]
+fn test_pane_header_copy_link_disabled_when_view_pending_no_session_id() {
+    // APP-5027 call-site regression: the pane-header "Copy link" item must be disabled
+    // when the terminal is in ViewPending state and Manager has no session_id for this view.
+    // This exercises the actual has_session_link call-site computation inside
+    // pane_header_overflow_menu_items, not just the session_sharing_context_menu_items helper.
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(Manager::new);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        // ViewPending simulates a cloud-agent viewer mid-setup: the session exists in the model
+        // but Manager has not yet received a session_id for this view.
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ViewPending);
+        });
+
+        terminal.read(&app, |view, ctx| {
+            let items = view.pane_header_overflow_menu_items(ctx);
+
+            let copy_link_item = items
+                .iter()
+                .find(|item| item.fields().is_some_and(|f| f.label() == "Copy link"));
+            assert!(
+                copy_link_item.is_some(),
+                "Copy link item should appear when terminal is in ViewPending state"
+            );
+            assert!(
+                copy_link_item.unwrap().fields().unwrap().is_disabled(),
+                "Copy link must be disabled when Manager has no session_id (ViewPending setup)"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_session_sharing_context_menu_copy_link_disabled_when_no_session_link() {
+    // The "Copy session sharing link" context-menu item must be disabled (greyed out)
+    // when the session link is not yet available (has_session_link=false).
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+
+        terminal.read(&app, |view, _| {
+            let model = view.model.lock();
+            // has_session_link=false simulates ViewPending with no registered session_id.
+            let items = view.session_sharing_context_menu_items(&model, false, false);
+
+            let copy_link_item = items.iter().find(|item| {
+                item.fields()
+                    .is_some_and(|f| f.label() == "Copy session sharing link")
+            });
+            assert!(
+                copy_link_item.is_some(),
+                "Copy session sharing link item should be present when is_sharer_or_viewer"
+            );
+            assert!(
+                copy_link_item.unwrap().fields().unwrap().is_disabled(),
+                "Copy session sharing link must be disabled when no session link is available"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_session_sharing_context_menu_copy_link_enabled_when_session_link_available() {
+    // The "Copy session sharing link" item must be enabled when the session link is available.
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+
+        terminal.read(&app, |view, _| {
+            let model = view.model.lock();
+            // has_session_link=true simulates an active or ended session with a registered id.
+            let items = view.session_sharing_context_menu_items(&model, false, true);
+
+            let copy_link_item = items.iter().find(|item| {
+                item.fields()
+                    .is_some_and(|f| f.label() == "Copy session sharing link")
+            });
+            assert!(
+                copy_link_item.is_some(),
+                "Copy session sharing link item should be present when is_sharer_or_viewer"
+            );
+            assert!(
+                !copy_link_item.unwrap().fields().unwrap().is_disabled(),
+                "Copy session sharing link must be enabled when session link is available"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_gate_shows_for_ambient_task() {
+    // REMOTE-2346: the workspace-level transcript details panel is gated on
+    // `Workspace::should_show_conversation_details_panel`. It is gated on
+    // `cfg(any(test, target_arch = "wasm32"))`, so it can be exercised on the host target even
+    // though the WASM render path itself is compiled out.
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        configure_ambient_details_panel_test(&mut app, &terminal, task);
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.should_show_wasm_conversation_details_panel(ctx),
+                "WASM details button gate must return true when an ambient cloud task is wired"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_gate_hidden_for_plain_terminal() {
+    // REMOTE-2346: `should_show_wasm_conversation_details_panel` must return false for a
+    // terminal with no ambient task, no transcript viewer, and no active conversation, so
+    // the pane-header button does not appear when the workspace panel would render nothing.
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                !view.should_show_wasm_conversation_details_panel(ctx),
+                "WASM details button gate must return false for a plain terminal with no cloud task"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_button_shows_for_ambient_task() {
+    // REMOTE-2346: the pane-header `(i)` gate is narrower than the workspace panel gate. It must
+    // return true for an ambient-task pane that is neither a shared session nor a
+    // conversation-transcript viewer (surfaces that lack the simplified WASM tab-bar `(i)`).
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(Manager::new);
+        let terminal = add_window_with_terminal(&mut app, None);
+        configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.should_show_wasm_pane_header_details_button(ctx),
+                "pane-header (i) must show for an ambient-task pane with no tab-bar affordance"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_button_hidden_for_transcript_viewer() {
+    // REMOTE-2346 regression: a conversation-transcript viewer already shows the simplified WASM
+    // tab-bar `(i)`, so the pane-header `(i)` must be suppressed to avoid a duplicate button —
+    // even though the broader workspace panel gate still returns true for that surface.
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(Manager::new);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let task_id = configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .set_conversation_transcript_viewer_status(Some(
+                    ConversationTranscriptViewerStatus::ViewingAmbientConversation(task_id),
+                ));
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.should_show_wasm_conversation_details_panel(ctx),
+                "workspace panel gate must still show for a transcript viewer"
+            );
+            assert!(
+                !view.should_show_wasm_pane_header_details_button(ctx),
+                "pane-header (i) must be hidden for a transcript viewer (it already has the tab-bar (i))"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_button_hidden_for_shared_session() {
+    // REMOTE-2346: a shared session already shows the simplified WASM tab-bar `(i)`, so the
+    // pane-header `(i)` must be suppressed there too.
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(Manager::new);
+        let terminal = add_window_with_terminal(&mut app, None);
+        configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ActiveViewer {
+                    role: Default::default(),
+                });
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                !view.should_show_wasm_pane_header_details_button(ctx),
+                "pane-header (i) must be hidden for a shared session (it already has the tab-bar (i))"
+            );
         });
     });
 }

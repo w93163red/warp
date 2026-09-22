@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
 use parking_lot::FairMutex;
-
 use warpui::App;
 
-use crate::terminal::shared_session::MAX_BYTES_SHAREABLE;
-use crate::terminal::TerminalModel;
-use crate::{
-    terminal::shared_session::{SharedSessionActionSource, SharedSessionScrollbackType},
-    test_util::{add_window_with_terminal, terminal::initialize_app_for_terminal_view},
-};
-
 use super::Body;
+use crate::terminal::TerminalModel;
+use crate::terminal::shared_session::{
+    MAX_BYTES_SHAREABLE, SharedSessionActionSource, SharedSessionScrollbackType,
+};
+use crate::test_util::add_window_with_terminal;
+use crate::test_util::terminal::initialize_app_for_terminal_view;
 
 #[test]
 fn test_open_modal_from_non_block() {
@@ -240,11 +238,13 @@ fn test_open_modal_from_long_running_block() {
             .lock()
             .simulate_long_running_block("ls", "a".repeat(MAX_BYTES_SHAREABLE / 4).as_str());
         assert_eq!(terminal_model.lock().block_list().blocks().len(), 2);
-        assert!(terminal_model
-            .lock()
-            .block_list()
-            .active_block()
-            .is_executing());
+        assert!(
+            terminal_model
+                .lock()
+                .block_list()
+                .active_block()
+                .is_executing()
+        );
 
         // Open the share modal.
         let terminal_model_clone = terminal_model.clone();
@@ -273,11 +273,13 @@ fn test_open_modal_from_long_running_block() {
             .lock()
             .process_bytes("a".repeat(MAX_BYTES_SHAREABLE / 4).as_str());
         assert_eq!(terminal_model.lock().block_list().blocks().len(), 2);
-        assert!(terminal_model
-            .lock()
-            .block_list()
-            .active_block()
-            .is_executing());
+        assert!(
+            terminal_model
+                .lock()
+                .block_list()
+                .active_block()
+                .is_executing()
+        );
 
         // Re-open the modal to refresh the options.
         let terminal_model_clone = terminal_model.clone();

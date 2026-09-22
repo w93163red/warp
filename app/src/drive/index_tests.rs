@@ -1,38 +1,37 @@
+use cloud_objects::cloud_object::ServerPermissions;
 use warp_core::ui::appearance::Appearance;
-use warp_server_client::cloud_object::ServerPermissions;
-use warpui::{
-    platform::WindowStyle, AddSingletonModel, App, SingletonEntity, TypedActionView, ViewHandle,
-};
+use warpui::platform::WindowStyle;
+use warpui::{AddSingletonModel, App, SingletonEntity, TypedActionView, ViewHandle};
 
-use crate::{
-    ai::blocklist::BlocklistAIHistoryModel,
-    auth::{auth_manager::AuthManager, AuthStateProvider},
-    cloud_object::{
-        model::{actions::ObjectActions, persistence::CloudModel, view::CloudViewModel},
-        CloudObjectSyncStatus, ObjectIdType, ObjectType, Owner, ServerCreationInfo, Space,
-    },
-    drive::{items::WarpDriveItemId, CloudObjectTypeAndId},
-    menu::MenuItem,
-    network::NetworkStatus,
-    notebooks::{CloudNotebook, CloudNotebookModel},
-    server::{
-        cloud_objects::update_manager::UpdateManager,
-        ids::{ClientId, ServerIdAndType, SyncId},
-        server_api::ServerApiProvider,
-        sync_queue::{QueueItem, SyncQueue},
-        telemetry::context_provider::AppTelemetryContextProvider,
-    },
-    settings_view::keybindings::KeybindingChangedNotifier,
-    terminal::shared_session::permissions_manager::SessionPermissionsManager,
-    test_util::settings::initialize_settings_for_tests,
-    workflows::{workflow::Workflow, CloudWorkflow, CloudWorkflowModel},
-    workspaces::{
-        team_tester::TeamTesterStatus, user_profiles::UserProfiles, user_workspaces::UserWorkspaces,
-    },
-    Assets,
+use super::{DriveIndex, DriveIndexAction, SharedObjectLimitBannerKind};
+use crate::ASSETS;
+use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::auth::AuthStateProvider;
+use crate::auth::auth_manager::AuthManager;
+use crate::cloud_object::model::actions::ObjectActions;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::cloud_object::model::view::CloudViewModel;
+use crate::cloud_object::{
+    CloudObjectSyncStatus, ObjectIdType, ObjectType, Owner, ServerCreationInfo, Space,
 };
-
-use super::{DriveIndex, DriveIndexAction};
+use crate::drive::CloudObjectTypeAndId;
+use crate::drive::items::WarpDriveItemId;
+use crate::menu::MenuItem;
+use crate::network::NetworkStatus;
+use crate::notebooks::{CloudNotebook, CloudNotebookModel};
+use crate::server::cloud_objects::update_manager::UpdateManager;
+use crate::server::ids::{ClientId, ServerIdAndType, SyncId};
+use crate::server::server_api::ServerApiProvider;
+use crate::server::sync_queue::{QueueItem, SyncQueue};
+use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
+use crate::settings_view::keybindings::KeybindingChangedNotifier;
+use crate::terminal::shared_session::permissions_manager::SessionPermissionsManager;
+use crate::test_util::settings::initialize_settings_for_tests;
+use crate::workflows::workflow::Workflow;
+use crate::workflows::{CloudWorkflow, CloudWorkflowModel};
+use crate::workspaces::team_tester::TeamTesterStatus;
+use crate::workspaces::user_profiles::UserProfiles;
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 fn initialize_app(app: &mut App) {
     initialize_settings_for_tests(app);
@@ -121,7 +120,7 @@ fn label_for_menu_item(item: &MenuItem<DriveIndexAction>) -> &str {
 
 #[test]
 fn test_retry_menu_item_visibility() {
-    App::test(Assets, |mut app| async move {
+    App::test(ASSETS, |mut app| async move {
         initialize_app(&mut app);
         let index = create_index(&mut app);
         let sync_id = create_workflow(&mut app);
@@ -171,7 +170,7 @@ fn test_retry_menu_item_visibility() {
 
 #[test]
 fn test_retry_menu_item_logic() {
-    App::test(Assets, |mut app| async move {
+    App::test(ASSETS, |mut app| async move {
         initialize_app(&mut app);
         let index = create_index(&mut app);
         let sync_id = create_workflow(&mut app);
@@ -209,22 +208,21 @@ fn test_retry_menu_item_logic() {
         CloudModel::handle(&app).update(&mut app, |cloud_model, ctx| {
             if let CloudObjectTypeAndId::Workflow(SyncId::ClientId(client_id)) =
                 cloud_object_type_and_id
+                && let SyncId::ServerId(server_id) = new_sync_id
             {
-                if let SyncId::ServerId(server_id) = new_sync_id {
-                    let server_creation_info = ServerCreationInfo {
-                        server_id_and_type: ServerIdAndType {
-                            id: server_id,
-                            id_type: ObjectIdType::Workflow,
-                        },
-                        creator_uid: None,
-                        permissions: ServerPermissions::mock_personal(),
-                    };
-                    cloud_model.update_object_after_server_creation(
-                        client_id,
-                        server_creation_info,
-                        ctx,
-                    );
-                }
+                let server_creation_info = ServerCreationInfo {
+                    server_id_and_type: ServerIdAndType {
+                        id: server_id,
+                        id_type: ObjectIdType::Workflow,
+                    },
+                    creator_uid: None,
+                    permissions: ServerPermissions::mock_personal(),
+                };
+                cloud_model.update_object_after_server_creation(
+                    client_id,
+                    server_creation_info,
+                    ctx,
+                );
             }
         });
 
@@ -274,6 +272,49 @@ fn test_warp_drive_navigation_states() {
                 Some(WarpDriveItemId::Object(cloud_object_type_and_id)),
                 "Expect selected to have correct value"
             );
+        });
+    });
+}
+
+#[test]
+fn test_shared_object_limit_banner_dismissal_persists_per_type() {
+    App::test(ASSETS, |mut app| async move {
+        initialize_app(&mut app);
+        let index = create_index(&mut app);
+
+        // Neither banner is dismissed by default.
+        index.read(&app, |_index, cx| {
+            assert!(!DriveIndex::is_object_limit_banner_dismissed(
+                SharedObjectLimitBannerKind::Notebook,
+                cx,
+            ));
+            assert!(!DriveIndex::is_object_limit_banner_dismissed(
+                SharedObjectLimitBannerKind::Workflow,
+                cx,
+            ));
+        });
+
+        // Dismissing the notebook banner is remembered.
+        index.update(&mut app, |index, ctx| {
+            index.handle_action(
+                &DriveIndexAction::DismissObjectLimitBanner {
+                    banner_kind: SharedObjectLimitBannerKind::Notebook,
+                },
+                ctx,
+            );
+        });
+
+        // The notebook banner stays dismissed, and the workflow banner is
+        // unaffected — dismissal is tracked per object type.
+        index.read(&app, |_index, cx| {
+            assert!(DriveIndex::is_object_limit_banner_dismissed(
+                SharedObjectLimitBannerKind::Notebook,
+                cx,
+            ));
+            assert!(!DriveIndex::is_object_limit_banner_dismissed(
+                SharedObjectLimitBannerKind::Workflow,
+                cx,
+            ));
         });
     });
 }

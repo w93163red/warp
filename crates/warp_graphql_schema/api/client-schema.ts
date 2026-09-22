@@ -12,6 +12,7 @@ const clientMutations = [
   'createFileArtifactUploadTarget',
   'createFolder',
   'createGenericStringObject',
+  'createManagedMcpClientConfig',
   'createManagedSecret',
   'createNotebook',
   'createTeam',
@@ -34,6 +35,7 @@ const clientMutations = [
   'grabNotebookEditAccess',
   'issueTaskIdentityToken',
   'joinTeamWithTeamDiscovery',
+  'joinWorkspaceFromDiscovery',
   'leaveObject',
   'markAcceptedIntelligentAutosuggestion',
   'mintCustomToken',
@@ -80,8 +82,10 @@ const clientMutations = [
 const clientQueries = [
   'cloudObject',
   'codebaseContextConfig',
+  'freeAvailableModels',
   'getRelevantFragments',
   'rerankFragments',
+  'harnessAuthSecrets',
   'listWarpDevImages',
   'pricingInfo',
   'managedSecrets',
@@ -99,6 +103,7 @@ const clientQueries = [
   'task',
   'taskGitCredentials',
   'taskSecrets',
+  'tuiOnboardingMarkers',
   'listAIConversations',
   'suggestCloudEnvironmentImage'
 ];

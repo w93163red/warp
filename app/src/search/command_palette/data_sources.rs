@@ -1,28 +1,25 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::drive::settings::WarpDriveSettings;
-use crate::search::action::CommandBindingDataSource;
-use crate::search::binding_source::BindingSource;
-use crate::search::command_palette::files;
-use crate::search::command_palette::launch_config;
-use crate::search::command_palette::mixer::{CommandPaletteItemAction, ItemSummary};
-use crate::search::command_palette::new_session::NewSessionDataSource;
-use crate::search::command_palette::repos::RepoDataSource;
-use crate::search::command_palette::{navigation, tabs, CommandPaletteMixer};
-use crate::search::data_source::QueryResult;
-use crate::search::files::model::FileSearchModel;
-use crate::search::mixer::AddAsyncSourceOptions;
-use crate::search::QueryFilter;
-use crate::session_management::SessionSource;
-use crate::settings::AISettings;
 use warp_core::context_flag::ContextFlag;
 use warp_core::features::FeatureFlag;
 use warpui::keymap::BindingId;
-use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, WindowId};
 
-use super::conversations;
-use super::warp_drive;
+use super::{conversations, warp_drive};
+use crate::drive::settings::WarpDriveSettings;
+use crate::search::QueryFilter;
+use crate::search::action::CommandBindingDataSource;
+use crate::search::binding_source::BindingSource;
+use crate::search::command_palette::mixer::{CommandPaletteItemAction, ItemSummary};
+use crate::search::command_palette::new_session::NewSessionDataSource;
+use crate::search::command_palette::repos::RepoDataSource;
+use crate::search::command_palette::{CommandPaletteMixer, files, launch_config, navigation, tabs};
+use crate::search::data_source::QueryResult;
+use crate::search::files::model::FileSearchModel;
+use crate::search::mixer::AddAsyncSourceOptions;
+use crate::session_management::SessionSource;
+use crate::settings::AISettings;
 
 /// Store of all of the [`crate::search::DataSource`]s for the command palette.
 pub struct DataSourceStore {
@@ -31,7 +28,6 @@ pub struct DataSourceStore {
     warp_drive_data_source: ModelHandle<warp_drive::DataSource>,
     launch_config_data_source: ModelHandle<launch_config::DataSource>,
     new_session_data_source: Option<ModelHandle<NewSessionDataSource>>,
-    historical_conversation_data_source: ModelHandle<conversations::DataSource>,
     all_conversation_data_source: ModelHandle<conversations::DataSource>,
     repo_data_source: ModelHandle<RepoDataSource>,
     tabs_data_source: Option<ModelHandle<tabs::DataSource>>,
@@ -41,6 +37,7 @@ impl DataSourceStore {
     pub fn new(
         binding_source: ModelHandle<BindingSource>,
         active_session_handle: ModelHandle<SessionSource>,
+        window_id: WindowId,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         let actions_data_source =
@@ -49,16 +46,14 @@ impl DataSourceStore {
         let sessions_data_source =
             ctx.add_model(|_| navigation::DataSource::new(active_session_handle));
 
-        let warp_drive_data_source = ctx.add_model(warp_drive::DataSource::new);
+        let warp_drive_data_source =
+            ctx.add_model(|ctx| warp_drive::DataSource::new(window_id, ctx));
 
         let launch_config_data_source = ctx.add_model(launch_config::DataSource::new);
 
         let new_session_data_source = (FeatureFlag::ShellSelector.is_enabled()
             && cfg!(feature = "local_tty"))
         .then_some(ctx.add_model(|ctx| NewSessionDataSource::new(binding_source, ctx)));
-
-        let historical_conversation_data_source: ModelHandle<conversations::DataSource> =
-            ctx.add_model(|_| conversations::DataSource::historical());
 
         let all_conversation_data_source: ModelHandle<conversations::DataSource> =
             ctx.add_model(|_| conversations::DataSource::new());
@@ -71,7 +66,6 @@ impl DataSourceStore {
             warp_drive_data_source,
             launch_config_data_source,
             new_session_data_source,
-            historical_conversation_data_source,
             all_conversation_data_source,
             repo_data_source,
             tabs_data_source: None,
@@ -130,8 +124,7 @@ impl DataSourceStore {
 
             if FeatureFlag::CommandPaletteFileSearch.is_enabled() && !is_shared_session_viewer {
                 let file_search_model = FileSearchModel::as_ref(ctx);
-                let repo_root = file_search_model.repo_root(ctx);
-                let is_in_git_repo = repo_root.is_some();
+                let is_in_git_repo = file_search_model.repo_root_location(ctx).is_some();
 
                 let files_data_source = if is_in_git_repo {
                     ctx.add_model(|_| files::data_source::FileDataSource::new())
@@ -155,11 +148,6 @@ impl DataSourceStore {
                 mixer.add_sync_source(
                     self.all_conversation_data_source.clone(),
                     HashSet::from([QueryFilter::Conversations]),
-                );
-
-                mixer.add_sync_source(
-                    self.historical_conversation_data_source.clone(),
-                    HashSet::from([QueryFilter::HistoricalConversations]),
                 );
             }
 
@@ -260,8 +248,9 @@ impl DataSourceStore {
                 line_and_column_arg,
             } => {
                 // Create a file search item from the summary
-                use crate::search::command_palette::files::search_item::FileSearchItem;
                 use fuzzy_match::FuzzyMatchResult;
+
+                use crate::search::command_palette::files::search_item::FileSearchItem;
 
                 let search_item = FileSearchItem {
                     path: PathBuf::from(path),
@@ -277,8 +266,9 @@ impl DataSourceStore {
                 project_directory,
             } => {
                 // Create a directory search item from the summary
-                use crate::search::command_palette::files::search_item::FileSearchItem;
                 use fuzzy_match::FuzzyMatchResult;
+
+                use crate::search::command_palette::files::search_item::FileSearchItem;
 
                 let search_item = FileSearchItem {
                     path: PathBuf::from(path),

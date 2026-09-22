@@ -14,5 +14,6 @@
                        testMode:(BOOL)testMode;
 - (void)setAsyncCallback:(BOOL)shouldAsync;
 - (void)setTitlebarDragAtBottom:(BOOL)enabled;
+- (void)setPresentsWithTransaction:(BOOL)presentsWithTransaction;
 - (BOOL)keyDownImpl:(NSEvent *)event;
 @end

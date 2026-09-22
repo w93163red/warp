@@ -3,10 +3,8 @@
 #![cfg_attr(feature = "release_bundle", windows_subsystem = "windows")]
 
 use anyhow::Result;
-use warp_core::{
-    channel::{Channel, ChannelConfig, ChannelState, WarpServerConfig},
-    AppId,
-};
+use warp_core::AppId;
+use warp_core::channel::{Channel, ChannelConfig, ChannelState, WarpServerConfig};
 
 // Simple wrapper around warp::run() for Warp OSS builds.
 fn main() -> Result<()> {

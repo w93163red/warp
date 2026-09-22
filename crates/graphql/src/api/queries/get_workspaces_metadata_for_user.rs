@@ -1,13 +1,33 @@
-use crate::{
-    billing::PricingInfo, experiment::Experiment, request_context::RequestContext, schema,
-    user::DiscoverableTeamData, workspace::Workspace,
-};
+use crate::ai::AICreditAvailability;
+use crate::billing::{PricingInfo, PurchaseAddOnCreditsPolicy};
+use crate::experiment::Experiment;
+use crate::request_context::RequestContext;
+use crate::schema;
+use crate::user::DiscoverableTeamData;
+use crate::workspace::Workspace;
 
 /*
 query GetWorkspacesMetadataForUser($requestContext: RequestContext!) {
   user(requestContext: $requestContext) {
     ... on UserOutput {
       user {
+        profile {
+          uid
+        }
+        aiCreditAvailability {
+          available
+          denialReason
+          creditSource
+        }
+        billingMetadata {
+          tier {
+            purchaseAddOnCreditsPolicy {
+              enabled
+              premiumEnabled
+              pricePremiumBps
+            }
+          }
+        }
         workspaces {
           uid
           name
@@ -15,15 +35,26 @@ query GetWorkspacesMetadataForUser($requestContext: RequestContext!) {
             uid
             email
             role
+            isDisabled
           }
           teams {
             uid
             name
+            inviteLink
             members {
               uid
               email
               role
+              isDisabled
             }
+            visibility
+            featureModelChoice { ... }
+          }
+          openTeams {
+            teamUid
+            numMembers
+            name
+            teamAcceptingInvites
           }
           billingMetadata {
             customerType
@@ -64,6 +95,16 @@ query GetWorkspacesMetadataForUser($requestContext: RequestContext!) {
               byoApiKeyPolicy {
                 enabled
               }
+              byoEndpointPolicy {
+                enabled
+              }
+              managedByokByoePolicy {
+                enabled
+              }
+              usageVisibilityPolicy {
+                adminGranularity
+                maxPriorCycles
+              }
               pricing {
                 enablePayAsYouGo
                 autoReloadCreditDenomination
@@ -77,11 +118,53 @@ query GetWorkspacesMetadataForUser($requestContext: RequestContext!) {
               type
             }
           }
+          billingCycleUsageHistory {
+            currentPeriodStart
+            currentPeriodEnd
+            summaries {
+              periodStart
+              periodEnd
+              entries {
+                subjectType
+                subjectUid
+                subjectDisplayName
+                costType
+                usageBucket
+                usageSource
+                creditsUsed
+                costCents
+                attributedTeamUid
+              }
+            }
+          }
           settings {
             isDiscoverable
             isInviteLinkEnabled
             llmSettings {
               enabled
+            }
+            teamByo {
+              firstPartyEnabled
+              endpointsEnabled
+              allowUserKeys
+              allowUserEndpoints
+              firstPartyKeys {
+                provider
+                credentialUid
+              }
+              endpoints {
+                uid
+                name
+                enabled
+                credentialUid
+                models {
+                  configKey
+                  slug
+                  alias
+                  displayName
+                  enabled
+                }
+              }
             }
             telemetrySettings {
               forceEnabled
@@ -95,10 +178,10 @@ query GetWorkspacesMetadataForUser($requestContext: RequestContext!) {
             }
           }
           hasBillingHistory
-          inviteCode
           pendingEmailInvites {
             email
             expired
+            teamUid
           }
           inviteLinkDomainRestrictions {
             uid
@@ -132,6 +215,7 @@ query GetWorkspacesMetadataForUser($requestContext: RequestContext!) {
         overages {
           pricePerRequestUsdCents
         }
+        promotionMessage
       }
     }
   }
@@ -169,9 +253,34 @@ pub enum PricingInfoResult {
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct User {
+    pub profile: UserProfile,
+    pub ai_credit_availability: AICreditAvailability,
+    pub billing_metadata: Option<UserPurchasePolicyBillingMetadata>,
     pub workspaces: Vec<Workspace>,
     pub experiments: Option<Vec<Experiment>>,
     pub discoverable_teams: Vec<DiscoverableTeamData>,
+}
+
+/// Slim selection of the user-level `billingMetadata`: only the add-on
+/// credits purchase policy. This is the teamless-purchase fallback (fresh
+/// free users have no team and their only workspace is the server's
+/// placeholder) — do not widen it into the full `BillingMetadata` selection.
+#[derive(cynic::QueryFragment, Debug)]
+#[cynic(graphql_type = "BillingMetadata")]
+pub struct UserPurchasePolicyBillingMetadata {
+    pub tier: UserPurchasePolicyTier,
+}
+
+#[derive(cynic::QueryFragment, Debug)]
+#[cynic(graphql_type = "Tier")]
+pub struct UserPurchasePolicyTier {
+    pub purchase_add_on_credits_policy: Option<PurchaseAddOnCreditsPolicy>,
+}
+
+#[derive(cynic::QueryFragment, Debug)]
+#[cynic(graphql_type = "FirebaseProfile")]
+pub struct UserProfile {
+    pub uid: String,
 }
 
 #[derive(cynic::QueryFragment, Debug)]

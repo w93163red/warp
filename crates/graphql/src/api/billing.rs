@@ -1,4 +1,6 @@
-use crate::{scalars::Time, schema, workspace::UgcCollectionEnablementSetting};
+use crate::scalars::Time;
+use crate::schema;
+use crate::workspace::UgcCollectionEnablementSetting;
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct BillingMetadata {
@@ -35,12 +37,22 @@ pub enum BonusGrantType {
     Any,
 }
 
+#[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BonusGrantScope {
+    User,
+    Team,
+    Workspace,
+    #[cynic(fallback)]
+    Other,
+}
+
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct BonusGrant {
     pub created_at: Time,
     pub cost_cents: i32,
     pub expiration: Option<Time>,
     pub grant_type: BonusGrantType,
+    pub scope: BonusGrantScope,
     pub reason: String,
     pub user_facing_message: Option<String>,
     pub request_credits_granted: i32,
@@ -104,11 +116,15 @@ pub struct Tier {
     pub usage_based_pricing_policy: Option<UsageBasedPricingPolicy>,
     pub codebase_context_policy: Option<CodebaseContextPolicy>,
     pub byo_api_key_policy: Option<ByoApiKeyPolicy>,
+    pub byo_endpoint_policy: Option<ByoEndpointPolicy>,
+    pub managed_byok_byoe_policy: Option<ManagedByokByoePolicy>,
     pub purchase_add_on_credits_policy: Option<PurchaseAddOnCreditsPolicy>,
     pub enterprise_pay_as_you_go_policy: Option<EnterprisePayAsYouGoPolicy>,
     pub enterprise_credits_auto_reload_policy: Option<EnterpriseCreditsAutoReloadPolicy>,
     pub multi_admin_policy: Option<MultiAdminPolicy>,
+    pub native_workspaces_policy: Option<NativeWorkspacesPolicy>,
     pub ambient_agents_policy: Option<AmbientAgentsPolicy>,
+    pub usage_visibility_policy: Option<UsageVisibilityPolicy>,
 }
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
@@ -183,8 +199,20 @@ pub struct ByoApiKeyPolicy {
 }
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct ByoEndpointPolicy {
+    pub enabled: bool,
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct ManagedByokByoePolicy {
+    pub enabled: bool,
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct PurchaseAddOnCreditsPolicy {
     pub enabled: bool,
+    pub premium_enabled: bool,
+    pub price_premium_bps: i32,
 }
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
@@ -202,6 +230,11 @@ pub struct EnterpriseCreditsAutoReloadPolicy {
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct MultiAdminPolicy {
+    pub enabled: bool,
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct NativeWorkspacesPolicy {
     pub enabled: bool,
 }
 
@@ -257,13 +290,33 @@ impl AddonCreditsOption {
     pub fn rate(&self) -> f32 {
         self.price_usd_cents as f32 / self.credits as f32
     }
+
+    /// Returns the purchase price in cents after applying a plan surcharge
+    /// expressed in basis points (1000 bps = +10%). `price_usd_cents` always
+    /// carries the list price; plans whose `PurchaseAddOnCreditsPolicy` has a
+    /// non-zero `price_premium_bps` pay a premium on top of it. The surcharge
+    /// is rounded up to the next cent using the same integer math as the
+    /// server so displayed prices always match what is charged.
+    pub fn price_usd_cents_with_premium(&self, premium_bps: i32) -> i32 {
+        if premium_bps <= 0 {
+            return self.price_usd_cents;
+        }
+        let price = self.price_usd_cents as i64;
+        let surcharge = (price * premium_bps as i64 + 9_999) / 10_000;
+        (price + surcharge) as i32
+    }
 }
+
+#[cfg(test)]
+#[path = "billing_tests.rs"]
+mod tests;
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct PricingInfo {
     pub plans: Vec<PlanPricing>,
     pub overages: OveragesPricing,
     pub addon_credits_options: Vec<AddonCreditsOption>,
+    pub promotion_message: Option<String>,
 }
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
@@ -292,6 +345,94 @@ pub enum StripeSubscriptionPlan {
     Build,
     BuildBusiness,
     BuildMax,
+    #[cynic(fallback)]
+    Other(String),
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct UsageVisibilityPolicy {
+    pub admin_granularity: UsageVisibilityGranularity,
+    pub max_prior_cycles: i32,
+}
+
+#[derive(cynic::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum UsageVisibilityGranularity {
+    OwnOnly,
+    TeamAggregate,
+    PerUserTotals,
+    FullBreakdown,
+    #[cynic(fallback)]
+    Other(String),
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct BillingCycleUsageHistory {
+    pub current_period_start: Time,
+    pub current_period_end: Time,
+    pub summaries: Vec<BillingCycleUsageSummary>,
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct BillingCycleUsageSummary {
+    pub period_start: Time,
+    pub period_end: Time,
+    pub entries: Vec<UsageEntry>,
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct UsageEntry {
+    pub subject_type: AiCreditsUsageAndCostSubjectType,
+    pub subject_uid: Option<String>,
+    pub subject_display_name: Option<String>,
+    pub cost_type: AiCreditsUsageAndCostType,
+    pub usage_bucket: AiCreditsUsageBucket,
+    pub usage_source: AiCreditsUsageSource,
+    pub credits_used: i32,
+    pub cost_cents: i32,
+    pub attributed_team_uid: Option<String>,
+}
+
+#[derive(cynic::Enum, Clone, Debug, PartialEq, Eq)]
+#[cynic(graphql_type = "AICreditsUsageAndCostSubjectType")]
+pub enum AiCreditsUsageAndCostSubjectType {
+    Team,
+    User,
+    ServiceAccount,
+    #[cynic(fallback)]
+    Other(String),
+}
+
+#[derive(cynic::Enum, Clone, Debug, PartialEq, Eq)]
+#[cynic(graphql_type = "AICreditsUsageAndCostType")]
+pub enum AiCreditsUsageAndCostType {
+    BaseLimit,
+    BonusGrant,
+    Payg,
+    AmbientBonusGrant,
+    Aggregate,
+    #[cynic(fallback)]
+    Other(String),
+}
+
+#[derive(cynic::Enum, Clone, Debug, PartialEq, Eq)]
+#[cynic(graphql_type = "AICreditsUsageBucket")]
+pub enum AiCreditsUsageBucket {
+    Ai,
+    Compute,
+    Platform,
+    SuggestedCodeDiffs,
+    Voice,
+    Aggregate,
+    #[cynic(fallback)]
+    Other(String),
+}
+
+#[derive(cynic::Enum, Clone, Debug, PartialEq, Eq)]
+#[cynic(graphql_type = "AICreditsUsageSource")]
+pub enum AiCreditsUsageSource {
+    Local,
+    Cloud,
+    Aggregate,
     #[cynic(fallback)]
     Other(String),
 }

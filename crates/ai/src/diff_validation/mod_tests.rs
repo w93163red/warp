@@ -180,13 +180,24 @@ fn test_append_to_end_of_file() {
 
 #[test]
 fn test_totally_unrelated_search() {
-    let input_diffs = vec![SearchAndReplace {
-        search: "4|foo bar baz".to_string(),
-        replace: "hello, world!".to_string(),
-    }];
+    let input_diffs = vec![
+        SearchAndReplace {
+            search: "1|I'd just like to interject".to_string(),
+            replace: "I'd just like to interrupt".to_string(),
+        },
+        SearchAndReplace {
+            search: "4|foo bar baz".to_string(),
+            replace: "hello, world!".to_string(),
+        },
+    ];
     let diff = fuzzy_match_diffs("test.rs", &input_diffs, CONTENT);
-    assert!(deltas(&diff).is_empty());
-    assert!(diff.failures.is_some());
+    assert_eq!(deltas(&diff).len(), 1);
+    let failures = diff.failures.expect("Expected failures to be tracked");
+    assert_eq!(failures.fuzzy_match_failures, 1);
+    assert_eq!(
+        failures.fuzzy_match_failure_details,
+        vec![DiffMatchFailure { block_number: 2 }]
+    );
 }
 
 /// The agent sometimes emits a search whose final line is a prefix of the actual file line.
@@ -411,6 +422,41 @@ fn test_v4a_no_match() {
     assert!(diff.failures.is_some());
     let failures = diff.failures.unwrap();
     assert_eq!(failures.fuzzy_match_failures, 1);
+    assert_eq!(
+        failures.fuzzy_match_failure_details,
+        vec![DiffMatchFailure { block_number: 1 }]
+    );
+}
+
+#[test]
+fn test_v4a_failure_preserves_original_block_ordinal() {
+    let hunks = vec![
+        V4AHunk {
+            change_context: vec![],
+            pre_context: "fn main() {".to_string(),
+            old: "    println!(\"Hello\");".to_string(),
+            new: "    println!(\"Hi\");".to_string(),
+            post_context: "}".to_string(),
+        },
+        V4AHunk {
+            change_context: vec![],
+            pre_context: "fn does_not_exist() {".to_string(),
+            old: "    unrelated_code();".to_string(),
+            new: "    new_code();".to_string(),
+            post_context: "}".to_string(),
+        },
+    ];
+
+    let file_content = "fn main() {\n    println!(\"Hello\");\n}";
+    let diff = fuzzy_match_v4a_diffs("test.rs", &hunks, None, file_content);
+
+    assert_eq!(deltas(&diff).len(), 1);
+    let failures = diff.failures.expect("Expected failures to be tracked");
+    assert_eq!(failures.fuzzy_match_failures, 1);
+    assert_eq!(
+        failures.fuzzy_match_failure_details,
+        vec![DiffMatchFailure { block_number: 2 }]
+    );
 }
 
 #[test]
@@ -608,6 +654,66 @@ fn test_partial_last_line_in_search_preserves_suffix() {
     assert_eq!(result, "func foo() {\nlet y = 1;\nlet x = 2;\n}\n");
 }
 
+#[test]
+fn test_partial_last_line_in_multiline_replacement_preserves_suffix() {
+    // This mirrors a model edit that deletes middle lines while leaving the final line as partial
+    // trailing context. The final line should remain a no-op after suffix preservation.
+    let file_content = "\
+mod proxy;
+pub fn run_daemon() -> anyhow::Result<()> {
+    // Logging is now handled by init_common (log_destination: File).
+
+    // socket_path: ~/.warp[-channel]/remote-server/server.sock
+    //   The Unix domain socket the daemon binds on.
+}
+";
+
+    let diffs = [SearchAndReplace {
+        search: "\
+2|pub fn run_daemon() -> anyhow::Result<()> {
+3|    // Logging is now handled by init_common (log_destination: File).
+4|
+5|    // socket_path:"
+            .to_string(),
+        replace: "\
+pub fn run_daemon() -> anyhow::Result<()> {
+    // socket_path:"
+            .to_string(),
+    }];
+
+    let (deltas, _failures) = fuzzy_match_file_diffs(&diffs, file_content);
+
+    assert_eq!(deltas.len(), 1, "Expected one matched delta");
+    assert_eq!(deltas[0].replacement_line_range, 2..6);
+    assert_eq!(
+        deltas[0].insertion,
+        "pub fn run_daemon() -> anyhow::Result<()> {\n    // socket_path: ~/.warp[-channel]/remote-server/server.sock"
+    );
+
+    let file_lines: Vec<&str> = file_content.lines().collect();
+    let range = &deltas[0].replacement_line_range;
+    let mut result = String::new();
+    for line in &file_lines[..range.start - 1] {
+        result.push_str(line);
+        result.push('\n');
+    }
+    result.push_str(&deltas[0].insertion);
+    result.push('\n');
+    for line in &file_lines[range.end - 1..] {
+        result.push_str(line);
+        result.push('\n');
+    }
+    assert_eq!(
+        result,
+        "\
+mod proxy;
+pub fn run_daemon() -> anyhow::Result<()> {
+    // socket_path: ~/.warp[-channel]/remote-server/server.sock
+    //   The Unix domain socket the daemon binds on.
+}
+"
+    );
+}
 #[test]
 fn test_search_and_replace_accommodates_none() {
     let parsed_diff = ParsedDiff::StrReplaceEdit {

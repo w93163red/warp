@@ -9,8 +9,8 @@ pub mod image;
 pub(crate) mod link_detection;
 pub mod links;
 pub mod openable_file_type;
-#[cfg(feature = "local_tty")]
 pub mod path;
+pub mod repo_detection;
 pub mod time_format;
 pub mod tooltips;
 pub(crate) mod traffic_lights;
@@ -19,10 +19,11 @@ pub mod vm_detection;
 #[cfg(windows)]
 pub mod windows;
 
-use itertools::Itertools;
 use std::cmp::Ordering;
-use std::fmt;
 use std::ops::Range;
+
+use itertools::Itertools;
+pub use warp_util::AsciiDebug;
 
 pub fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     let mut i = 1;
@@ -61,29 +62,6 @@ pub fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
         result = result.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
     }
     Some(result)
-}
-
-/// AsciiDebug is intended to make it easy to inspect the contents of byte slices that are mostly ASCII
-/// characters (but may not be valid unicode). It changes the output of the wrapped byte slice to
-/// a human readable string with non-ASCII characters written as hex escapes.
-///
-/// E.g. `log::info!("{:?}", &AsciiDebug(some_byte_slice));`
-pub struct AsciiDebug<'a>(pub &'a [u8]);
-
-impl fmt::Debug for AsciiDebug<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"")?;
-        for &byte in self.0 {
-            // Check if the byte is a standard printable character.
-            if (32..126).contains(&byte) {
-                write!(f, "{}", byte as char)?;
-            } else {
-                write!(f, "\\{{{byte:02X}}}")?;
-            }
-        }
-        write!(f, "\"")?;
-        Ok(())
-    }
 }
 
 #[test]

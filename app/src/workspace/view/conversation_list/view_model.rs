@@ -1,10 +1,14 @@
+use fuzzy_match::match_indices_case_insensitive;
+use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, WindowId};
+
 use crate::ai::agent_conversations_model::{
     AgentConversationEntry, AgentConversationEntryId, AgentConversationsModel,
-    AgentConversationsModelEvent, AgentManagementFilters, ArtifactFilter, CreatedOnFilter,
-    CreatorFilter, OwnerFilter, SourceFilter, StatusFilter,
+    AgentConversationsModelEvent, AgentManagementFilters, ArtifactFilter, ConversationUpdateKind,
+    CreatedOnFilter, CreatorFilter, OwnerFilter, SourceFilter, StatusFilter,
 };
-use fuzzy_match::match_indices_case_insensitive;
-use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+use crate::workspaces::user_workspaces::{
+    TeamContextResolver, UserWorkspaces, UserWorkspacesEvent,
+};
 
 pub struct ConversationListViewModelEvent;
 
@@ -19,6 +23,7 @@ pub struct ConversationListViewModel {
     cached_entry_ids: Vec<AgentConversationEntryId>,
     filtered_items: Vec<ConversationEntry>,
     search_query: String,
+    team_context_resolver: TeamContextResolver,
 }
 
 impl Entity for ConversationListViewModel {
@@ -26,10 +31,14 @@ impl Entity for ConversationListViewModel {
 }
 
 impl ConversationListViewModel {
-    pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+    pub fn new(
+        window_id: WindowId,
+        team_context_resolver: TeamContextResolver,
+        ctx: &mut ModelContext<Self>,
+    ) -> Self {
         let conversations_model = AgentConversationsModel::handle(ctx);
 
-        ctx.subscribe_to_model(&conversations_model, |me, event, ctx| {
+        ctx.subscribe_to_model(&conversations_model, |me, _, event, ctx| {
             match event {
                 // These events change the set of items in the list, so we need
                 // to rebuild the cached ID list.
@@ -40,11 +49,29 @@ impl ConversationListViewModel {
                 }
                 // Status changes don't affect the set of IDs (status is read
                 // at render time via get_item_by_id); just signal a re-render.
-                AgentConversationsModelEvent::ConversationUpdated { .. } => {
-                    ctx.emit(ConversationListViewModelEvent);
+                AgentConversationsModelEvent::ConversationUpdated { kind } => {
+                    if matches!(
+                        kind,
+                        ConversationUpdateKind::MetadataChanged
+                            | ConversationUpdateKind::TitleChanged
+                    ) {
+                        me.refresh_cached_items(ctx);
+                    } else {
+                        ctx.emit(ConversationListViewModelEvent);
+                    }
                 }
                 // Artifact updates don't affect the conversation list
                 AgentConversationsModelEvent::ConversationArtifactsUpdated { .. } => {}
+            }
+        });
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), move |me, _, event, ctx| {
+            if matches!(
+                event,
+                UserWorkspacesEvent::WindowTeamChanged {
+                    window_id: changed_window_id
+                } if *changed_window_id == window_id
+            ) {
+                me.refresh_cached_items(ctx);
             }
         });
 
@@ -53,6 +80,7 @@ impl ConversationListViewModel {
             cached_entry_ids: Vec::new(),
             filtered_items: Vec::new(),
             search_query: String::new(),
+            team_context_resolver,
         };
         model.refresh_cached_items(ctx);
         model
@@ -67,6 +95,7 @@ impl ConversationListViewModel {
     /// emitting `ConversationListViewModelEvent` is sufficient there.
     fn refresh_cached_items(&mut self, ctx: &mut ModelContext<Self>) {
         let model = self.conversations_model.as_ref(ctx);
+        let scope = (self.team_context_resolver)(ctx);
         self.cached_entry_ids = model
             .get_entries(
                 &AgentManagementFilters {
@@ -79,6 +108,7 @@ impl ConversationListViewModel {
                     environment: Default::default(),
                     harness: Default::default(),
                 },
+                &scope,
                 ctx,
             )
             .into_iter()

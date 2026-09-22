@@ -1,13 +1,26 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use cynic::{MutationBuilder, QueryBuilder};
+use warp_graphql::managed_secrets::{ManagedSecret, ManagedSecretType};
+use warp_graphql::mutations::create_managed_secret::{
+    CreateManagedSecret, CreateManagedSecretInput, CreateManagedSecretResult,
+    CreateManagedSecretVariables,
+};
+use warp_graphql::mutations::delete_managed_secret::{
+    DeleteManagedSecret, DeleteManagedSecretInput, DeleteManagedSecretResult,
+    DeleteManagedSecretVariables,
+};
 use warp_graphql::mutations::issue_task_identity_token::{
     IssueTaskIdentityToken, IssueTaskIdentityTokenInput, IssueTaskIdentityTokenResult,
     IssueTaskIdentityTokenVariables,
 };
-use warp_graphql::object_permissions::OwnerType;
+use warp_graphql::mutations::update_managed_secret::{
+    UpdateManagedSecret, UpdateManagedSecretInput, UpdateManagedSecretResult,
+    UpdateManagedSecretVariables,
+};
+use warp_graphql::object_permissions::{Owner, OwnerType};
 use warp_graphql::queries::list_harness_auth_secrets::{
     ListHarnessAuthSecrets, ListHarnessAuthSecretsInput, ListHarnessAuthSecretsVariables,
 };
@@ -20,40 +33,33 @@ use warp_graphql::queries::managed_secret_config::{
 use warp_graphql::queries::task_secrets::{
     ManagedSecretValue, TaskSecrets, TaskSecretsInput, TaskSecretsResult, TaskSecretsVariables,
 };
-use warp_graphql::{
-    managed_secrets::{ManagedSecret, ManagedSecretType},
-    mutations::{
-        create_managed_secret::{
-            CreateManagedSecret, CreateManagedSecretInput, CreateManagedSecretResult,
-            CreateManagedSecretVariables,
-        },
-        delete_managed_secret::{
-            DeleteManagedSecret, DeleteManagedSecretInput, DeleteManagedSecretResult,
-            DeleteManagedSecretVariables,
-        },
-        update_managed_secret::{
-            UpdateManagedSecret, UpdateManagedSecretInput, UpdateManagedSecretResult,
-            UpdateManagedSecretVariables,
-        },
-    },
-    object_permissions::Owner,
-};
+pub use warp_managed_secrets::client::{ManagedSecretConfigs, ManagedSecretsClient};
 use warp_managed_secrets::client::{SecretOwner, TaskIdentityToken};
 
 use super::ServerApi;
 use crate::server::graphql::{get_request_context, get_user_facing_error_message};
+use crate::server::team_scope::RequestTeamScope;
 
-pub use warp_managed_secrets::client::{ManagedSecretConfigs, ManagedSecretsClient};
+pub(crate) type AppManagedSecretManager =
+    warp_managed_secrets::ManagedSecretManager<RequestTeamScope>;
+pub(crate) type AppManagedSecretsClient = dyn ManagedSecretsClient<RequestScope = RequestTeamScope>;
 
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl ManagedSecretsClient for ServerApi {
-    async fn get_managed_secret_configs(&self) -> Result<ManagedSecretConfigs> {
+    type RequestScope = RequestTeamScope;
+
+    async fn get_managed_secret_configs(
+        &self,
+        request_scope: &Self::RequestScope,
+    ) -> Result<ManagedSecretConfigs> {
         let variables = GetManagedSecretConfigVariables {
             request_context: get_request_context(),
         };
         let operation = GetManagedSecretConfig::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = self
+            .send_graphql_request_for_team(operation, *request_scope)
+            .await?;
 
         match response.user {
             UserResult::UserOutput(output) => {
@@ -86,6 +92,7 @@ impl ManagedSecretsClient for ServerApi {
 
     async fn create_managed_secret(
         &self,
+        request_scope: &Self::RequestScope,
         owner: SecretOwner,
         name: String,
         secret_type: ManagedSecretType,
@@ -114,7 +121,9 @@ impl ManagedSecretsClient for ServerApi {
             request_context: get_request_context(),
         };
         let operation = CreateManagedSecret::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = self
+            .send_graphql_request_for_team(operation, *request_scope)
+            .await?;
 
         match response.create_managed_secret {
             CreateManagedSecretResult::CreateManagedSecretOutput(output) => {
@@ -129,7 +138,12 @@ impl ManagedSecretsClient for ServerApi {
         }
     }
 
-    async fn delete_managed_secret(&self, owner: SecretOwner, name: String) -> Result<()> {
+    async fn delete_managed_secret(
+        &self,
+        request_scope: &Self::RequestScope,
+        owner: SecretOwner,
+        name: String,
+    ) -> Result<()> {
         let graphql_owner = match owner {
             SecretOwner::CurrentUser => Owner {
                 type_: OwnerType::User,
@@ -149,7 +163,9 @@ impl ManagedSecretsClient for ServerApi {
             request_context: get_request_context(),
         };
         let operation = DeleteManagedSecret::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = self
+            .send_graphql_request_for_team(operation, *request_scope)
+            .await?;
 
         match response.delete_managed_secret {
             DeleteManagedSecretResult::DeleteManagedSecretOutput(_) => Ok(()),
@@ -164,6 +180,7 @@ impl ManagedSecretsClient for ServerApi {
 
     async fn update_managed_secret(
         &self,
+        request_scope: &Self::RequestScope,
         owner: SecretOwner,
         name: String,
         encrypted_value: Option<String>,
@@ -190,7 +207,9 @@ impl ManagedSecretsClient for ServerApi {
             request_context: get_request_context(),
         };
         let operation = UpdateManagedSecret::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = self
+            .send_graphql_request_for_team(operation, *request_scope)
+            .await?;
 
         match response.update_managed_secret {
             UpdateManagedSecretResult::UpdateManagedSecretOutput(output) => {
@@ -207,6 +226,7 @@ impl ManagedSecretsClient for ServerApi {
 
     async fn list_harness_auth_secrets(
         &self,
+        request_scope: &Self::RequestScope,
         harness: warp_graphql::ai::AgentHarness,
     ) -> Result<Vec<ManagedSecret>> {
         let Some(harness_input) = Option::<
@@ -221,7 +241,9 @@ impl ManagedSecretsClient for ServerApi {
             request_context: get_request_context(),
         };
         let operation = ListHarnessAuthSecrets::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = self
+            .send_graphql_request_for_team(operation, *request_scope)
+            .await?;
 
         match response.harness_auth_secrets {
             warp_graphql::queries::list_harness_auth_secrets::HarnessAuthSecretsResult::HarnessAuthSecretsOutput(output) => {
@@ -236,14 +258,23 @@ impl ManagedSecretsClient for ServerApi {
         }
     }
 
-    async fn list_secrets(&self) -> Result<Vec<ManagedSecret>> {
+    async fn list_secrets(
+        &self,
+        request_scope: Option<&Self::RequestScope>,
+    ) -> Result<Vec<ManagedSecret>> {
         let variables = ListManagedSecretsVariables {
             // Pagination over managed secrets is not yet supported.
             input: ManagedSecretsInput { cursor: None },
             request_context: get_request_context(),
         };
         let operation = ListManagedSecrets::build(variables);
-        let response = self.send_graphql_request(operation, None).await?;
+        let response = match request_scope {
+            Some(request_scope) => {
+                self.send_graphql_request_for_team(operation, *request_scope)
+                    .await?
+            }
+            None => self.send_graphql_request(operation, None).await?,
+        };
 
         match response.managed_secrets {
             ManagedSecretsResult::ManagedSecretsOutput(output) => Ok(output.managed_secrets),
@@ -323,3 +354,7 @@ impl ManagedSecretsClient for ServerApi {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "managed_secrets_tests.rs"]
+mod tests;

@@ -1,23 +1,19 @@
 use std::collections::HashMap;
 
-use warp_core::ui::{appearance::Appearance, Icon};
+use warp_core::ui::Icon;
+use warp_core::ui::appearance::Appearance;
+use warpui::elements::ParentElement;
+use warpui::prelude::{
+    ConstrainedBox, Container, CrossAxisAlignment, Cursor, Flex, Hoverable, MouseStateHandle, Text,
+};
 use warpui::{
-    elements::ParentElement,
-    prelude::{
-        ConstrainedBox, Container, CrossAxisAlignment, Cursor, Flex, Hoverable, MouseStateHandle,
-        Text,
-    },
     AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
 };
 
-use crate::{
-    ai::blocklist::{
-        agent_view::{agent_view_bg_color, AgentViewController},
-        inline_action::inline_action_icons,
-        BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
-    },
-    terminal::view::ambient_agent::{AmbientAgentViewModel, AmbientAgentViewModelEvent},
-};
+use crate::ai::blocklist::agent_view::AgentViewController;
+use crate::ai::blocklist::inline_action::inline_action_icons;
+use crate::ai::blocklist::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
+use crate::terminal::view::ambient_agent::{AmbientAgentViewModel, AmbientAgentViewModelEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SetupCommandGroupId(u64);
@@ -76,6 +72,11 @@ impl SetupCommandState {
         self.running_group_id == Some(group_id)
     }
 
+    pub fn should_suppress_input_sync_for_current_group(&self) -> bool {
+        self.current_group_id != SetupCommandGroupId::initial()
+            && self.is_running(self.current_group_id)
+    }
+
     pub fn start_new_group(&mut self) -> SetupCommandGroupId {
         let group_id = SetupCommandGroupId(self.next_group_id);
         self.next_group_id += 1;
@@ -118,14 +119,13 @@ impl CloudModeSetupTextBlock {
                         conversation_id: updated_conversation_id,
                         ..
                     } = event
+                        && *updated_conversation_id == conversation_id
                     {
-                        if *updated_conversation_id == conversation_id {
-                            me.ambient_agent_view_model.update(ctx, |model, ctx| {
-                                model.finish_setup_command_group(me.group_id, ctx);
-                                model.set_setup_command_group_visibility(me.group_id, false, ctx);
-                            });
-                            ctx.unsubscribe_to_model(&history_model);
-                        }
+                        me.ambient_agent_view_model.update(ctx, |model, ctx| {
+                            model.finish_setup_command_group(me.group_id, ctx);
+                            model.set_setup_command_group_visibility(me.group_id, false, ctx);
+                        });
+                        ctx.unsubscribe_to_model(&history_model);
                     }
                 },
             );
@@ -170,7 +170,7 @@ impl View for CloudModeSetupTextBlock {
         let icon_size = inline_action_icons::icon_size(app);
         let text_color = appearance
             .theme()
-            .disabled_text_color(agent_view_bg_color(app).into())
+            .disabled_text_color(appearance.theme().background())
             .into_solid();
         let expandable = Hoverable::new(self.mouse_state.clone(), move |_is_hovered| {
             Flex::row()
@@ -218,6 +218,7 @@ impl View for CloudModeSetupTextBlock {
             &self.ambient_agent_view_model,
             app,
         )
+        .with_margin_top(8.)
         .finish()
     }
 }

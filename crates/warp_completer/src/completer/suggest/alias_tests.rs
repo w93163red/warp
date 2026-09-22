@@ -18,7 +18,7 @@ pub fn test_expand_command_aliases() {
         .with_aliases(aliases);
 
     // Simple case: there's a command we don't have an alias for
-    let result = warpui::r#async::block_on(expand_command_aliases(
+    let result = warpui_core::r#async::block_on(expand_command_aliases(
         "normalCommandWithoutAlias ",
         false,
         &ctx,
@@ -31,10 +31,10 @@ pub fn test_expand_command_aliases() {
     assert!(result.signature_for_completions.is_none());
 
     // We have a top-level "aliasForTest" which expands to "test".
-    let result = warpui::r#async::block_on(expand_command_aliases("aliasForTest ", false, &ctx));
+    let result =
+        warpui_core::r#async::block_on(expand_command_aliases("aliasForTest ", false, &ctx));
     assert_eq!(result.expanded_command_line, "test ");
     assert_eq!(result.tokens_from_command, vec!["test"]);
-    #[cfg(not(feature = "v2"))]
     assert_eq!(
         result
             .signature_for_completions
@@ -44,10 +44,10 @@ pub fn test_expand_command_aliases() {
         "test"
     );
 
-    #[cfg(not(feature = "v2"))]
     {
         // The test signature has an alias function, which expands subcommand "twelve" to "one".
-        let result = warpui::r#async::block_on(expand_command_aliases("test twelve ", false, &ctx));
+        let result =
+            warpui_core::r#async::block_on(expand_command_aliases("test twelve ", false, &ctx));
         assert_eq!(result.expanded_command_line, "test one ");
         assert_eq!(result.tokens_from_command, vec!["test", "one"]);
         // Should be using the subcommand signature for completions
@@ -61,8 +61,11 @@ pub fn test_expand_command_aliases() {
         );
 
         // We have a top-level aliasForTest which expands to test, and then the test signature expands "twelve" to "one"
-        let result =
-            warpui::r#async::block_on(expand_command_aliases("aliasForTest twelve ", false, &ctx));
+        let result = warpui_core::r#async::block_on(expand_command_aliases(
+            "aliasForTest twelve ",
+            false,
+            &ctx,
+        ));
         assert_eq!(result.expanded_command_line, "test one ");
         assert_eq!(result.tokens_from_command, vec!["test", "one"]);
         // Should be using the subcommand signature for completions
@@ -89,7 +92,7 @@ pub fn test_expand_command_aliases_env_vars() {
         .with_aliases(aliases);
 
     // We have a top-level "aliasForTest" which expands to "test".
-    let result = warpui::r#async::block_on(expand_command_aliases(
+    let result = warpui_core::r#async::block_on(expand_command_aliases(
         "ENV1=VAL1 ENV2=VAL2 aliasForTest ",
         false,
         &ctx,
@@ -105,7 +108,6 @@ pub fn test_expand_command_aliases_env_vars() {
             .env_vars,
         vec!["ENV1=VAL1", "ENV2=VAL2"]
     );
-    #[cfg(not(feature = "v2"))]
     assert_eq!(
         result
             .signature_for_completions
@@ -115,10 +117,9 @@ pub fn test_expand_command_aliases_env_vars() {
         "test"
     );
 
-    #[cfg(not(feature = "v2"))]
     {
         // The test signature has an alias function, which expands subcommand "twelve" to "one".
-        let result = warpui::r#async::block_on(expand_command_aliases(
+        let result = warpui_core::r#async::block_on(expand_command_aliases(
             "ENV1=VAL1 ENV2=VAL2 test twelve ",
             false,
             &ctx,
@@ -148,7 +149,7 @@ pub fn test_expand_command_aliases_env_vars() {
         );
 
         // We have a top-level aliasForTest which expands to test, and then the test signature expands "twelve" to "one"
-        let result = warpui::r#async::block_on(expand_command_aliases(
+        let result = warpui_core::r#async::block_on(expand_command_aliases(
             "ENV1=VAL1 ENV2=VAL2 aliasForTest twelve ",
             false,
             &ctx,
@@ -191,17 +192,17 @@ pub fn test_expand_command_aliases_should_not_expand_if_no_space_after_alias() {
         .with_aliases(aliases);
 
     // We have a top-level "aliasForTest" which expands to "test", but there's no trailing space so we shouldn't expand.
-    let result = warpui::r#async::block_on(expand_command_aliases("aliasForTest", false, &ctx));
+    let result =
+        warpui_core::r#async::block_on(expand_command_aliases("aliasForTest", false, &ctx));
     assert_eq!(result.expanded_command_line, "aliasForTest");
     assert_eq!(result.tokens_from_command, vec!["aliasForTest"]);
     assert!(result.signature_for_completions.is_none());
 
     // The test signature has an alias function which expands subcommand "twelve" to "one", but there's no trailing space so we shouldn't expand.
-    let result = warpui::r#async::block_on(expand_command_aliases("test twelve", false, &ctx));
+    let result = warpui_core::r#async::block_on(expand_command_aliases("test twelve", false, &ctx));
     assert_eq!(result.expanded_command_line, "test twelve");
     assert_eq!(result.tokens_from_command, vec!["test", "twelve"]);
     // "twelve" isn't a valid subcommand, so we should use the "test" signature.
-    #[cfg(not(feature = "v2"))]
     assert_eq!(
         result
             .signature_for_completions
@@ -213,11 +214,10 @@ pub fn test_expand_command_aliases_should_not_expand_if_no_space_after_alias() {
 
     // We have a top-level aliasForTest which expands to test. But the test signature does not expand "twelve" to "one" because there's no trailing space.
     let result =
-        warpui::r#async::block_on(expand_command_aliases("aliasForTest twelve", false, &ctx));
+        warpui_core::r#async::block_on(expand_command_aliases("aliasForTest twelve", false, &ctx));
     assert_eq!(result.expanded_command_line, "test twelve");
     assert_eq!(result.tokens_from_command, vec!["test", "twelve"]);
     // "twelve" isn't a valid subcommand, so we should use the "test" signature.
-    #[cfg(not(feature = "v2"))]
     assert_eq!(
         result
             .signature_for_completions
@@ -240,13 +240,16 @@ pub fn test_expand_command_aliases_case_insensitive_for_powershell() {
         .with_aliases(aliases)
         .with_shell_family(ShellFamily::PowerShell);
 
-    let result = warpui::r#async::block_on(expand_command_aliases("ALIASFORTEST ", false, &ctx));
+    let result =
+        warpui_core::r#async::block_on(expand_command_aliases("ALIASFORTEST ", false, &ctx));
     assert_eq!(result.expanded_command_line, "test ");
 
-    let result = warpui::r#async::block_on(expand_command_aliases("aliasfortest ", false, &ctx));
+    let result =
+        warpui_core::r#async::block_on(expand_command_aliases("aliasfortest ", false, &ctx));
     assert_eq!(result.expanded_command_line, "test ");
 
-    let result = warpui::r#async::block_on(expand_command_aliases("ALIASFORTEST", false, &ctx));
+    let result =
+        warpui_core::r#async::block_on(expand_command_aliases("ALIASFORTEST", false, &ctx));
     assert_eq!(result.expanded_command_line, "ALIASFORTEST");
 }
 
@@ -262,10 +265,12 @@ pub fn test_expand_command_aliases_case_sensitive_for_posix() {
         .with_aliases(aliases)
         .with_shell_family(ShellFamily::Posix);
 
-    let result = warpui::r#async::block_on(expand_command_aliases("ALIASFORTEST ", false, &ctx));
+    let result =
+        warpui_core::r#async::block_on(expand_command_aliases("ALIASFORTEST ", false, &ctx));
     assert_eq!(result.expanded_command_line, "ALIASFORTEST ");
 
-    let result = warpui::r#async::block_on(expand_command_aliases("aliasForTest ", false, &ctx));
+    let result =
+        warpui_core::r#async::block_on(expand_command_aliases("aliasForTest ", false, &ctx));
     assert_eq!(result.expanded_command_line, "test ");
 }
 
@@ -281,7 +286,7 @@ pub fn test_expand_command_aliases_multiple_commands() {
         .with_aliases(aliases);
 
     // We have a top-level "aliasForTest" which expands to "test".
-    let result = warpui::r#async::block_on(expand_command_aliases(
+    let result = warpui_core::r#async::block_on(expand_command_aliases(
         "kubectl get pod && ENV1=VAL1 ENV2=VAL2 aliasForTest ",
         false,
         &ctx,
@@ -291,10 +296,9 @@ pub fn test_expand_command_aliases_multiple_commands() {
         "kubectl get pod && ENV1=VAL1 ENV2=VAL2 test "
     );
 
-    #[cfg(not(feature = "v2"))]
     {
         // The test signature has an alias function, which expands subcommand "twelve" to "one".
-        let result = warpui::r#async::block_on(expand_command_aliases(
+        let result = warpui_core::r#async::block_on(expand_command_aliases(
             "kubectl get pod && ENV1=VAL1 ENV2=VAL2 test twelve ",
             false,
             &ctx,
@@ -307,7 +311,7 @@ pub fn test_expand_command_aliases_multiple_commands() {
         // Multiple commands should all have their aliases expanded.
         // It is a known issue that only the last command is expanded currently.
         // TODO(INT-830): fix this case, it should expand to "ENV1=VAL1 ENV2=VAL2 test && ENV3=VAL3 ENV3=VAL3 test "
-        let result = warpui::r#async::block_on(expand_command_aliases(
+        let result = warpui_core::r#async::block_on(expand_command_aliases(
             "ENV1=VAL1 ENV2=VAL2 aliasForTest && ENV3=VAL3 ENV3=VAL3 aliasForTest ",
             false,
             &ctx,

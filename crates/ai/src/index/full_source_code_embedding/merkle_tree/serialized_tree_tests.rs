@@ -2,11 +2,10 @@ use futures::executor::block_on;
 use serde_json;
 use virtual_fs::VirtualFS;
 
-use crate::index::full_source_code_embedding::merkle_tree::{
-    construct_test_merkle_tree, MerkleTree,
-};
-
 use super::SerializedCodebaseIndex;
+use crate::index::full_source_code_embedding::merkle_tree::{
+    MerkleTree, construct_test_merkle_tree,
+};
 
 #[test]
 fn round_trip_index_serialize_deserialize_json() {

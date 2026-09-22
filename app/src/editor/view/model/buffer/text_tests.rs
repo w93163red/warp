@@ -1,6 +1,7 @@
-use super::*;
 use std::collections::HashSet;
 use std::iter::FromIterator;
+
+use super::*;
 
 #[test]
 fn test_basic() {
@@ -78,7 +79,7 @@ fn test_random() {
             if rng.gen_ratio(1, 5) {
                 string.push('\n');
             } else {
-                string.push(rng.gen());
+                string.push(rng.r#gen());
             }
         }
         let text = Text::from(string.clone());

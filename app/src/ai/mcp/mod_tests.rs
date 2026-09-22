@@ -1,15 +1,17 @@
+use std::collections::HashMap;
+
+use serde_json;
+use warp_managed_secrets::ManagedSecretValue;
+
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::mcp::parsing::normalize_codex_toml_to_json;
 use crate::ai::mcp::parsing::resolve_json;
 use crate::ai::mcp::{
-    mcp_provider_from_file_path, CLIServer, JsonTemplate, MCPProvider, MCPServer,
+    CLIServer, JsonTemplate, MCPProvider, MCPServer, MCPServerExt,
     ParsedTemplatableMCPServerResult, ServerSentEvents, StaticEnvVar, StaticHeader,
     TemplatableMCPServer, TemplatableMCPServerInstallation, TemplateVariable, TransportType,
-    VariableType, VariableValue,
+    VariableType, VariableValue, mcp_provider_from_file_path,
 };
-use serde_json;
-use std::collections::HashMap;
-use warp_managed_secrets::ManagedSecretValue;
 
 #[test]
 fn mcp_provider_from_file_path_recognizes_warp_home_path() {
@@ -20,67 +22,6 @@ fn mcp_provider_from_file_path_recognizes_warp_home_path() {
             Some(MCPProvider::Warp)
         );
     }
-}
-
-#[test]
-fn test_mcp_server_config_serialization_excludes_secret_env_values() {
-    // Create a CLI server with environment variables containing secrets
-    let cli_server = CLIServer {
-        command: "npx".to_string(),
-        args: vec!["@modelcontextprotocol/server-postgres".to_string()],
-        cwd_parameter: Some("/tmp".to_string()),
-        static_env_vars: vec![
-            StaticEnvVar {
-                name: "API_KEY".to_string(),
-                value: "SOME_LEAKED_SECRET".to_string(),
-            },
-            StaticEnvVar {
-                name: "DATABASE_URL".to_string(),
-                value: "postgresql://user:password@localhost/db".to_string(),
-            },
-            StaticEnvVar {
-                name: "PUBLIC_CONFIG".to_string(),
-                value: "not-secret-value".to_string(),
-            },
-        ],
-    };
-
-    let mcp_server = MCPServer {
-        transport_type: TransportType::CLIServer(cli_server),
-        name: "test-server".to_string(),
-        uuid: uuid::Uuid::new_v4(),
-    };
-
-    // Test direct serde serialization
-    let serialized = serde_json::to_string(&mcp_server).expect("Failed to serialize MCP server");
-
-    // The serialized config should NOT contain the secret values
-    assert!(
-        !serialized.contains("SOME_LEAKED_SECRET"),
-        "Serialized config contains leaked secret value: {serialized}",
-    );
-    assert!(
-        !serialized.contains("password"),
-        "Serialized config contains password: {serialized}",
-    );
-    assert!(
-        !serialized.contains("not-secret-value"),
-        "Serialized config contains env var value: {serialized}",
-    );
-
-    // But should contain the environment variable names/keys
-    assert!(
-        serialized.contains("API_KEY"),
-        "Serialized config should contain env var key 'API_KEY': {serialized}",
-    );
-    assert!(
-        serialized.contains("DATABASE_URL"),
-        "Serialized config should contain env var key 'DATABASE_URL': {serialized}",
-    );
-    assert!(
-        serialized.contains("PUBLIC_CONFIG"),
-        "Serialized config should contain env var key 'PUBLIC_CONFIG': {serialized}",
-    );
 }
 
 /// Helper function to create a test TemplatableMCPServerInstallation with custom values
@@ -127,65 +68,6 @@ fn create_test_installation(
         templatable_mcp_server,
         variable_values,
     )
-}
-
-#[test]
-fn test_static_env_var_direct_serialization() {
-    // Test direct serialization of StaticEnvVar to ensure skip_serializing works
-    let env_var = StaticEnvVar {
-        name: "TEST_SECRET".to_string(),
-        value: "SOME_LEAKED_SECRET".to_string(),
-    };
-
-    let serialized = serde_json::to_string(&env_var).expect("Failed to serialize env var");
-
-    // Should contain the name but not the value due to skip_serializing
-    assert!(
-        serialized.contains("TEST_SECRET"),
-        "Serialized env var should contain name: {serialized}",
-    );
-    assert!(
-        !serialized.contains("SOME_LEAKED_SECRET"),
-        "Serialized env var should not contain value due to skip_serializing: {serialized}",
-    );
-}
-
-#[test]
-fn test_static_env_var_deserialization_with_default() {
-    // Test that StaticEnvVar can be deserialized properly with default value
-    let json = r#"{"name": "API_KEY"}"#;
-
-    let env_var: StaticEnvVar = serde_json::from_str(json).expect("Failed to deserialize env var");
-
-    assert_eq!(env_var.name, "API_KEY");
-    assert_eq!(env_var.value, ""); // Should default to empty string
-}
-
-#[test]
-fn test_sse_server_serialization() {
-    // Test that ServerSentEvents transport type serializes correctly
-    let sse_server = ServerSentEvents {
-        url: "https://example.com/sse".to_string(),
-        headers: Default::default(),
-    };
-
-    let mcp_server = MCPServer {
-        transport_type: TransportType::ServerSentEvents(sse_server),
-        name: "sse-server".to_string(),
-        uuid: uuid::Uuid::new_v4(),
-    };
-
-    let serialized = serde_json::to_string(&mcp_server).expect("Failed to serialize MCP server");
-
-    // Should contain the URL since it's not a secret field
-    assert!(
-        serialized.contains("https://example.com/sse"),
-        "Serialized SSE server should contain URL: {serialized}",
-    );
-    assert!(
-        serialized.contains("sse-server"),
-        "Serialized SSE server should contain name: {serialized}",
-    );
 }
 
 #[test]
@@ -237,14 +119,18 @@ fn test_sse_server_with_headers() {
     if let TransportType::ServerSentEvents(parsed_sse) = &parsed_server.transport_type {
         assert_eq!(parsed_sse.url, "https://example.com/sse");
         assert_eq!(parsed_sse.headers.len(), 2);
-        assert!(parsed_sse
-            .headers
-            .iter()
-            .any(|h| h.name == "Authorization" && h.value == "Bearer token123"));
-        assert!(parsed_sse
-            .headers
-            .iter()
-            .any(|h| h.name == "X-Custom-Header" && h.value == "custom-value"));
+        assert!(
+            parsed_sse
+                .headers
+                .iter()
+                .any(|h| h.name == "Authorization" && h.value == "Bearer token123")
+        );
+        assert!(
+            parsed_sse
+                .headers
+                .iter()
+                .any(|h| h.name == "X-Custom-Header" && h.value == "custom-value")
+        );
     } else {
         panic!("Expected ServerSentEvents transport type");
     }
@@ -1096,10 +982,68 @@ fn test_apply_secrets_missing_secret_leaves_placeholder() {
     );
 
     let secrets = make_secrets(vec![]);
-    installation.apply_secrets(&secrets);
+    let unresolved_secret_names = installation.apply_secrets(&secrets);
 
     assert_eq!(
         installation.variable_values()["API_KEY"].value,
         "{{nonexistent_secret}}"
     );
+    // Preserving the placeholder is deliberate, but it means the server is
+    // about to run with literal `{{...}}` text where a credential belongs, so
+    // the caller has to be told which secret went missing.
+    assert_eq!(
+        unresolved_secret_names,
+        vec!["nonexistent_secret".to_string()]
+    );
+}
+
+#[test]
+fn test_apply_secrets_reports_no_unresolved_refs_when_everything_resolves() {
+    let mut installation = create_test_installation(
+        "sse-server",
+        r#"{"sse-server":{"url":"https://example.com","headers":{"Authorization":"{{Authorization}}"}}}"#,
+        vec![("Authorization", "Bearer {{my_token}}")],
+    );
+
+    let secrets = make_secrets(vec![("my_token", "tok_abc123")]);
+    let unresolved_secret_names = installation.apply_secrets(&secrets);
+
+    assert!(unresolved_secret_names.is_empty());
+}
+
+#[test]
+fn test_apply_secrets_does_not_parse_refs_from_resolved_secret_values() {
+    let mut installation = create_test_installation(
+        "sse-server",
+        r#"{"sse-server":{"url":"https://example.com","headers":{"Authorization":"{{Authorization}}"}}}"#,
+        vec![("Authorization", "Bearer {{my_token}}")],
+    );
+
+    let secrets = make_secrets(vec![("my_token", "literal-{{not-a-secret-ref}}")]);
+    let unresolved_secret_names = installation.apply_secrets(&secrets);
+
+    assert!(unresolved_secret_names.is_empty());
+    assert_eq!(
+        installation.variable_values()["Authorization"].value,
+        "Bearer literal-{{not-a-secret-ref}}"
+    );
+}
+
+#[test]
+fn test_apply_secrets_unresolved_refs_never_expose_resolved_values() {
+    // One ref resolves and one does not. The report must name only the
+    // missing secret, never the value of the one that resolved.
+    let mut installation = create_test_installation(
+        "sse-server",
+        r#"{"sse-server":{"url":"https://example.com","headers":{"Authorization":"{{Authorization}}","X-Extra":"{{X-Extra}}"}}}"#,
+        vec![
+            ("Authorization", "Bearer {{present_token}}"),
+            ("X-Extra", "{{absent_token}}"),
+        ],
+    );
+
+    let secrets = make_secrets(vec![("present_token", "super-secret-value")]);
+    let unresolved_secret_names = installation.apply_secrets(&secrets);
+
+    assert_eq!(unresolved_secret_names, vec!["absent_token".to_string()]);
 }

@@ -1,12 +1,11 @@
-use crate::index::full_source_code_embedding::{
-    fragment_metadata::LeafToFragmentMetadataUpdates, merkle_tree::DirEntryOrFragment,
-};
+use std::collections::HashSet;
+
 use repo_metadata::{DirectoryEntry, Entry};
 use virtual_fs::{Stub, VirtualFS};
 
-use std::collections::HashSet;
-
 use super::{MerkleNode, NodeMask};
+use crate::index::full_source_code_embedding::fragment_metadata::LeafToFragmentMetadataUpdates;
+use crate::index::full_source_code_embedding::merkle_tree::DirEntryOrFragment;
 
 /// Tests that node hashes for directories are sorted (meaning they are resilient to files within
 /// the directory being in a different order).
@@ -827,9 +826,9 @@ fn test_merkle_node_multiple_operations() {
 
             // The hash of our modified node should match the hash of the manually constructed node
             assert_eq!(
-            node.hash, expected_node.hash,
-            "Hash after all operations should match hash of node constructed with expected structure"
-        );
+                node.hash, expected_node.hash,
+                "Hash after all operations should match hash of node constructed with expected structure"
+            );
         },
     );
 }

@@ -7,15 +7,17 @@
 //! - [`ClaudeResumeInfo`] — everything the harness runner needs to resume an existing
 //!   Claude conversation: the Warp server conversation id to reuse, the Claude session uuid
 //!   to pass to `claude --resume`, and the decoded envelope to rehydrate onto disk.
-//! - [`write_session_index_entry`] — best-effort update of `~/.claude/sessions-index.json`
-//!   so Claude's `--resume <uuid>` lookup can find the freshly-rehydrated jsonl. Upstream
-//!   versions vary in how they use this index (claude-code#33912, #39667, #5768); we write
-//!   a conservative entry and log on failure.
+//! - [`write_session_index_entry`] — update of `~/.claude/sessions-index.json` so Claude's
+//!   `--resume <uuid>` lookup can find the freshly-rehydrated jsonl. Upstream versions vary in
+//!   how they use this index (claude-code#33912, #39667, #5768); we write a conservative entry.
+//!   Callers treat write failures as hard errors rather than warnings, since this index is required
+//!   by some Claude Code versions.
 //!
 //! Split out from `claude_code.rs` so the `AIClient` transcript-fetch impl can deserialize
 //! envelopes without pulling in the rest of the harness runner.
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::fs::{create_dir_all, write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -24,9 +26,8 @@ use serde_json::Value;
 use uuid::Uuid;
 use warp_core::safe_warn;
 
-use crate::ai::agent::conversation::AIConversationId;
-
 use super::json_utils::entries_to_jsonl;
+use crate::ai::agent::api::ServerConversationToken;
 
 /// JSON envelope sent to the server representing a complete Claude Code session.
 ///
@@ -59,13 +60,19 @@ pub(crate) struct ClaudeResumeInfo {
     /// The Warp server-side conversation id. The runner stores this instead of calling
     /// `create_external_conversation` so subsequent transcript/block-snapshot uploads overwrite
     /// the same GCS objects.
-    pub(crate) conversation_id: AIConversationId,
+    pub(crate) conversation_id: ServerConversationToken,
     /// The Claude session uuid to pass to `claude --resume`. Matches `envelope.uuid`.
     pub(crate) session_id: Uuid,
-    /// Envelope from the server. Its `cwd` field is rewritten to the current run's working
-    /// directory before being written to disk, so `claude --resume <uuid>` finds the jsonl under
-    /// `~/.claude/projects/<encoded(new_cwd)>/`.
+    /// Envelope from the server. Its `cwd` field must match the current run's working directory
+    /// — [`rehydrate_claude_transcript`] rejects the resume rather than silently rewriting `cwd`,
+    /// since jsonl entries embed their own `cwd` fields that can't be retroactively fixed up, and
+    /// a rewritten top-level `cwd` alone would still leave those stale.
     pub(crate) envelope: ClaudeTranscriptEnvelope,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClaudeLocalContinuation {
+    pub(crate) command: String,
 }
 
 /// Encode a filesystem path as a Claude config directory name, matching the
@@ -85,9 +92,21 @@ pub(crate) fn claude_config_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    dirs::home_dir()
+    home_dir_for_claude_config()
         .map(|h| h.join(".claude"))
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
+}
+
+/// In tests on Windows, `dirs::home_dir()` ignores `HOME`, so we check it
+/// manually so that tests can override the home directory.
+pub(super) fn home_dir_for_claude_config() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home));
+    }
+    dirs::home_dir()
 }
 
 /// Assemble a [`ClaudeTranscriptEnvelope`] from the Claude config directory.
@@ -97,18 +116,25 @@ pub(crate) fn claude_config_dir() -> Result<PathBuf> {
 /// - `<config_root>/projects/<encoded_cwd>/<session_uuid>/subagents/*.jsonl` - subagents
 /// - `<config_root>/todos/<session_uuid>-agent-*.json` - per-agent todo lists
 ///
-/// If the main JSONL does not exist yet (e.g. during an early periodic save)
-/// the envelope is returned with an empty `entries` list rather than an error.
+/// If the main JSONL does not exist, `require_main_transcript` controls whether
+/// this returns an error or an envelope with an empty `entries` list.
 pub(crate) fn read_envelope(
     session_uuid: Uuid,
     cwd: &Path,
     config_root: &Path,
+    require_main_transcript: bool,
 ) -> Result<ClaudeTranscriptEnvelope> {
     let encoded = encode_cwd(cwd);
     let projects_dir = config_root.join("projects").join(&encoded);
 
     // Main session transcript.
     let session_file = projects_dir.join(format!("{session_uuid}.jsonl"));
+    if require_main_transcript && !session_file.exists() {
+        anyhow::bail!(
+            "Claude Code transcript does not exist after harness termination: {}",
+            session_file.display()
+        );
+    }
     let entries = read_jsonl(&session_file)?;
 
     // Subagents are stored in a directory named after the session UUID.
@@ -186,12 +212,12 @@ pub(crate) fn write_envelope(
 ) -> Result<()> {
     let encoded = encode_cwd(&envelope.cwd);
     let projects_dir = config_root.join("projects").join(&encoded);
-    std::fs::create_dir_all(&projects_dir)
+    create_dir_all(&projects_dir)
         .with_context(|| format!("Failed to create {}", projects_dir.display()))?;
 
     // Main session JSONL.
     let session_file = projects_dir.join(format!("{}.jsonl", envelope.uuid));
-    std::fs::write(&session_file, entries_to_jsonl(&envelope.entries)?)
+    write(&session_file, entries_to_jsonl(&envelope.entries)?)
         .with_context(|| format!("Failed to write {}", session_file.display()))?;
 
     // Subagent JSONLs.
@@ -199,11 +225,11 @@ pub(crate) fn write_envelope(
         let subagents_dir = projects_dir
             .join(envelope.uuid.to_string())
             .join("subagents");
-        std::fs::create_dir_all(&subagents_dir)
+        create_dir_all(&subagents_dir)
             .with_context(|| format!("Failed to create {}", subagents_dir.display()))?;
         for (stem, entries) in &envelope.subagents {
             let path = subagents_dir.join(format!("{stem}.jsonl"));
-            std::fs::write(&path, entries_to_jsonl(entries)?)
+            write(&path, entries_to_jsonl(entries)?)
                 .with_context(|| format!("Failed to write {}", path.display()))?;
         }
     }
@@ -211,11 +237,11 @@ pub(crate) fn write_envelope(
     // Per-agent todo lists.
     if !envelope.todos.is_empty() {
         let todos_dir = config_root.join("todos");
-        std::fs::create_dir_all(&todos_dir)
+        create_dir_all(&todos_dir)
             .with_context(|| format!("Failed to create {}", todos_dir.display()))?;
         for (stem, value) in &envelope.todos {
             let path = todos_dir.join(format!("{stem}.json"));
-            std::fs::write(&path, serde_json::to_vec(value)?)
+            write(&path, serde_json::to_vec(value)?)
                 .with_context(|| format!("Failed to write {}", path.display()))?;
         }
     }
@@ -223,10 +249,123 @@ pub(crate) fn write_envelope(
     Ok(())
 }
 
+/// Rehydrate a Claude transcript fetched for a `--conversation` cloud resume.
+///
+/// Requires `envelope.cwd` (the working directory the session was originally saved under) to
+/// match `local_cwd` (this run's working directory) exactly. Claude's `--resume <uuid>` lookup
+/// is scoped to the project directory derived from the literal cwd string, and each jsonl entry
+/// also embeds its own `cwd` field that isn't rewritten here — so resuming under a different
+/// directory would either leave Claude unable to find the session at all, or hand it a
+/// transcript with a `cwd` that no longer matches where it's actually running. Both are worse
+/// than failing loudly up front.
+pub(crate) fn rehydrate_claude_transcript(
+    envelope: &mut ClaudeTranscriptEnvelope,
+    local_cwd: &Path,
+) -> Result<ClaudeLocalContinuation> {
+    if envelope.cwd != local_cwd {
+        anyhow::bail!(
+            "Unable to resume Claude session {}: it was saved with working directory {}, but \
+             this run's working directory is {}.",
+            envelope.uuid,
+            envelope.cwd.display(),
+            local_cwd.display()
+        );
+    }
+    let session_id = envelope.uuid;
+    let config_root = claude_config_dir().context("Failed to resolve Claude config dir")?;
+    write_envelope(envelope, &config_root).context("Failed to rehydrate Claude transcript")?;
+    write_session_index_entry(session_id, local_cwd, &config_root)
+        .context("Failed to update Claude sessions-index.json")?;
+
+    Ok(ClaudeLocalContinuation {
+        command: format!("claude --resume {session_id}"),
+    })
+}
+
+/// Write a [`ClaudeTranscriptEnvelope`] to a project directory derived from `storage_cwd`,
+/// without mutating `envelope.cwd`.
+///
+/// Used by the local continuation path so the transcript's recorded working directory
+/// (the original cloud cwd) is preserved as-is while the file is placed under
+/// `~/.claude/projects/<encoded(storage_cwd)>/` where Claude's per-project lookup can find it.
+/// Cloud resume uses [`write_envelope`] instead, which derives the path from `envelope.cwd`.
+///
+/// Creates:
+/// - `<config_root>/projects/<encoded(storage_cwd)>/<uuid>.jsonl` — main transcript
+/// - `<config_root>/projects/<encoded(storage_cwd)>/<uuid>/subagents/<stem>.jsonl` — subagents
+/// - `<config_root>/todos/<stem>.json` — per-agent todo lists (same location as cloud resume)
+pub(crate) fn write_envelope_for_local_continuation(
+    envelope: &ClaudeTranscriptEnvelope,
+    storage_cwd: &Path,
+    config_root: &Path,
+) -> Result<()> {
+    let projects_dir = config_root.join("projects").join(encode_cwd(storage_cwd));
+    create_dir_all(&projects_dir)
+        .with_context(|| format!("Failed to create {}", projects_dir.display()))?;
+
+    // Main session JSONL.
+    let session_file = projects_dir.join(format!("{}.jsonl", envelope.uuid));
+    write(&session_file, entries_to_jsonl(&envelope.entries)?)
+        .with_context(|| format!("Failed to write {}", session_file.display()))?;
+
+    // Subagent JSONLs — same relative layout as write_envelope.
+    if !envelope.subagents.is_empty() {
+        let subagents_dir = projects_dir
+            .join(envelope.uuid.to_string())
+            .join("subagents");
+        create_dir_all(&subagents_dir)
+            .with_context(|| format!("Failed to create {}", subagents_dir.display()))?;
+        for (stem, entries) in &envelope.subagents {
+            let path = subagents_dir.join(format!("{stem}.jsonl"));
+            write(&path, entries_to_jsonl(entries)?)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+    }
+
+    // Per-agent todo lists are written to the same global location as cloud resume.
+    if !envelope.todos.is_empty() {
+        let todos_dir = config_root.join("todos");
+        create_dir_all(&todos_dir)
+            .with_context(|| format!("Failed to create {}", todos_dir.display()))?;
+        for (stem, value) in &envelope.todos {
+            let path = todos_dir.join(format!("{stem}.json"));
+            write(&path, serde_json::to_vec(value)?)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Rehydrate a Claude transcript downloaded from a remote cloud run for local continuation.
+///
+/// Unlike [`rehydrate_claude_transcript`] (used by the cloud resume harness runner), this
+/// function does **not** mutate the envelope's `cwd` field — the remote session's original
+/// working directory is preserved as-is in the transcript. The session file is stored under
+/// `~/.claude/projects/<encoded(home_dir)>/` so Claude's per-project session lookup finds it
+/// when the user runs `claude --resume <uuid>` from their home directory.
+pub(crate) fn rehydrate_claude_transcript_from_reader(
+    reader: impl Read,
+) -> Result<ClaudeLocalContinuation> {
+    let envelope: ClaudeTranscriptEnvelope =
+        serde_json::from_reader(reader).context("Failed to parse Claude transcript envelope")?;
+    let session_id = envelope.uuid;
+    let config_root = claude_config_dir().context("Failed to resolve Claude config dir")?;
+    let home_dir = home_dir_for_claude_config()
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    write_envelope_for_local_continuation(&envelope, &home_dir, &config_root)
+        .context("Failed to rehydrate Claude transcript for local continuation")?;
+    write_session_index_entry(session_id, &home_dir, &config_root)
+        .context("Failed to update Claude sessions-index.json")?;
+    Ok(ClaudeLocalContinuation {
+        command: format!("claude --resume {session_id}"),
+    })
+}
+
 /// Filename of Claude's global session index.
 const SESSIONS_INDEX_FILENAME: &str = "sessions-index.json";
 
-/// Upsert an entry for `session_uuid` into `<config_root>/sessions-index.json` so Claude's
+/// Upsert an entry for `session_uuid` into `<config_root>/sessions-index.json` so Claude's`
 /// `claude --resume <uuid>` lookup can find the rehydrated jsonl.
 ///
 /// Upstream Claude versions vary in how the index is keyed and what fields they read; this
@@ -234,9 +373,8 @@ const SESSIONS_INDEX_FILENAME: &str = "sessions-index.json";
 /// mirrors the fragments documented in claude-code#33912 / #39667 / #5768. Unknown fields are
 /// preserved on existing entries, and we never remove other entries.
 ///
-/// Best-effort: callers should log a warning on failure rather than aborting the run — if the
-/// index is missing or wrong, `--resume` simply falls back to "No conversation found" and the
-/// resumed run surfaces the expected resume-failure error.
+/// A missing or malformed index file is treated as an empty index and overwritten rather than
+/// failing (see the read branch below).
 pub(crate) fn write_session_index_entry(
     session_uuid: Uuid,
     cwd: &Path,
@@ -283,10 +421,9 @@ pub(crate) fn write_session_index_entry(
     index.insert(session_uuid.to_string(), entry);
 
     if let Some(parent) = index_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
+        create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-    std::fs::write(
+    write(
         &index_path,
         serde_json::to_vec_pretty(&Value::Object(index))
             .context("Failed to serialize sessions-index.json")?,

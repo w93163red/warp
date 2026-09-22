@@ -1,30 +1,40 @@
+use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use pathfinder_geometry::vector::vec2f;
 use warp_cli::agent::Harness;
 use warp_core::ui::appearance::Appearance;
-use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::Fill;
+use warp_core::ui::theme::color::internal_colors;
+use warp_managed_secrets::client::SecretOwner;
 use warpui::elements::{
     Border, ChildAnchor, ChildView, OffsetPositioning, ParentAnchor, ParentElement as _,
     ParentOffsetBounds, Stack,
 };
-use warpui::fonts::Properties;
 use warpui::{
     AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
 };
 
 use crate::ai::auth_secret_types::auth_secret_types_for_harness;
+use crate::ai::cloud_agent_settings::{AuthSecretPreference, CloudAgentSettings};
 use crate::ai::harness_availability::{
     AuthSecretFetchState, HarnessAvailabilityEvent, HarnessAvailabilityModel,
 };
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields, MenuVariant};
 use crate::terminal::input::{MenuPositioning, MenuPositioningProvider};
+use crate::terminal::view::ambient_agent::delete_auth_secret_confirmation_dialog::{
+    DeleteAuthSecretConfirmationDialog, DeleteAuthSecretConfirmationDialogEvent,
+    PendingAuthSecretDeletion,
+};
 use crate::terminal::view::ambient_agent::host_selector::NakedHeaderButtonTheme;
 use crate::terminal::view::ambient_agent::{AmbientAgentViewModel, AmbientAgentViewModelEvent};
 use crate::ui_components::icons::Icon;
+use crate::view_components::DismissibleToast;
 use crate::view_components::action_button::{ActionButton, ButtonSize};
+use crate::workspace::ToastStack;
+use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces, UserWorkspacesEvent};
 
 const HEADER_FONT_SIZE: f32 = 12.;
 
@@ -34,7 +44,7 @@ const MENU_HORIZONTAL_PADDING: f32 = 16.;
 
 const ITEM_VERTICAL_PADDING: f32 = 8.;
 
-const MENU_WIDTH: f32 = 208.;
+const MENU_WIDTH: f32 = 232.;
 
 const SIDECAR_WIDTH: f32 = 220.;
 
@@ -48,11 +58,12 @@ const MENU_HEADER_LABEL: &str = "API key";
 
 const SIDECAR_HEADER_LABEL: &str = "Choose a type";
 
-const NO_SECRET_LABEL: &str = "No API key";
+const NO_SECRET_LABEL: &str = "Inherit key from environment";
 
 const NEW_ITEM_LABEL: &str = "New";
 
 const MAIN_MENU_SAVE_POSITION_ID: &str = "auth_secret_selector_main_menu";
+type PendingDeleteKey = (Harness, String, SecretOwner);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AuthSecretSelectorAction {
@@ -61,21 +72,28 @@ pub enum AuthSecretSelectorAction {
     ClearSecret,
     OpenNewTypeSidecar,
     SelectNewType(usize),
+    DeleteSecret { name: String, owner: SecretOwner },
 }
 
 pub enum AuthSecretSelectorEvent {
     MenuVisibilityChanged { open: bool },
     NewTypeSelected { harness: Harness, type_index: usize },
+    DeleteConfirmationDialogToggled { is_open: bool },
 }
 
 pub struct AuthSecretSelector {
     button: ViewHandle<ActionButton>,
     menu: ViewHandle<Menu<AuthSecretSelectorAction>>,
     new_type_sidecar: ViewHandle<Menu<AuthSecretSelectorAction>>,
+    delete_confirmation_dialog: ViewHandle<DeleteAuthSecretConfirmationDialog>,
     is_menu_open: bool,
     is_new_type_sidecar_open: bool,
     menu_positioning_provider: Arc<dyn MenuPositioningProvider>,
     ambient_agent_model: ModelHandle<AmbientAgentViewModel>,
+    /// Secrets with an in-flight delete request, keyed by harness, name,
+    /// and owner. This disables only the matching X affordance while that
+    /// exact request is pending.
+    pending_deletes: HashSet<PendingDeleteKey>,
 }
 
 impl AuthSecretSelector {
@@ -115,12 +133,8 @@ impl AuthSecretSelector {
             MenuEvent::ItemSelected => {}
         });
 
-        let new_type_sidecar = ctx.add_typed_action_view(|_ctx| {
-            Menu::new()
-                .with_width(SIDECAR_WIDTH)
-                .with_drop_shadow()
-                .prevent_interaction_with_other_elements()
-        });
+        let new_type_sidecar = ctx
+            .add_typed_action_view(|_ctx| Menu::new().with_width(SIDECAR_WIDTH).with_drop_shadow());
 
         ctx.subscribe_to_view(&new_type_sidecar, |me, _, event, ctx| match event {
             MenuEvent::Close { .. } => {
@@ -129,8 +143,16 @@ impl AuthSecretSelector {
             MenuEvent::ItemSelected | MenuEvent::ItemHovered => {}
         });
 
+        let delete_confirmation_dialog =
+            ctx.add_typed_action_view(DeleteAuthSecretConfirmationDialog::new);
+        ctx.subscribe_to_view(&delete_confirmation_dialog, |me, _, event, ctx| {
+            me.handle_delete_confirmation_event(event, ctx);
+        });
+
         ctx.subscribe_to_model(&ambient_agent_model, |me, _, event, ctx| match event {
             AmbientAgentViewModelEvent::HarnessSelected => {
+                // When the harness changes, try to restore the saved auth secret.
+                me.maybe_restore_auth_secret_from_settings(ctx);
                 me.refresh_button(ctx);
                 me.refresh_menu(ctx);
                 me.refresh_sidecar(ctx);
@@ -145,12 +167,35 @@ impl AuthSecretSelector {
         ctx.subscribe_to_model(
             &HarnessAvailabilityModel::handle(ctx),
             |me, _, event, ctx| match event {
-                HarnessAvailabilityEvent::AuthSecretsLoaded
-                | HarnessAvailabilityEvent::AuthSecretCreated { .. } => {
+                HarnessAvailabilityEvent::AuthSecretsChanged => {
                     me.refresh_menu(ctx);
                     me.refresh_button(ctx);
                 }
+                HarnessAvailabilityEvent::AuthSecretDeleted {
+                    harness,
+                    name,
+                    owner,
+                } => {
+                    if me.secret_owner_is_visible(owner, ctx) {
+                        me.handle_secret_deleted(*harness, name.clone(), owner.clone(), ctx);
+                    }
+                }
+                HarnessAvailabilityEvent::AuthSecretDeletionFailed {
+                    harness,
+                    name,
+                    owner,
+                    error,
+                } => {
+                    me.handle_secret_deletion_failed(
+                        *harness,
+                        name.clone(),
+                        owner.clone(),
+                        error.clone(),
+                        ctx,
+                    );
+                }
                 HarnessAvailabilityEvent::Changed
+                | HarnessAvailabilityEvent::AuthSecretCreated { .. }
                 | HarnessAvailabilityEvent::AuthSecretCreationFailed { .. } => {}
             },
         );
@@ -159,20 +204,87 @@ impl AuthSecretSelector {
             me.refresh_menu(ctx);
             me.refresh_sidecar(ctx);
         });
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |me, _, event, ctx| {
+            let affects_window = matches!(event, UserWorkspacesEvent::TeamsChanged)
+                || matches!(
+                    event,
+                    UserWorkspacesEvent::WindowTeamChanged { window_id }
+                        if *window_id == ctx.window_id()
+                );
+            if affects_window {
+                me.handle_team_scope_changed(ctx);
+            }
+        });
 
         let mut me = Self {
             button,
             menu,
             new_type_sidecar,
+            delete_confirmation_dialog,
             is_menu_open: false,
             is_new_type_sidecar_open: false,
             menu_positioning_provider,
             ambient_agent_model,
+            pending_deletes: HashSet::new(),
         };
+        me.maybe_restore_auth_secret_from_settings(ctx);
         me.refresh_button(ctx);
         me.refresh_menu(ctx);
         me.refresh_sidecar(ctx);
         me
+    }
+
+    fn secret_owner_is_visible(&self, owner: &SecretOwner, ctx: &ViewContext<Self>) -> bool {
+        match owner {
+            SecretOwner::CurrentUser => true,
+            SecretOwner::Team { team_uid } => UserWorkspaces::as_ref(ctx)
+                .team_context_for_view(ctx)
+                .team_uid()
+                .is_some_and(|current_team_uid| current_team_uid.uid() == *team_uid),
+        }
+    }
+
+    fn handle_team_scope_changed(&mut self, ctx: &mut ViewContext<Self>) {
+        self.pending_deletes.clear();
+        self.ambient_agent_model.update(ctx, |model, ctx| {
+            model.set_harness_auth_secret_name(None, ctx);
+        });
+        self.maybe_restore_auth_secret_from_settings(ctx);
+        self.refresh_button(ctx);
+        self.refresh_menu(ctx);
+        if self.is_menu_open {
+            let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
+            let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+            HarnessAvailabilityModel::handle(ctx).update(ctx, |model, ctx| {
+                model.ensure_auth_secrets_fetched(&team_scope, harness, ctx);
+            });
+        }
+    }
+
+    /// Restores the saved auth secret from settings for the active harness if none is selected.
+    fn maybe_restore_auth_secret_from_settings(&mut self, ctx: &mut ViewContext<Self>) {
+        if self
+            .ambient_agent_model
+            .as_ref(ctx)
+            .selected_harness_auth_secret_name()
+            .is_some()
+        {
+            return;
+        }
+        let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
+        let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+        let saved_name =
+            match CloudAgentSettings::as_ref(ctx).auth_secret_preference(&team_scope, harness) {
+                Some(AuthSecretPreference::Named(name)) => Some(name),
+                Some(AuthSecretPreference::Inherit) | None => None,
+            };
+        if let Some(saved_name) = saved_name {
+            // Apply optimistically — secrets may not be fetched yet, but the UI
+            // will update once auth secrets are loaded.
+            self.ambient_agent_model.update(ctx, |model, ctx| {
+                model.set_harness_auth_secret_name(Some(saved_name), ctx);
+            });
+        }
     }
 
     pub fn is_menu_open(&self) -> bool {
@@ -183,6 +295,10 @@ impl AuthSecretSelector {
         self.menu.update(ctx, |menu, ctx| menu.select_previous(ctx));
     }
 
+    pub(crate) fn delete_confirmation_dialog_element(&self) -> Box<dyn Element> {
+        ChildView::new(&self.delete_confirmation_dialog).finish()
+    }
+
     fn set_menu_visibility(&mut self, is_open: bool, ctx: &mut ViewContext<Self>) {
         if self.is_menu_open == is_open {
             return;
@@ -190,8 +306,9 @@ impl AuthSecretSelector {
         self.is_menu_open = is_open;
         if is_open {
             let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
+            let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
             HarnessAvailabilityModel::handle(ctx).update(ctx, |model, ctx| {
-                model.ensure_auth_secrets_fetched(harness, ctx);
+                model.ensure_auth_secrets_fetched(&team_scope, harness, ctx);
             });
             let selected_action = self
                 .ambient_agent_model
@@ -273,9 +390,12 @@ impl AuthSecretSelector {
         let border = Border::all(1.).with_border_fill(theme.outline());
 
         let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
+        let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_view(ctx);
         let availability = HarnessAvailabilityModel::as_ref(ctx);
         let items = build_main_menu_items(
-            availability.auth_secrets_for(harness),
+            harness,
+            availability.auth_secrets_for(&team_scope, harness),
+            &self.pending_deletes,
             hover_background,
             header_text_color,
         );
@@ -286,6 +406,134 @@ impl AuthSecretSelector {
         });
     }
 
+    fn handle_secret_deleted(
+        &mut self,
+        harness: Harness,
+        name: String,
+        owner: SecretOwner,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let removed_pending = self.pending_deletes.remove(&(harness, name.clone(), owner));
+        let preference_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+
+        CloudAgentSettings::handle(ctx).update(ctx, |settings, ctx| {
+            if matches!(
+                settings.auth_secret_preference(&preference_scope, harness),
+                Some(AuthSecretPreference::Named(selected)) if selected == name
+            ) {
+                settings.persist_auth_secret_preference(&preference_scope, harness, None, ctx);
+            }
+        });
+
+        // Drop the selection if it pointed at the just-deleted secret
+        // so the chip falls back to the inherit label.
+        let selected = self
+            .ambient_agent_model
+            .as_ref(ctx)
+            .selected_harness_auth_secret_name()
+            .map(|s| s.to_string());
+        if selected.as_deref() == Some(name.as_str()) {
+            self.ambient_agent_model.update(ctx, |model, ctx| {
+                model.set_harness_auth_secret_name(None, ctx);
+            });
+        }
+
+        self.refresh_menu(ctx);
+        self.refresh_button(ctx);
+
+        // Only surface a toast for a deletion *this* selector initiated.
+        // A deletion fired from a different surface (or a different
+        // window) shouldn't pop a duplicate confirmation here.
+        if removed_pending {
+            let window_id = ctx.window_id();
+            let message = format!("API key '{name}' deleted.");
+            ToastStack::handle(ctx).update(ctx, |ts, ctx| {
+                ts.add_ephemeral_toast(DismissibleToast::success(message), window_id, ctx);
+            });
+        }
+
+        let active_harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
+        if harness == active_harness {
+            ctx.notify();
+        }
+    }
+
+    fn handle_secret_deletion_failed(
+        &mut self,
+        harness: Harness,
+        name: String,
+        owner: SecretOwner,
+        error: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let removed_pending = self.pending_deletes.remove(&(harness, name.clone(), owner));
+        let active_harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
+        if harness == active_harness {
+            self.refresh_menu(ctx);
+        }
+        // Show a toast only when the failed delete was ours; avoids
+        // double-toasting if another surface also tried to delete.
+        if removed_pending {
+            let window_id = ctx.window_id();
+            let message = format!("Failed to delete API key '{name}': {error}");
+            ToastStack::handle(ctx).update(ctx, |ts, ctx| {
+                ts.add_ephemeral_toast(DismissibleToast::error(message), window_id, ctx);
+            });
+        }
+        ctx.notify();
+    }
+
+    fn handle_delete_confirmation_event(
+        &mut self,
+        event: &DeleteAuthSecretConfirmationDialogEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            DeleteAuthSecretConfirmationDialogEvent::Cancel => {
+                self.delete_confirmation_dialog
+                    .update(ctx, |dialog, ctx| dialog.hide(ctx));
+                ctx.emit(AuthSecretSelectorEvent::DeleteConfirmationDialogToggled {
+                    is_open: false,
+                });
+            }
+            DeleteAuthSecretConfirmationDialogEvent::Confirm(pending_deletion) => {
+                let pending_deletion = pending_deletion.clone();
+                self.delete_confirmation_dialog
+                    .update(ctx, |dialog, ctx| dialog.hide(ctx));
+                ctx.emit(AuthSecretSelectorEvent::DeleteConfirmationDialogToggled {
+                    is_open: false,
+                });
+                self.start_secret_delete(pending_deletion, ctx);
+            }
+        }
+    }
+
+    fn start_secret_delete(
+        &mut self,
+        pending_deletion: PendingAuthSecretDeletion,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let PendingAuthSecretDeletion {
+            team_scope,
+            harness,
+            name,
+            owner,
+        } = pending_deletion;
+
+        if !self
+            .pending_deletes
+            .insert((harness, name.clone(), owner.clone()))
+        {
+            return;
+        }
+
+        HarnessAvailabilityModel::handle(ctx).update(ctx, |model, ctx| {
+            model.delete_auth_secret(team_scope.as_ref(), harness, name, owner, ctx);
+        });
+        // Re-render so the X for the pending row becomes
+        // disabled.
+        self.refresh_menu(ctx);
+    }
     fn refresh_sidecar(&mut self, ctx: &mut ViewContext<Self>) {
         let appearance = Appearance::as_ref(ctx);
         let theme = appearance.theme();
@@ -358,7 +606,9 @@ impl AuthSecretSelector {
 }
 
 fn build_main_menu_items(
+    harness: Harness,
     fetch_state: &AuthSecretFetchState,
+    pending_deletes: &HashSet<PendingDeleteKey>,
     hover_background: Fill,
     header_text_color: pathfinder_color::ColorU,
 ) -> Vec<MenuItem<AuthSecretSelectorAction>> {
@@ -375,7 +625,7 @@ fn build_main_menu_items(
     let mut items = vec![header];
 
     items.push(MenuItem::Item(
-        MenuItemFields::new("No secret")
+        MenuItemFields::new(NO_SECRET_LABEL)
             .with_font_size_override(ITEM_FONT_SIZE)
             .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
             .with_override_hover_background_color(hover_background)
@@ -385,13 +635,22 @@ fn build_main_menu_items(
     match fetch_state {
         AuthSecretFetchState::Loaded(secrets) => {
             for secret in secrets {
+                let is_pending_delete =
+                    pending_deletes.contains(&(harness, secret.name.clone(), secret.owner.clone()));
                 let fields = MenuItemFields::new(secret.name.clone())
                     .with_font_size_override(ITEM_FONT_SIZE)
                     .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
                     .with_override_hover_background_color(hover_background)
                     .with_on_select_action(AuthSecretSelectorAction::SelectSecret(
                         secret.name.clone(),
-                    ));
+                    ))
+                    .with_right_side_icon(Icon::X)
+                    .with_right_side_icon_action(AuthSecretSelectorAction::DeleteSecret {
+                        name: secret.name.clone(),
+                        owner: secret.owner.clone(),
+                    })
+                    .with_right_side_icon_a11y_label(format!("Delete API key {}", secret.name))
+                    .with_right_side_icon_disabled(is_pending_delete);
                 items.push(MenuItem::Item(fields));
             }
         }
@@ -421,7 +680,7 @@ fn build_main_menu_items(
             .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
             .with_override_hover_background_color(hover_background)
             .with_icon(Icon::Plus)
-            .with_right_side_label("›", Properties::default())
+            .with_right_side_icon(Icon::ChevronRight)
             .with_on_select_action(AuthSecretSelectorAction::OpenNewTypeSidecar),
     ));
 
@@ -476,19 +735,33 @@ impl TypedActionView for AuthSecretSelector {
                 let name = name.clone();
                 let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
                 self.ambient_agent_model.update(ctx, |model, ctx| {
-                    model.set_harness_auth_secret_name(Some(name), ctx);
+                    model.set_harness_auth_secret_name(Some(name.clone()), ctx);
                 });
-                crate::ai::cloud_agent_settings::CloudAgentSettings::handle(ctx).update(
-                    ctx,
-                    |settings, ctx| {
-                        settings.mark_harness_auth_ftux_completed(harness, ctx);
-                    },
-                );
+                let preference_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+                CloudAgentSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.mark_harness_auth_ftux_completed(harness, ctx);
+                    settings.persist_auth_secret_preference(
+                        &preference_scope,
+                        harness,
+                        Some(AuthSecretPreference::Named(name)),
+                        ctx,
+                    );
+                });
                 self.set_menu_visibility(false, ctx);
             }
             AuthSecretSelectorAction::ClearSecret => {
+                let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
                 self.ambient_agent_model.update(ctx, |model, ctx| {
                     model.set_harness_auth_secret_name(None, ctx);
+                });
+                let preference_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+                CloudAgentSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.persist_auth_secret_preference(
+                        &preference_scope,
+                        harness,
+                        Some(AuthSecretPreference::Inherit),
+                        ctx,
+                    );
                 });
                 self.set_menu_visibility(false, ctx);
             }
@@ -504,6 +777,24 @@ impl TypedActionView for AuthSecretSelector {
                     harness,
                     type_index,
                 });
+            }
+            AuthSecretSelectorAction::DeleteSecret { name, owner } => {
+                let pending_deletion = PendingAuthSecretDeletion {
+                    team_scope: Rc::new(
+                        UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx),
+                    ),
+                    harness: self.ambient_agent_model.as_ref(ctx).selected_harness(),
+                    name: name.clone(),
+                    owner: owner.clone(),
+                };
+                self.set_menu_visibility(false, ctx);
+                self.delete_confirmation_dialog.update(ctx, |dialog, ctx| {
+                    dialog.show(pending_deletion, ctx);
+                });
+                ctx.emit(AuthSecretSelectorEvent::DeleteConfirmationDialogToggled {
+                    is_open: true,
+                });
+                ctx.notify();
             }
         }
     }

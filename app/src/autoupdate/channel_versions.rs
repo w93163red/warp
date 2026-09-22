@@ -1,4 +1,6 @@
-use std::{env, fs::read_to_string, sync::Arc};
+use std::env;
+use std::fs::read_to_string;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use channel_versions::ChannelVersions;

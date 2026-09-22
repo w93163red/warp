@@ -1,9 +1,3 @@
-use crate::pricing::{PricingInfoModel, PricingInfoModelEvent};
-use crate::terminal::general_settings::GeneralSettings;
-use crate::ui_components::blended_colors;
-use crate::view_components::{Dropdown, DropdownEvent, DropdownItem, ToastFlavor};
-use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
-use crate::workspaces::workspace::CustomerType;
 use asset_macro::bundled_or_fetched_asset;
 use itertools::Itertools;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
@@ -27,6 +21,13 @@ use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::{
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
 };
+
+use crate::pricing::{PricingInfoModel, PricingInfoModelEvent};
+use crate::terminal::general_settings::GeneralSettings;
+use crate::ui_components::blended_colors;
+use crate::view_components::{Dropdown, DropdownEvent, DropdownItem, ToastFlavor};
+use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
+use crate::workspaces::workspace::CustomerType;
 
 const BUTTON_DIAMETER: f32 = 20.;
 const DROPDOWN_WIDTH: f32 = 160.;
@@ -787,7 +788,7 @@ impl TypedActionView for BuildPlanMigrationModal {
             BuildPlanMigrationModalViewAction::GetStartedClicked => {
                 // Get current team UID and workspace data
                 let workspaces = UserWorkspaces::as_ref(ctx);
-                let Some(team_uid) = workspaces.current_team_uid() else {
+                let Some(team_uid) = workspaces.team_uid_for_window(ctx.window_id()) else {
                     ctx.emit(BuildPlanMigrationModalEvent::ShowToast {
                         message: "Oops, something went wrong; your team data could not be found."
                             .to_string(),

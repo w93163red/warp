@@ -161,6 +161,10 @@ void warp_marked_text_cleared(WarpHostView *);
 - (void)setAsyncCallback:(BOOL)shouldAsync {
     asyncCallback = shouldAsync;
 }
+- (void)setPresentsWithTransaction:(BOOL)presentsWithTransaction {
+    CAMetalLayer *layer = (CAMetalLayer *)self.layer;
+    layer.presentsWithTransaction = presentsWithTransaction;
+}
 
 - (void)setTitlebarDragAtBottom:(BOOL)enabled {
     titlebarDragAtBottom = enabled;
@@ -287,7 +291,7 @@ void warp_marked_text_cleared(WarpHostView *);
     layer.allowsNextDrawableTimeout = NO;
     layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
     layer.needsDisplayOnBoundsChange = YES;
-    layer.presentsWithTransaction = YES;
+    layer.presentsWithTransaction = NO;
     layer.delegate = self;
     layer.opaque = NO;
     return layer;

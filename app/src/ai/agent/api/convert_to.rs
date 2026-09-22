@@ -1,18 +1,19 @@
 //! Conversions from application types to MAA API types.
 
+use std::collections::HashMap;
+
 use ai::agent::convert::ConvertToAPITypeError;
 use anyhow::anyhow;
 use chrono::{DateTime, Local, Timelike};
 use warp_multi_agent_api as api;
 
-use crate::ai::{
-    agent::{
-        AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
-        AIAgentInput, DriveObjectPayload, MCPContext, PassiveSuggestionResultType,
-        PassiveSuggestionTrigger, RunningCommand, StaticQueryType, Suggestions, UserQueryMode,
-    },
-    block_context::BlockContext,
+use crate::ai::agent::base_user_query::warp_client_origin;
+use crate::ai::agent::{
+    AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext, AIAgentInput,
+    BaseUserQuery, DriveObjectPayload, MCPContext, PassiveSuggestionResultType,
+    PassiveSuggestionTrigger, RunningCommand, StaticQueryType, Suggestions, UserQueryMode,
 };
+use crate::ai::block_context::BlockContext;
 
 fn local_datetime_to_timestamp(timestamp: DateTime<Local>) -> prost_types::Timestamp {
     prost_types::Timestamp {
@@ -44,11 +45,6 @@ impl TryFrom<StaticQueryType> for api::request::input::query_with_canned_respons
             StaticQueryType::SomethingElse => Ok(
                 api::request::input::query_with_canned_response::Type::SomethingElse(
                     api::request::input::query_with_canned_response::SomethingElse {},
-                ),
-            ),
-            StaticQueryType::CustomOnboardingRequest => Ok(
-                api::request::input::query_with_canned_response::Type::CustomOnboardingRequest(
-                    api::request::input::query_with_canned_response::CustomOnboardingRequest {},
                 ),
             ),
             StaticQueryType::EvaluationSuite => {
@@ -201,14 +197,6 @@ pub(super) fn convert_input(
                     )),
                 });
             }
-            AIAgentInput::FetchReviewComments { repo_path, context } => {
-                return Ok(api::request::Input {
-                    context: Some(convert_context(context.as_ref())),
-                    r#type: Some(api::request::input::Type::FetchReviewComments(
-                        api::request::input::FetchReviewComments { repo_path },
-                    )),
-                });
-            }
             AIAgentInput::SummarizeConversation { prompt, context } => {
                 return Ok(api::request::Input {
                     context: Some(convert_context(context.as_ref())),
@@ -230,6 +218,7 @@ pub(super) fn convert_input(
                         api::request::input::InvokeSkill {
                             skill: Some(skill.into()),
                             user_query: user_query.map(|user_query| {
+                                let attribution = attribution_fields(user_query.base.as_ref());
                                 api::request::input::UserQuery {
                                     query: user_query.query,
                                     referenced_attachments: user_query
@@ -239,6 +228,9 @@ pub(super) fn convert_input(
                                         .collect(),
                                     mode: None,
                                     intended_agent: Default::default(),
+                                    origin: attribution.origin,
+                                    author: attribution.author,
+                                    source_message: attribution.source_message,
                                 }
                             }),
                         },
@@ -294,6 +286,56 @@ pub(super) fn convert_input(
     })
 }
 
+/// Builds the outgoing `Request.Input.UserQuery` by writing the fields this client models over
+/// `base`, the query warp-server injected with a shared-session prompt (if any).
+///
+/// `query`, `mode`, and `intended_agent` were seeded from the base when the input was built
+/// (see `BaseUserQuery::seed_input_fields`), so writing them back wholesale drops nothing the
+/// server sent. Attachments are the one field this client does not model losslessly
+/// (`TryFrom<api::Attachment>` keeps only file path references), so the base's entries stay
+/// and the ones this client resolved locally are added alongside them.
+fn user_query_proto(
+    base: Option<&BaseUserQuery>,
+    query: String,
+    referenced_attachments: HashMap<String, api::Attachment>,
+    mode: api::UserQueryMode,
+    intended_agent: i32,
+) -> api::request::input::UserQuery {
+    let mut proto = base.map(BaseUserQuery::to_proto).unwrap_or_default();
+    proto.query = query;
+    proto.mode = Some(mode);
+    proto.intended_agent = intended_agent;
+    for (key, attachment) in referenced_attachments {
+        proto
+            .referenced_attachments
+            .entry(key)
+            .or_insert(attachment);
+    }
+    mark_fresh_local(base, &mut proto);
+    proto
+}
+
+/// Marks a query this client built from local input as freshly typed here.
+///
+/// warp-server attributes an input to the authenticated caller only when it carries a bare
+/// `WarpClient` origin. An input with no origin at all is deliberately left alone, because an
+/// older relay could have forwarded it from another participant. Without this marker, locally
+/// typed queries would be recorded with no author. A query with a base is never marked: its
+/// fields, including an absent origin, are what the server or viewer decided.
+fn mark_fresh_local(base: Option<&BaseUserQuery>, query: &mut api::request::input::UserQuery) {
+    if base.is_none() && query.origin.is_none() {
+        query.origin = Some(warp_client_origin());
+    }
+}
+
+/// The attribution fields for a query built outside `user_query_proto` (skill invocations): the
+/// base metadata when there is any, otherwise the fresh-local marker.
+fn attribution_fields(base: Option<&BaseUserQuery>) -> api::request::input::UserQuery {
+    let mut fields = base.map(BaseUserQuery::to_proto).unwrap_or_default();
+    mark_fresh_local(base, &mut fields);
+    fields
+}
+
 fn convert_input_to_user_input(
     input: AIAgentInput,
 ) -> Result<api::request::input::user_inputs::user_input::Input, ConvertToAPITypeError> {
@@ -305,22 +347,24 @@ fn convert_input_to_user_input(
             user_query_mode,
             running_command: None,
             intended_agent,
+            base,
             ..
         } => Ok(
-            api::request::input::user_inputs::user_input::Input::UserQuery(
-                api::request::input::UserQuery {
-                    query,
-                    referenced_attachments: referenced_attachments.into_iter().map(|(k, attachment)| (k, attachment.into())).collect(),
-                    mode: Some(user_query_mode.into()),
-                    intended_agent: intended_agent.map(|agent| agent.into()).unwrap_or_default(),
-                },
-            ),
+            api::request::input::user_inputs::user_input::Input::UserQuery(user_query_proto(
+                base.as_ref(),
+                query,
+                referenced_attachments.into_iter().map(|(k, attachment)| (k, attachment.into())).collect(),
+                user_query_mode.into(),
+                intended_agent.map(|agent| agent.into()).unwrap_or_default(),
+            )),
         ),
         AIAgentInput::UserQuery {
             query,
             static_query_type: None,
             referenced_attachments,
             user_query_mode,
+            intended_agent,
+            base,
             running_command: Some(RunningCommand{
                 command,
                 block_id,
@@ -333,12 +377,14 @@ fn convert_input_to_user_input(
         } => {
             Ok(api::request::input::user_inputs::user_input::Input::CliAgentUserQuery(
                 api::request::input::CliAgentUserQuery {
-                    user_query: Some(api::request::input::UserQuery {
-                            query,
-                            referenced_attachments: referenced_attachments.into_iter().map(|(k, attachment)| (k, attachment.into())).collect(),
-                            mode: Some(user_query_mode.into()),
-                            intended_agent: api::AgentType::Cli.into(),
-                        }),
+                    user_query: Some(user_query_proto(
+                        base.as_ref(),
+                        query,
+                        referenced_attachments.into_iter().map(|(k, attachment)| (k, attachment.into())).collect(),
+                        user_query_mode.into(),
+                        // A CLI subagent query is for the CLI agent unless the base named one.
+                        intended_agent.unwrap_or(api::AgentType::Cli).into(),
+                    )),
                     running_command: Some(api::RunningShellCommand{
                         command,
                         snapshot: Some(api::LongRunningShellCommandSnapshot {
@@ -347,6 +393,7 @@ fn convert_input_to_user_input(
                             command_id: block_id.as_str().to_owned(),
                             is_alt_screen_active,
                             is_preempted: false,
+                            activity: None,
                         }),
                     }),
                     run_shell_command_tool_call_id: requested_command_id.map(|id| id.to_string()).unwrap_or_default(),
@@ -451,7 +498,6 @@ fn convert_input_to_user_input(
         AIAgentInput::ResumeConversation { .. } => Err(ConvertToAPITypeError::Ignore),
         AIAgentInput::InitProjectRules { .. } => Err(ConvertToAPITypeError::Ignore),
         AIAgentInput::CodeReview { .. } => Err(ConvertToAPITypeError::Ignore),
-        AIAgentInput::FetchReviewComments { .. } => Err(ConvertToAPITypeError::Ignore),
         AIAgentInput::CreateEnvironment { .. } => Err(ConvertToAPITypeError::Ignore),
         AIAgentInput::InvokeSkill { .. } => Err(ConvertToAPITypeError::Ignore),
         invalid_input => Err(anyhow!(
@@ -690,11 +736,14 @@ impl TryFrom<AIAgentActionResult> for api::request::input::user_inputs::user_inp
             AIAgentActionResultType::RequestComputerUse(request_computer_use_result) => {
                 Some(request_computer_use_result.try_into()?)
             }
+            AIAgentActionResultType::StartRecording(start_recording_result) => {
+                Some(start_recording_result.try_into()?)
+            }
+            AIAgentActionResultType::StopRecording(stop_recording_result) => {
+                Some(stop_recording_result.try_into()?)
+            }
             AIAgentActionResultType::FetchConversation(fetch_conversation_result) => {
                 Some(fetch_conversation_result.try_into()?)
-            }
-            AIAgentActionResultType::StartAgent(start_agent_result) => {
-                Some(start_agent_result.into())
             }
             AIAgentActionResultType::SendMessageToAgent(send_message_result) => {
                 Some(send_message_result.into())
@@ -707,6 +756,9 @@ impl TryFrom<AIAgentActionResult> for api::request::input::user_inputs::user_inp
             }
             AIAgentActionResultType::RunAgents(orchestrate_result) => {
                 Some(orchestrate_result.try_into()?)
+            }
+            AIAgentActionResultType::WaitForEvents(wait_for_events_result) => {
+                Some(wait_for_events_result.try_into()?)
             }
         };
         Ok(
@@ -722,6 +774,7 @@ impl TryFrom<AIAgentActionResult> for api::request::input::user_inputs::user_inp
 
 fn convert_context(context: &[AIAgentContext]) -> api::InputContext {
     let mut api_context = api::InputContext::default();
+    let mut git_context = None;
     for context in context.iter().cloned() {
         match context {
             AIAgentContext::Block(block) => {
@@ -805,12 +858,42 @@ fn convert_context(context: &[AIAgentContext]) -> api::InputContext {
                 }
             }
             AIAgentContext::Git { head, branch } => {
-                api_context.git = Some(api::input_context::Git {
-                    head,
-                    branch: branch.unwrap_or_default(),
-                    repository: None,   // TODO: populate?
-                    pull_request: None, // TODO: populate?
+                let api_git_context =
+                    git_context.get_or_insert_with(api::input_context::Git::default);
+                api_git_context.head = head;
+                api_git_context.branch = branch.unwrap_or_default();
+            }
+            AIAgentContext::Repository { name, owner, host } => {
+                let api_git_context =
+                    git_context.get_or_insert_with(api::input_context::Git::default);
+                api_git_context.repository = Some(api::input_context::git::Repository {
+                    name,
+                    owner: owner.unwrap_or_default(),
+                    host: host.unwrap_or_default(),
                 });
+            }
+            AIAgentContext::PullRequest {
+                number,
+                state,
+                draft,
+                base_branch,
+                url,
+            } => {
+                if number <= 0 {
+                    continue;
+                }
+                let Some(state) = api_pull_request_state(&state, draft) else {
+                    continue;
+                };
+                let pull_request = api::input_context::git::PullRequest {
+                    number,
+                    state: state as i32,
+                    base_branch,
+                    url,
+                };
+                let api_git_context =
+                    git_context.get_or_insert_with(api::input_context::Git::default);
+                api_git_context.pull_request = Some(pull_request);
             }
             AIAgentContext::Skills { skills } => {
                 api_context.updated_skills_context = Some(api::input_context::SkillsContext {
@@ -828,7 +911,32 @@ fn convert_context(context: &[AIAgentContext]) -> api::InputContext {
             }
         }
     }
+    api_context.git = git_context;
     api_context
+}
+
+/// Maps a GitHub PR state plus draft flag to the proto `State` enum.
+///
+/// Returns `None` for unknown states so the caller can skip emitting a
+/// `pull_request` sub-message rather than sending `STATE_UNSPECIFIED` to the
+/// server.
+fn api_pull_request_state(
+    state: &str,
+    draft: bool,
+) -> Option<api::input_context::git::pull_request::State> {
+    use api::input_context::git::pull_request::State;
+    match state.to_ascii_uppercase().as_str() {
+        "OPEN" => {
+            if draft {
+                Some(State::OpenDraft)
+            } else {
+                Some(State::Open)
+            }
+        }
+        "CLOSED" => Some(State::Closed),
+        "MERGED" => Some(State::Merged),
+        _ => None,
+    }
 }
 
 impl From<Suggestions> for api::Suggestions {
@@ -920,6 +1028,7 @@ impl From<MCPContext> for api::request::McpContext {
                     id: server.id,
                     name: server.name,
                     description: server.description,
+                    identity: None,
                     resources: server
                         .resources
                         .into_iter()
@@ -961,9 +1070,10 @@ impl From<BlockContext> for api::ExecutedShellCommand {
 /// Tries to convert a [`serde_json::Value`] to a [`prost_types::Value`].
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn serde_json_to_prost(value: serde_json::Value) -> Result<prost_types::Value, String> {
+    use std::collections::BTreeMap;
+
     use prost_types::value::Kind::*;
     use serde_json::Value::*;
-    use std::collections::BTreeMap;
 
     Ok(prost_types::Value {
         kind: Some(match value {

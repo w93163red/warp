@@ -1,5 +1,6 @@
-use super::*;
 use std::ops::Add;
+
+use super::*;
 
 #[test]
 fn test_extend_and_push_tree() {
@@ -16,7 +17,8 @@ fn test_extend_and_push_tree() {
 #[test]
 fn test_random() {
     for seed in 0..100 {
-        use rand::{distributions, prelude::*};
+        use rand::distributions;
+        use rand::prelude::*;
 
         let rng = &mut StdRng::seed_from_u64(seed);
 
@@ -101,12 +103,12 @@ fn test_random() {
         for _ in 0..10 {
             let end = rng.gen_range(0..tree.extent::<Count>().0 + 1);
             let start = rng.gen_range(0..end + 1);
-            let start_bias = if rng.gen() {
+            let start_bias = if rng.r#gen() {
                 SeekBias::Left
             } else {
                 SeekBias::Right
             };
-            let end_bias = if rng.gen() {
+            let end_bias = if rng.r#gen() {
                 SeekBias::Left
             } else {
                 SeekBias::Right

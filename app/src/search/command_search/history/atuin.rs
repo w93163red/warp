@@ -19,8 +19,9 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Local, TimeZone as _};
-use diesel::{sql_query, sql_types, Connection as _, QueryableByName, RunQueryDsl as _,
-    SqliteConnection};
+use diesel::{
+    Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query, sql_types,
+};
 
 use crate::terminal::HistoryEntry;
 
@@ -98,8 +99,12 @@ pub fn load_entries(path: &Path) -> Result<Vec<HistoryEntry>> {
     // Opening read-only keeps us from creating a database where atuin has none,
     // and from taking a write lock on one atuin is using.
     let url = format!("file:{}?mode=ro", path.display());
-    let mut connection = SqliteConnection::establish(&url)
-        .with_context(|| format!("failed to open atuin's history database at {}", path.display()))?;
+    let mut connection = SqliteConnection::establish(&url).with_context(|| {
+        format!(
+            "failed to open atuin's history database at {}",
+            path.display()
+        )
+    })?;
 
     let rows: Vec<HistoryRow> = sql_query(
         "SELECT command, cwd, timestamp, exit FROM history \

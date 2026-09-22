@@ -1,4 +1,4 @@
-use diesel::{sql_query, Connection as _, RunQueryDsl as _, SqliteConnection};
+use diesel::{Connection as _, RunQueryDsl as _, SqliteConnection, sql_query};
 use tempfile::TempDir;
 
 use super::*;

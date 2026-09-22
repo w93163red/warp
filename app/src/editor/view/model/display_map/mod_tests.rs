@@ -1,9 +1,9 @@
-use crate::editor::tests::sample_text;
+use anyhow::Error;
+use warpui::App;
 
 use super::*;
 use crate::editor::EditOrigin;
-use anyhow::Error;
-use warpui::App;
+use crate::editor::tests::sample_text;
 
 #[test]
 fn test_chars_at() -> Result<()> {

@@ -3,17 +3,17 @@
 
 mod api;
 
-pub use api::*;
+use std::sync::Arc;
 
+pub use api::*;
 use chrono::NaiveDateTime;
 use itertools::Itertools;
 use parking_lot::FairMutex;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 use crate::ai_assistant::execution_context::WarpAiExecutionContext;
-use crate::terminal::model::block::BlockState;
 use crate::terminal::TerminalModel;
+use crate::terminal::model::block::BlockState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandContext {

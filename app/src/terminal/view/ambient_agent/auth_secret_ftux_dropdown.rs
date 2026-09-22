@@ -1,15 +1,16 @@
 use warp_cli::agent::Harness;
 use warp_core::ui::appearance::Appearance;
-use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::Fill;
+use warp_core::ui::theme::color::internal_colors;
+use warp_editor::editor::NavigationKey;
 use warpui::elements::{
     Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
     Empty, Expanded, Flex, Hoverable, MainAxisSize, MouseStateHandle, OffsetPositioning,
     ParentAnchor, ParentElement as _, ParentOffsetBounds, Radius, Stack, Text,
 };
 use warpui::{
-    AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle,
+    AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
+    WeakViewHandle,
 };
 
 use crate::ai::auth_secret_types::auth_secret_types_for_harness;
@@ -21,9 +22,8 @@ use crate::editor::{
     SingleLineEditorOptions, TextOptions,
 };
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields, MenuVariant};
-use crate::terminal::view::ambient_agent::{AmbientAgentViewModel, AmbientAgentViewModelEvent};
 use crate::ui_components::icons::Icon;
-use warp_editor::editor::NavigationKey;
+use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 
 const MENU_WIDTH: f32 = 720.;
 
@@ -67,20 +67,21 @@ pub enum FtuxDropdownEvent {
 }
 
 pub struct AuthSecretFtuxDropdown {
+    view_handle: WeakViewHandle<Self>,
     search_editor: ViewHandle<EditorView>,
     search_query: String,
     menu: ViewHandle<Menu<FtuxDropdownAction>>,
     is_menu_open: bool,
-    ambient_agent_model: ModelHandle<AmbientAgentViewModel>,
+    harness: Harness,
     display_label: Option<String>,
     label_mouse_state: MouseStateHandle,
+    /// Compact mode (orchestration modal): no auto-open, suppresses the
+    /// existing-secrets list and Skip, shows only "+ New …" entries.
+    compact_mode: bool,
 }
 
 impl AuthSecretFtuxDropdown {
-    pub fn new(
-        ambient_agent_model: ModelHandle<AmbientAgentViewModel>,
-        ctx: &mut ViewContext<Self>,
-    ) -> Self {
+    pub fn new(harness: Harness, ctx: &mut ViewContext<Self>) -> Self {
         let search_editor = ctx.add_typed_action_view(|ctx| {
             let appearance = Appearance::as_ref(ctx);
             let mut editor = EditorView::single_line(
@@ -120,52 +121,76 @@ impl AuthSecretFtuxDropdown {
             MenuEvent::ItemSelected | MenuEvent::ItemHovered => {}
         });
 
-        ctx.subscribe_to_model(&ambient_agent_model, |me, _, event, ctx| {
-            if let AmbientAgentViewModelEvent::HarnessSelected = event {
-                me.search_query.clear();
-                me.search_editor.update(ctx, |editor, ctx| {
-                    editor.system_clear_buffer(true, ctx);
-                });
-                if me.is_menu_open {
-                    let harness = me.ambient_agent_model.as_ref(ctx).selected_harness();
-                    HarnessAvailabilityModel::handle(ctx).update(ctx, |model, ctx| {
-                        model.ensure_auth_secrets_fetched(harness, ctx);
-                    });
-                }
-                me.refresh_menu(ctx);
-                ctx.notify();
-            }
-        });
-
         ctx.subscribe_to_model(
             &HarnessAvailabilityModel::handle(ctx),
             |me, _, event, ctx| match event {
-                HarnessAvailabilityEvent::AuthSecretsLoaded
-                | HarnessAvailabilityEvent::AuthSecretCreated { .. } => {
+                HarnessAvailabilityEvent::AuthSecretsChanged => {
                     me.refresh_menu(ctx);
                     ctx.notify();
                 }
                 HarnessAvailabilityEvent::Changed
-                | HarnessAvailabilityEvent::AuthSecretCreationFailed { .. } => {}
+                | HarnessAvailabilityEvent::AuthSecretCreated { .. }
+                | HarnessAvailabilityEvent::AuthSecretCreationFailed { .. }
+                | HarnessAvailabilityEvent::AuthSecretDeleted { .. }
+                | HarnessAvailabilityEvent::AuthSecretDeletionFailed { .. } => {}
             },
         );
 
         ctx.subscribe_to_model(&Appearance::handle(ctx), |me, _, _, ctx| {
             me.refresh_menu(ctx);
         });
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |me, _, event, ctx| {
+            let affects_window = matches!(event, UserWorkspacesEvent::TeamsChanged)
+                || matches!(
+                    event,
+                    UserWorkspacesEvent::WindowTeamChanged { window_id }
+                        if *window_id == ctx.window_id()
+                );
+            if affects_window {
+                me.refresh_for_team_scope_change(ctx);
+            }
+        });
 
         let mut me = Self {
+            view_handle: ctx.handle(),
             search_editor,
             search_query: String::new(),
             menu,
             is_menu_open: false,
-            ambient_agent_model,
+            harness,
             display_label: None,
             label_mouse_state: MouseStateHandle::default(),
+            compact_mode: false,
         };
         me.refresh_menu(ctx);
         me.set_menu_visibility(true, ctx);
         me
+    }
+
+    fn refresh_for_team_scope_change(&mut self, ctx: &mut ViewContext<Self>) {
+        self.refresh_menu(ctx);
+        if self.is_menu_open {
+            let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+            let harness = self.harness;
+            HarnessAvailabilityModel::handle(ctx).update(ctx, |model, ctx| {
+                model.ensure_auth_secrets_fetched(&team_scope, harness, ctx);
+            });
+        }
+        ctx.notify();
+    }
+
+    /// Toggle compact mode. See the `compact_mode` field for what changes.
+    /// Idempotent.
+    pub fn set_compact_mode(&mut self, compact: bool, ctx: &mut ViewContext<Self>) {
+        if self.compact_mode == compact {
+            return;
+        }
+        self.compact_mode = compact;
+        if compact {
+            self.set_menu_visibility(false, ctx);
+        }
+        self.refresh_menu(ctx);
+        ctx.notify();
     }
 
     fn set_menu_visibility(&mut self, is_open: bool, ctx: &mut ViewContext<Self>) {
@@ -261,11 +286,34 @@ impl AuthSecretFtuxDropdown {
         }
     }
 
+    /// Updates the harness this dropdown should query secrets for. Resets the
+    /// search query / editor and refreshes the menu, then lazily fetches
+    /// secrets for the new harness if the menu is currently open.
+    pub fn set_harness(&mut self, harness: Harness, ctx: &mut ViewContext<Self>) {
+        if self.harness == harness {
+            return;
+        }
+        self.harness = harness;
+        self.search_query.clear();
+        self.search_editor.update(ctx, |editor, ctx| {
+            editor.system_clear_buffer(true, ctx);
+        });
+        if self.is_menu_open {
+            let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+            HarnessAvailabilityModel::handle(ctx).update(ctx, |model, ctx| {
+                model.ensure_auth_secrets_fetched(&team_scope, harness, ctx);
+            });
+        }
+        self.refresh_menu(ctx);
+        ctx.notify();
+    }
+
     fn matching_secret_count(&self, app: &AppContext) -> usize {
-        let harness = self.ambient_agent_model.as_ref(app).selected_harness();
+        let harness = self.harness;
+        let team_scope = UserWorkspaces::as_ref(app).team_context(&self.view_handle, app);
         let availability = HarnessAvailabilityModel::as_ref(app);
         let query = self.search_query.trim().to_lowercase();
-        match availability.auth_secrets_for(harness) {
+        match availability.auth_secrets_for(&team_scope, harness) {
             AuthSecretFetchState::Loaded(secrets) => {
                 if query.is_empty() {
                     secrets.len()
@@ -287,15 +335,36 @@ impl AuthSecretFtuxDropdown {
         let disabled_text_color = theme.disabled_text_color(theme.surface_2()).into_solid();
         let border = Border::all(1.).with_border_color(internal_colors::neutral_4(theme));
 
-        let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
+        let harness = self.harness;
+        let team_scope = UserWorkspaces::as_ref(ctx).team_context(&self.view_handle, ctx);
         let availability = HarnessAvailabilityModel::as_ref(ctx);
         let query = self.search_query.trim().to_lowercase();
+        let compact = self.compact_mode;
 
         let mut items: Vec<MenuItem<FtuxDropdownAction>> = Vec::new();
 
         let no_results_text_color = internal_colors::text_sub(theme, theme.surface_2());
 
-        match availability.auth_secrets_for(harness) {
+        if compact {
+            // Compact (modal) mode: only render "+ New …" entries.
+            for (index, info) in auth_secret_types_for_harness(harness).iter().enumerate() {
+                items.push(MenuItem::Item(
+                    MenuItemFields::new(format!("New {}", info.display_name))
+                        .with_font_size_override(FONT_SIZE)
+                        .with_padding_override(MENU_ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
+                        .with_override_hover_background_color(hover_background)
+                        .with_icon(Icon::Plus)
+                        .with_on_select_action(FtuxDropdownAction::SelectNewType(index)),
+                ));
+            }
+            self.menu.update(ctx, |menu, ctx| {
+                menu.set_border(Some(border));
+                menu.set_items(items, ctx);
+            });
+            return;
+        }
+
+        match availability.auth_secrets_for(&team_scope, harness) {
             AuthSecretFetchState::Loaded(secrets) => {
                 let mut matched = false;
                 for secret in secrets {
@@ -366,8 +435,8 @@ impl AuthSecretFtuxDropdown {
 
         items.push(MenuItem::Item(
             MenuItemFields::new_with_label(
-                "Skip setting an API key",
-                "Choose this if authentication is set up in the environment",
+                "Skip (advanced)",
+                "Only if your key is already set in the environment (e.g. injected as a Kubernetes secret)",
             )
             .with_font_size_override(FONT_SIZE)
             .with_padding_override(MENU_ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
@@ -493,9 +562,8 @@ impl TypedActionView for AuthSecretFtuxDropdown {
                 self.set_menu_visibility(false, ctx);
             }
             FtuxDropdownAction::SelectNewType(type_index) => {
-                let harness = self.ambient_agent_model.as_ref(ctx).selected_harness();
                 ctx.emit(FtuxDropdownEvent::NewTypeSelected {
-                    harness,
+                    harness: self.harness,
                     type_index: *type_index,
                 });
                 self.set_menu_visibility(false, ctx);

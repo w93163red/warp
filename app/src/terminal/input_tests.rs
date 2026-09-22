@@ -1,110 +1,277 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
+use chrono::Local;
+use fuzzy_match::FuzzyMatchResult;
+use repo_metadata::RepoMetadataModel;
+use repo_metadata::repositories::DetectedRepositories;
+use repo_metadata::watcher::DirectoryWatcher;
+use session_sharing_protocol::common::Role;
+use smol_str::SmolStr;
+use unindent::Unindent;
+#[cfg(feature = "voice_input")]
+use voice_input::VoiceInputToggledFrom;
+use warp_completer::completer::{
+    EngineFileType, Match, MatchStrategy, MatchedSuggestion, PathSeparators, Priority, Suggestion,
+    SuggestionResults, SuggestionType,
+};
+use warp_completer::meta::Span;
+use warp_util::standardized_path::StandardizedPath;
+use warp_util::user_input::UserInput;
+use warpui::platform::WindowStyle;
+use warpui::text::SelectionType;
+use warpui::{App, ReadModel, UpdateView, WindowId};
+use watcher::HomeDirectoryWatcher;
+use workflows::workflow::{Argument, ArgumentType, Workflow};
 
 use super::*;
+use crate::ai::AIRequestUsageModel;
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
+use crate::ai::agent::conversation::ConversationStatus;
+use crate::ai::agent::task::TaskId;
+use crate::ai::agent::{
+    AIAgentActionId, AIAgentExchange, AIAgentInput, AIAgentOutputStatus, UserQueryMode,
+};
 use crate::ai::agent_conversations_model::AgentConversationsModel;
-use crate::ai::blocklist::{AIQueryHistory, BlocklistAIPermissions};
+use crate::ai::blocklist::{AIQueryHistory, BlocklistAIPermissions, ResponseStreamId};
+use crate::ai::cloud_agent_settings::{AuthSecretPreference, CloudAgentSettings};
+use crate::ai::connected_self_hosted_workers::ConnectedSelfHostedWorkersModel;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::harness_availability::HarnessAvailabilityModel;
-use crate::ai::llms::LLMPreferences;
+use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::mcp::gallery::MCPGalleryManager;
 use crate::ai::mcp::templatable_manager::TemplatableMCPServerManager;
 use crate::ai::outline::RepoOutlines;
 use crate::ai::persisted_workspace::PersistedWorkspace;
 use crate::ai::restored_conversations::RestoredAgentConversations;
 use crate::ai::skills::SkillManager;
-use crate::ai::AIRequestUsageModel;
-use crate::auth::auth_manager::AuthManager;
 use crate::auth::AuthStateProvider;
+use crate::auth::auth_manager::AuthManager;
 use crate::changelog_model::ChangelogModel;
 use crate::cloud_object::model::persistence::CloudModel;
-use crate::pricing::PricingInfoModel;
-use crate::search::files::model::FileSearchModel;
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
-use crate::terminal::input::slash_command_model::SlashCommandEntryState;
-use crate::terminal::input::slash_commands::SlashCommandsEvent;
-use crate::warp_managed_paths_watcher::WarpManagedPathsWatcher;
-use repo_metadata::repositories::DetectedRepositories;
-use repo_metadata::watcher::DirectoryWatcher;
-use repo_metadata::RepoMetadataModel;
-use watcher::HomeDirectoryWatcher;
-
-use crate::editor::{EditorAction, TextStyleOperation};
+use crate::context_chips::prompt::Prompt;
+use crate::editor::{DisplayPoint, EditorAction, Point, TextStyleOperation};
 use crate::input_suggestions::{HistoryOrder, Item};
 use crate::network::NetworkStatus;
-use crate::server::cloud_objects::{listener::Listener, update_manager::UpdateManager};
+use crate::pricing::PricingInfoModel;
+use crate::search::files::model::FileSearchModel;
+use crate::search::slash_command_menu::static_commands::commands;
+use crate::server::cloud_objects::listener::Listener;
+use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::server_api::ServerApiProvider;
 use crate::server::sync_queue::SyncQueue;
-
 use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
 use crate::settings::import::model::ImportedConfigModel;
-use crate::settings::{AliasExpansionSettings, AppEditorSettings, InputBoxType, PrivacySettings};
+use crate::settings::{
+    AliasExpansionSettings, AppEditorSettings, InputBoxType, LongRunningCommandSubmissionMode,
+    PrivacySettings, PromptSubmissionMode,
+};
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 #[cfg(windows)]
 use crate::system::SystemInfo;
 use crate::system::SystemStats;
+use crate::terminal::TerminalView;
 use crate::terminal::alt_screen_reporting::AltScreenReporting;
-use crate::terminal::event::{BlockMetadataReceivedEvent, BootstrappedEvent};
+use crate::terminal::block_list_viewport::ScrollPosition;
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext,
+    CLIAgentSessionStatus, CLIAgentSessionsModel,
+};
+use crate::terminal::event::{
+    BlockCompletedEvent, BlockMetadataReceivedEvent, BlockType, BootstrappedEvent,
+    UserBlockCompleted,
+};
+use crate::terminal::general_settings::UserDefaultShellUnsupportedBannerState;
+use crate::terminal::input::slash_commands::SlashCommandsEvent;
 use crate::terminal::keys::TerminalKeybindings;
 use crate::terminal::local_shell::LocalShellState;
-use crate::terminal::shared_session::permissions_manager::SessionPermissionsManager;
-use crate::workspaces::team_tester::TeamTesterStatus;
-use crate::workspaces::update_manager::TeamUpdateManager;
-use crate::workspaces::user_workspaces::UserWorkspaces;
-
-use crate::terminal::block_list_viewport::ScrollPosition;
 use crate::terminal::local_tty::shell::ShellStarter;
-use crate::terminal::model::ansi::{Handler, PrecmdValue};
-use crate::terminal::model::block::SerializedBlock;
-use crate::terminal::model::blocks::{insert_block, BlockListPoint};
+use crate::terminal::model::ansi::{Handler, PromptMetadata};
+use crate::terminal::model::block::{BlockId, SerializedBlock};
+use crate::terminal::model::blocks::{BlockListPoint, insert_block};
 use crate::terminal::model::grid::Dimensions as _;
 use crate::terminal::model::index::Side;
 use crate::terminal::model::session::{BootstrapSessionType, SessionInfo};
 use crate::terminal::model::terminal_model::BlockIndex;
 use crate::terminal::model_events::ModelEvent;
-use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
-use chrono::Local;
-use warpui::text::SelectionType;
-
-use crate::terminal::shell::ShellType;
-use crate::test_util::settings::initialize_settings_for_tests;
-use crate::themes::theme::AnsiColorIdentifier;
-use crate::workspace::{ActiveSession, OneTimeModalModel, ToastStack, WorkspaceRegistry};
-use crate::{
-    editor::{DisplayPoint, Point},
-    terminal::TerminalView,
-};
-use crate::{experiments, AgentNotificationsModel};
-use fuzzy_match::FuzzyMatchResult;
-use session_sharing_protocol::common::Role;
-use smol_str::SmolStr;
-use warp_completer::completer::{
-    EngineFileType, Match, MatchStrategy, MatchedSuggestion, Priority, Suggestion,
-    SuggestionResults, SuggestionType,
-};
-use warp_completer::meta::Span;
-
-use unindent::Unindent;
-
-#[cfg(feature = "voice_input")]
-use voice_input::VoiceInputToggledFrom;
-use warpui::platform::WindowStyle;
-use warpui::{App, ReadModel, UpdateView, WindowId};
-
-use crate::terminal::universal_developer_input::UniversalDeveloperInputButtonBarEvent;
-
-use warp_util::user_input::UserInput;
-use workflows::workflow::{Argument, ArgumentType, Workflow};
-
-use crate::context_chips::prompt::Prompt;
-use crate::terminal::general_settings::UserDefaultShellUnsupportedBannerState;
 use crate::terminal::resizable_data::ResizableData;
+use crate::terminal::shared_session::permissions_manager::SessionPermissionsManager;
+use crate::terminal::shell::ShellType;
+use crate::terminal::universal_developer_input::UniversalDeveloperInputButtonBarEvent;
+use crate::terminal::view::Event as TerminalViewEvent;
 use crate::terminal::view::inline_banner::ByoLlmAuthBannerSessionState;
 use crate::terminal::writeable_pty::command_history::update_command_history;
-use crate::{GlobalResourceHandles, GlobalResourceHandlesProvider, ReferralThemeStatus};
+use crate::test_util::assert_eventually;
+use crate::test_util::settings::initialize_settings_for_tests;
+use crate::themes::theme::AnsiColorIdentifier;
+use crate::warp_managed_paths_watcher::WarpManagedPathsWatcher;
+use crate::workspace::{ActiveSession, OneTimeModalModel, ToastStack, WorkspaceRegistry};
+use crate::workspaces::team::Team;
+use crate::workspaces::team_tester::TeamTesterStatus;
+use crate::workspaces::update_manager::TeamUpdateManager;
+use crate::workspaces::user_workspaces::{TeamContextForOperation, UserWorkspaces};
+use crate::workspaces::workspace::Workspace;
+use crate::{
+    AgentNotificationsModel, GlobalResourceHandles, GlobalResourceHandlesProvider,
+    ReferralThemeStatus, experiments,
+};
+
+fn pending_ctrl_r_handoff() -> PendingShellWidgetHandoff {
+    PendingShellWidgetHandoff {
+        session_id: SessionId::from(1),
+        original_buffer: "draft".to_string(),
+        selection: None,
+        block_id: BlockId::new(),
+        apply_mode: ShellWidgetApplyMode::Replace,
+        cursor_offset: None,
+    }
+}
+
+fn pending_ctrl_t_handoff() -> PendingShellWidgetHandoff {
+    PendingShellWidgetHandoff {
+        session_id: SessionId::from(1),
+        original_buffer: "echo ".to_string(),
+        selection: None,
+        block_id: BlockId::new(),
+        apply_mode: ShellWidgetApplyMode::Splice,
+        cursor_offset: Some(ByteOffset::from(5)),
+    }
+}
+
+#[test]
+fn matching_shell_widget_handoff_selection_is_applied() {
+    let mut handoff = pending_ctrl_r_handoff();
+    handoff.maybe_apply_selection(SessionId::from(1), "echo selected");
+    assert_eq!(handoff.restore_text(), "echo selected");
+
+    let mut handoff = pending_ctrl_t_handoff();
+    handoff.maybe_apply_selection(SessionId::from(1), "selected/file.txt");
+    assert_eq!(handoff.selection, Some("selected/file.txt".to_string()));
+}
+
+#[test]
+fn unsolicited_or_stale_shell_widget_handoff_selection_is_ignored() {
+    let mut handoff = pending_ctrl_r_handoff();
+    handoff.maybe_apply_selection(SessionId::from(2), "echo selected");
+    assert_eq!(handoff.restore_text(), "draft");
+}
+
+#[test]
+fn empty_shell_widget_handoff_selection_keeps_original_buffer() {
+    let mut handoff = pending_ctrl_r_handoff();
+    handoff.maybe_apply_selection(SessionId::from(1), "");
+    assert_eq!(handoff.restore_text(), "draft");
+
+    let mut handoff = pending_ctrl_t_handoff();
+    handoff.maybe_apply_selection(SessionId::from(1), "");
+    assert_eq!(handoff.selection, None);
+}
+
+#[test]
+fn renders_git_checkout_prompt_chip_command_as_single_shell_argument() {
+    let command = PromptChipShellCommand::GitCheckout {
+        branch_name: "poc;id>/tmp/proof $(whoami) `id` | cat 'tail'".to_string(),
+    };
+
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Bash),
+        r#"git checkout 'poc;id>/tmp/proof $(whoami) `id` | cat '"'"'tail'"'"''"#
+    );
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Zsh),
+        r#"git checkout 'poc;id>/tmp/proof $(whoami) `id` | cat '"'"'tail'"'"''"#
+    );
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Fish),
+        r"git checkout 'poc;id>/tmp/proof $(whoami) `id` | cat \'tail\''"
+    );
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::PowerShell),
+        "git checkout 'poc;id>/tmp/proof $(whoami) `id` | cat ''tail'''"
+    );
+}
+
+#[test]
+fn renders_nvm_use_prompt_chip_command_as_single_shell_argument() {
+    let command = PromptChipShellCommand::NvmUse {
+        version: "v20.0.0;touch /tmp/pwn 'x'".to_string(),
+    };
+
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Bash),
+        r#"nvm use 'v20.0.0;touch /tmp/pwn '"'"'x'"'"''"#
+    );
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Fish),
+        r"nvm use 'v20.0.0;touch /tmp/pwn \'x\''"
+    );
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::PowerShell),
+        "nvm use 'v20.0.0;touch /tmp/pwn ''x'''"
+    );
+}
+
+#[test]
+fn renders_change_directory_prompt_chip_command_as_single_shell_argument() {
+    let command = PromptChipShellCommand::ChangeDirectory {
+        dir_name: "repo dir;rm -rf / 'x'".to_string(),
+    };
+
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Bash),
+        r#"cd 'repo dir;rm -rf / '"'"'x'"'"''"#
+    );
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::PowerShell),
+        "cd 'repo dir;rm -rf / ''x'''"
+    );
+}
+
+#[test]
+fn renders_echo_prompt_chip_command_as_single_shell_argument() {
+    let command = PromptChipShellCommand::Echo {
+        message: "a message containing \"double\" and 'single' quotes",
+    };
+
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::Bash),
+        r#"echo 'a message containing "double" and '"'"'single'"'"' quotes'"#
+    );
+    assert_eq!(
+        render_prompt_chip_shell_command(&command, ShellType::PowerShell),
+        r#"echo 'a message containing "double" and ''single'' quotes'"#
+    );
+}
+
+#[test]
+fn renders_fixed_prompt_chip_command_without_interpolation() {
+    assert_eq!(
+        render_prompt_chip_shell_command(
+            &PromptChipShellCommand::NvmInstallLatestNode,
+            ShellType::Bash,
+        ),
+        "nvm install node"
+    );
+}
 
 pub fn initialize_app(app: &mut App) {
     initialize_settings_for_tests(app);
+
+    // NLD is now opt-in by default (`ai_autodetection_enabled_internal` defaults to false).
+    // These tests exercise the natural-language-detection-on code paths (buffer-driven slash
+    // command detection, auto-detection input mode), so explicitly re-enable it here to preserve
+    // the pre-opt-in test behavior. The opt-in default itself is covered by
+    // `ai_autodetection_defaults_to_opt_in` in `settings/ai_tests.rs`.
+    crate::settings::AISettings::handle(app).update(app, |settings, ctx| {
+        settings
+            .ai_autodetection_enabled_internal
+            .set_value(true, ctx)
+            .unwrap();
+    });
 
     // Make sure we set up all necessary custom action bindings.
     app.update(init);
@@ -117,6 +284,7 @@ pub fn initialize_app(app: &mut App) {
     app.add_singleton_model(|_| Prompt::mock());
     app.add_singleton_model(SyncQueue::mock);
     app.add_singleton_model(CloudModel::mock);
+    app.add_singleton_model(crate::ai::cloud_environments::CloudEnvironmentCatalog::new);
     app.add_singleton_model(ImportedConfigModel::new);
     app.add_singleton_model(UserWorkspaces::default_mock);
     app.add_singleton_model(TeamTesterStatus::mock);
@@ -137,7 +305,27 @@ pub fn initialize_app(app: &mut App) {
         AIRequestUsageModel::new_for_test(ServerApiProvider::as_ref(ctx).get_ai_client(), ctx)
     });
     app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+    // QueuedQueryModel subscribes to history events; register after the
+    // history model is in place.
+    app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
+    // Pill bar model subscribes to history events; register after the
+    // history model is in place.
+    app.add_singleton_model(|ctx| {
+        crate::ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel::new(
+            Default::default(),
+            ctx,
+        )
+    });
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // The blocklist controller created during terminal bootstrap subscribes to
+    // OrchestrationEventService and OrchestrationEventStreamer unconditionally,
+    // so both singletons must be registered before bootstrap.
+    app.add_singleton_model(
+        crate::ai::blocklist::orchestration_events::OrchestrationEventService::new,
+    );
+    app.add_singleton_model(
+        crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
+    );
     app.add_singleton_model(|_| ActiveAgentViewsModel::new());
     app.add_singleton_model(AgentNotificationsModel::new);
     app.add_singleton_model(BlocklistAIPermissions::new);
@@ -146,10 +334,12 @@ pub fn initialize_app(app: &mut App) {
     app.add_singleton_model(AuthManager::new_for_test);
     app.add_singleton_model(LLMPreferences::new);
     app.add_singleton_model(HarnessAvailabilityModel::new);
+    app.add_singleton_model(ConnectedSelfHostedWorkersModel::new);
     app.add_singleton_model(SessionPermissionsManager::new);
     app.add_singleton_model(DirectoryWatcher::new);
     app.add_singleton_model(|_| DetectedRepositories::default());
-    app.add_singleton_model(|_| crate::code_review::git_status_update::GitStatusUpdateModel::new());
+    app.add_singleton_model(crate::remote_server::manager::RemoteServerManager::new);
+    app.add_singleton_model(|_| crate::code_review::git_repo_model::GitRepoModels::new());
     app.add_singleton_model(RepoMetadataModel::new);
     app.add_singleton_model(FileSearchModel::new);
     app.add_singleton_model(RepoOutlines::new_for_test);
@@ -192,17 +382,19 @@ pub fn initialize_app(app: &mut App) {
 
     app.update(experiments::init);
     AltScreenReporting::register(app);
-    app.add_singleton_model(|_| RestoredAgentConversations::new(vec![]));
+    app.add_singleton_model(|_| RestoredAgentConversations::new_seeded(vec![]));
     app.add_singleton_model(OneTimeModalModel::new);
     app.add_singleton_model(|_| WorkspaceRegistry::new());
     app.add_singleton_model(|_| ToastStack);
     app.add_singleton_model(|_| PricingInfoModel::new());
+    app.add_singleton_model(crate::ai::pricing_promotion::PricingPromotionState::new);
     app.add_singleton_model(ByoLlmAuthBannerSessionState::new);
     app.add_singleton_model(|_| {
         crate::ai::ambient_agents::github_auth_notifier::GitHubAuthNotifier::new()
     });
     app.add_singleton_model(AgentConversationsModel::new);
     app.add_singleton_model(PersistedWorkspace::new_for_test);
+    app.add_singleton_model(|ctx| crate::ai::agent_tips::AITipModel::new_for_agent_tips(ctx));
     // `LocalShellState` captures the user's interactive login-shell PATH (used
     // for MCP/sbx executable resolution). Tests don't exercise that capture, so
     // register the singleton in its `NotLoaded` state to satisfy callers that
@@ -275,11 +467,12 @@ pub async fn add_window_with_bootstrapped_terminal_and_window_id(
 ) -> (WindowId, ViewHandle<TerminalView>) {
     let tips_model = app.add_model(|_| TipsCompleted::default());
 
-    let shell_starter_source = ShellStarter::init(Default::default())
-        .expect("Could not create a shell starter source or wsl name")
-        .to_shell_starter_source()
-        .await
-        .expect("Could not create a shell starter source");
+    let shell_starter_source =
+        ShellStarter::init(crate::terminal::available_shells::AvailableShell::default())
+            .expect("Could not create a shell starter source or wsl name")
+            .to_shell_starter_source()
+            .await
+            .expect("Could not create a shell starter source");
     let shell_type = shell_starter_source.shell_type();
 
     let session_info = session_info
@@ -340,7 +533,7 @@ pub fn simulate_directory_for_completion<A, S>(
         let block_metadata = BlockMetadata::new(Some(session_id), Some(directory.clone()));
         let block_index = {
             let mut model = terminal.model.lock();
-            model.block_list_mut().precmd(PrecmdValue {
+            model.block_list_mut().prompt_only_precmd(PromptMetadata {
                 pwd: Some(directory.clone()),
                 session_id: Some(session_id.into()),
                 ..Default::default()
@@ -389,11 +582,11 @@ fn argument_suggestion(name: impl Into<SmolStr>) -> MatchedSuggestion {
 
 /// Creates a [`MatchedSuggestion`] for a file completion result.
 /// Specifically, we ensure the replacement is the entire path
-/// while the display text is just the string after the last slash.
+/// while the display text is just the string after the last valid path separator.
 fn file_suggestion(path: impl Into<SmolStr>) -> MatchedSuggestion {
     let replacement = path.into();
     let display = replacement
-        .rsplit(std::path::MAIN_SEPARATOR)
+        .rsplit(PathSeparators::for_os().all)
         .next()
         .map(Into::into)
         .unwrap_or_else(|| replacement.clone());
@@ -595,6 +788,87 @@ fn test_input_tab() {
         input.read(&app, |input, ctx| {
             assert_eq!(input.buffer_text(ctx), "    cd so");
         });
+    });
+}
+
+#[test]
+fn zero_state_hint_text_only_registers_active_slash_command_placeholders() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let session_info = SessionInfo::new_for_test();
+        let session_id = session_info.session_id;
+        let terminal = add_window_with_bootstrapped_terminal(
+            &mut app,
+            None, /* history_file_commands */
+            Some(session_info),
+        )
+        .await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_zero_state_hint_text(ctx);
+        });
+
+        let editor = input.read(&app, |input, _| input.editor().clone());
+        let rename_tab_prefix = format!("{} ", commands::RENAME_TAB.name);
+        let continue_locally_prefix = format!("{} ", commands::CONTINUE_LOCALLY.name);
+
+        editor.update(&mut app, |editor, ctx| {
+            editor.set_placeholder_text_with_prefix(
+                continue_locally_prefix.clone(),
+                "stale hint",
+                ctx,
+            );
+        });
+        input.update(&mut app, |input, ctx| {
+            input.set_zero_state_hint_text(ctx);
+        });
+
+        assert!(
+            editor.read(&app, |editor, _| editor
+                .placeholder_text(&rename_tab_prefix)
+                .is_some()),
+            "always-active slash command placeholders should still be registered"
+        );
+        assert!(
+            editor.read(&app, |editor, _| editor
+                .placeholder_text(&continue_locally_prefix)
+                .is_none()),
+            "/continue-locally should not be registered outside cloud conversation context"
+        );
+
+        editor.update(&mut app, |editor, ctx| {
+            editor.set_placeholder_text_with_prefix(
+                continue_locally_prefix.clone(),
+                "stale hint",
+                ctx,
+            );
+        });
+
+        let repo_dir = tempfile::TempDir::new().expect("repo temp dir");
+        let repo_path = repo_dir.path().to_path_buf();
+        simulate_directory_for_completion(
+            session_id,
+            &terminal,
+            &mut app,
+            repo_path.to_string_lossy().into_owned(),
+        );
+        DetectedRepositories::handle(&app).update(&mut app, |repos, _| {
+            let root = StandardizedPath::from_local_canonicalized(&repo_path)
+                .expect("canonicalized repo root");
+            repos.insert_test_repo_root(root);
+        });
+        input.update(&mut app, |input, ctx| {
+            input.update_repo_path(Some(repo_path), ctx);
+        });
+
+        assert!(
+            editor.read(&app, |editor, _| editor
+                .placeholder_text(&continue_locally_prefix)
+                .is_none()),
+            "active slash-command data source updates should refresh stale placeholders"
+        );
     });
 }
 
@@ -1109,6 +1383,1887 @@ fn test_history_up_for_shared_session_executor() {
 }
 
 #[test]
+fn maybe_route_ai_query_to_remote_target_proceeds_for_local_pane() {
+    // An ordinary local pane (not a viewer, not a cloud/ambient pane) must not be intercepted:
+    // the helper returns false so the caller proceeds with normal local submission.
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.block_list_mut().set_bootstrapped();
+            model
+                .block_list_mut()
+                .active_block_for_test()
+                .set_session_id(SessionId::from(0));
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("run something", ctx);
+        });
+
+        let handled = input.update(&mut app, |input, ctx| {
+            input.maybe_route_ai_query_to_remote_target(ctx)
+        });
+        assert!(
+            !handled,
+            "a local pane must not be intercepted by cloud follow-up routing"
+        );
+    });
+}
+
+#[test]
+fn maybe_route_ai_query_to_remote_target_proceeds_for_empty_buffer() {
+    // Even on a viewer pane, an empty buffer is a no-op the caller handles normally, so the
+    // helper returns false and does not forward anything.
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.block_list_mut().set_bootstrapped();
+            model.set_shared_session_status(SharedSessionStatus::executor());
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        let sent = Rc::new(RefCell::new(Vec::<String>::new()));
+        let sent_cb = sent.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if let super::Event::SendAgentPrompt { prompt, .. } = event {
+                    sent_cb.borrow_mut().push(prompt.clone());
+                }
+            });
+        });
+
+        let handled = input.update(&mut app, |input, ctx| {
+            input.maybe_route_ai_query_to_remote_target(ctx)
+        });
+        assert!(!handled, "an empty buffer must not be routed");
+        assert!(
+            sent.borrow().is_empty(),
+            "an empty buffer must not forward a viewer prompt"
+        );
+    });
+}
+
+#[test]
+fn maybe_route_ai_query_to_remote_target_blocks_read_only_viewer() {
+    // A read-only (reader) viewer cannot submit; the helper handles it (blocks) without
+    // forwarding a prompt to the sharer.
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.block_list_mut().set_bootstrapped();
+            model.set_shared_session_status(SharedSessionStatus::ActiveViewer {
+                role: Role::Reader,
+            });
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        let sent = Rc::new(RefCell::new(Vec::<String>::new()));
+        let sent_cb = sent.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if let super::Event::SendAgentPrompt { prompt, .. } = event {
+                    sent_cb.borrow_mut().push(prompt.clone());
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("please continue", ctx);
+        });
+
+        let handled = input.update(&mut app, |input, ctx| {
+            input.maybe_route_ai_query_to_remote_target(ctx)
+        });
+        assert!(
+            handled,
+            "a read-only viewer submission must be handled (blocked)"
+        );
+        assert!(
+            sent.borrow().is_empty(),
+            "a read-only viewer must not forward a prompt to the sharer"
+        );
+    });
+}
+
+#[test]
+fn unresolved_ambient_task_blocks_submission() {
+    // REMOTE-2661: eligibility that is merely unresolved (the ambient task is not in
+    // `AgentConversationsModel` yet) must fail closed for every submission path, rather than
+    // fall back to the direct viewer path or a new local conversation.
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let task_id: crate::ai::ambient_agents::AmbientAgentTaskId =
+            "550e8400-e29b-41d4-a716-000000000099".parse().unwrap();
+
+        let blocked = input.update(&mut app, |input, ctx| {
+            input.block_submission_while_ambient_task_unresolved(Some(task_id), ctx)
+        });
+        assert!(
+            blocked,
+            "an uncached ambient task must block the submission instead of resolving eligibility"
+        );
+    });
+}
+
+#[test]
+fn maybe_route_ai_query_to_remote_target_forwards_executor_viewer_prompt() {
+    // An executor viewer forwards the prompt to the sharer (SendAgentPrompt) instead of running
+    // it on the viewer's local machine.
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.block_list_mut().set_bootstrapped();
+            model
+                .block_list_mut()
+                .active_block_for_test()
+                .set_session_id(SessionId::from(0));
+            model.set_shared_session_status(SharedSessionStatus::executor());
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        let sent = Rc::new(RefCell::new(Vec::<String>::new()));
+        let sent_cb = sent.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if let super::Event::SendAgentPrompt { prompt, .. } = event {
+                    sent_cb.borrow_mut().push(prompt.clone());
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("continue please", ctx);
+        });
+
+        let handled = input.update(&mut app, |input, ctx| {
+            input.maybe_route_ai_query_to_remote_target(ctx)
+        });
+        assert!(handled, "an executor viewer submission must be handled");
+        assert_eq!(
+            sent.borrow().as_slice(),
+            ["continue please"],
+            "an executor viewer must forward the prompt to the sharer"
+        );
+    });
+}
+
+#[test]
+fn attach_ambient_view_model_builds_composer_selectors_for_fresh_cloud_pane_in_view_pending() {
+    // Regression: a fresh cloud-mode composer pane is created in `ViewPending` (see
+    // `TerminalModel::new_for_cloud_mode_shared_session_viewer`), which
+    // `SharedSessionStatus::is_viewer()` reports as a viewer. Such a pane is a dummy cloud-mode
+    // session composing a new run, not an actual shared-session viewer, so the composer-only
+    // host / auth-secret / FTUX selectors must still be built for it.
+    App::test((), |mut app| async move {
+        let _cloud_mode_input_v2 = FeatureFlag::CloudModeInputV2.override_enabled(true);
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+
+        // Simulate the initial cloud composer state: a dummy cloud-mode session in `ViewPending`.
+        terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.set_shared_session_status(SharedSessionStatus::ViewPending);
+            model.set_is_dummy_cloud_mode_session(true);
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let weak_terminal = terminal.downgrade();
+        input.update(&mut app, |input, ctx| {
+            let view_model = ctx
+                .add_model(|ctx| AmbientAgentViewModel::new(terminal_view_id, weak_terminal, ctx));
+            input.attach_ambient_agent_view_model(view_model, ctx);
+
+            assert!(
+                input.host_selector().is_some(),
+                "the initial cloud composer state must build the host selector"
+            );
+            assert!(
+                input.auth_secret_selector().is_some(),
+                "the initial cloud composer state must build the auth-secret selector"
+            );
+            assert!(
+                input.auth_secret_ftux_view().is_some(),
+                "the initial cloud composer state must build the auth-secret FTUX view"
+            );
+        });
+    });
+}
+
+#[test]
+fn attach_ambient_view_model_skips_composer_selectors_for_actual_shared_session_viewer() {
+    // An actual shared-session viewer (NOT a dummy cloud-mode session) that lazily discovers it is
+    // viewing an ambient run must not build the composer-only selectors, even though its ambient VM
+    // is still `Composing` and the model is in a viewer status when the model is attached.
+    App::test((), |mut app| async move {
+        let _cloud_mode_input_v2 = FeatureFlag::CloudModeInputV2.override_enabled(true);
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+
+        // An actual shared-session viewer is in a viewer status but is not a dummy cloud-mode
+        // session (its model is created via `new_for_shared_session_viewer`).
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ViewPending);
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let weak_terminal = terminal.downgrade();
+        input.update(&mut app, |input, ctx| {
+            let view_model = ctx
+                .add_model(|ctx| AmbientAgentViewModel::new(terminal_view_id, weak_terminal, ctx));
+            input.attach_ambient_agent_view_model(view_model, ctx);
+
+            assert!(
+                input.host_selector().is_none(),
+                "an actual shared-session viewer must not build the host selector"
+            );
+            assert!(
+                input.auth_secret_selector().is_none(),
+                "an actual shared-session viewer must not build the auth-secret selector"
+            );
+            assert!(
+                input.auth_secret_ftux_view().is_none(),
+                "an actual shared-session viewer must not build the auth-secret FTUX view"
+            );
+        });
+    });
+}
+
+#[test]
+fn auth_secret_selectors_follow_their_own_window_team() {
+    App::test((), |mut app| async move {
+        let _cloud_mode_input_v2 = FeatureFlag::CloudModeInputV2.override_enabled(true);
+        initialize_app(&mut app);
+
+        let team_a = Team::from_local_cache(1.into(), "Team A".to_string(), None, None, None, None);
+        let team_b = Team::from_local_cache(2.into(), "Team B".to_string(), None, None, None, None);
+        let workspace = Workspace::from_local_cache(
+            "workspace_uid123456789".to_string().into(),
+            "Workspace".to_string(),
+            Some(vec![team_a.clone(), team_b.clone()]),
+            None,
+        );
+        let workspace_uid = workspace.uid;
+        app.update(|ctx| {
+            UserWorkspaces::handle(ctx).update(ctx, |workspaces, ctx| {
+                workspaces.update_workspaces(vec![workspace], ctx);
+                workspaces.set_current_workspace_uid(workspace_uid, ctx);
+            });
+            CloudAgentSettings::handle(ctx).update(ctx, |settings, ctx| {
+                settings.persist_auth_secret_preference(
+                    &TeamContextForOperation::new_for_test(team_a.uid),
+                    Harness::Claude,
+                    Some(AuthSecretPreference::Named("team-a-key".to_string())),
+                    ctx,
+                );
+                settings.persist_auth_secret_preference(
+                    &TeamContextForOperation::new_for_test(team_b.uid),
+                    Harness::Claude,
+                    Some(AuthSecretPreference::Named("team-b-key".to_string())),
+                    ctx,
+                );
+            });
+        });
+
+        let tips_a = app.add_model(|_| TipsCompleted::default());
+        let (window_a, terminal_a) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_a, None, ctx)
+        });
+        let tips_b = app.add_model(|_| TipsCompleted::default());
+        let (window_b, terminal_b) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_b, None, ctx)
+        });
+        terminal_a.update(&mut app, |view, _| {
+            view.model.lock().set_is_dummy_cloud_mode_session(true);
+        });
+        terminal_b.update(&mut app, |view, _| {
+            view.model.lock().set_is_dummy_cloud_mode_session(true);
+        });
+        UserWorkspaces::handle(&app).update(&mut app, |workspaces, ctx| {
+            workspaces.switch_window_to_team(window_a, team_a.uid, ctx);
+            workspaces.switch_window_to_team(window_b, team_a.uid, ctx);
+        });
+
+        let input_a = terminal_a.read(&app, |view, _| view.input().clone());
+        let terminal_a_id = terminal_a.read(&app, |view, _| view.id());
+        let weak_terminal_a = terminal_a.downgrade();
+        let view_model_a = input_a.update(&mut app, |input, ctx| {
+            let view_model = ctx
+                .add_model(|ctx| AmbientAgentViewModel::new(terminal_a_id, weak_terminal_a, ctx));
+            view_model.update(ctx, |model, ctx| model.set_harness(Harness::Claude, ctx));
+            input.attach_ambient_agent_view_model(view_model.clone(), ctx);
+            view_model
+        });
+
+        let input_b = terminal_b.read(&app, |view, _| view.input().clone());
+        let terminal_b_id = terminal_b.read(&app, |view, _| view.id());
+        let weak_terminal_b = terminal_b.downgrade();
+        let view_model_b = input_b.update(&mut app, |input, ctx| {
+            let view_model = ctx
+                .add_model(|ctx| AmbientAgentViewModel::new(terminal_b_id, weak_terminal_b, ctx));
+            view_model.update(ctx, |model, ctx| model.set_harness(Harness::Claude, ctx));
+            input.attach_ambient_agent_view_model(view_model.clone(), ctx);
+            view_model
+        });
+
+        assert_eq!(
+            view_model_a.read(&app, |model, _| {
+                model.selected_harness_auth_secret_name().map(str::to_owned)
+            }),
+            Some("team-a-key".to_string())
+        );
+        assert_eq!(
+            view_model_b.read(&app, |model, _| {
+                model.selected_harness_auth_secret_name().map(str::to_owned)
+            }),
+            Some("team-a-key".to_string())
+        );
+        let ftux_a = input_a.read(&app, |input, _| {
+            input
+                .auth_secret_ftux_view()
+                .cloned()
+                .expect("cloud composer should have an auth-secret FTUX view")
+        });
+        ftux_a.update(&mut app, |_, ctx| {
+            ctx.emit(AuthSecretFtuxViewEvent::SecretSelected {
+                harness: Harness::Claude,
+                name: "team-a-ftux-key".to_string(),
+            });
+        });
+        assert_eq!(
+            view_model_a.read(&app, |model, _| {
+                model.selected_harness_auth_secret_name().map(str::to_owned)
+            }),
+            Some("team-a-ftux-key".to_string())
+        );
+        app.read(|ctx| {
+            let settings = CloudAgentSettings::as_ref(ctx);
+            assert_eq!(
+                settings.auth_secret_preference(
+                    &TeamContextForOperation::new_for_test(team_a.uid),
+                    Harness::Claude,
+                ),
+                Some(AuthSecretPreference::Named("team-a-ftux-key".to_string()))
+            );
+            assert_eq!(
+                settings.auth_secret_preference(
+                    &TeamContextForOperation::new_for_test(team_b.uid),
+                    Harness::Claude,
+                ),
+                Some(AuthSecretPreference::Named("team-b-key".to_string()))
+            );
+        });
+
+        UserWorkspaces::handle(&app).update(&mut app, |workspaces, ctx| {
+            workspaces.switch_window_to_team(window_a, team_b.uid, ctx);
+        });
+
+        assert_eq!(
+            view_model_a.read(&app, |model, _| {
+                model.selected_harness_auth_secret_name().map(str::to_owned)
+            }),
+            Some("team-b-key".to_string())
+        );
+        assert_eq!(
+            view_model_b.read(&app, |model, _| {
+                model.selected_harness_auth_secret_name().map(str::to_owned)
+            }),
+            Some("team-a-key".to_string())
+        );
+
+        ftux_a.update(&mut app, |_, ctx| {
+            ctx.emit(AuthSecretFtuxViewEvent::Skipped {
+                harness: Harness::Claude,
+            });
+        });
+        app.read(|ctx| {
+            let settings = CloudAgentSettings::as_ref(ctx);
+            assert_eq!(
+                settings.auth_secret_preference(
+                    &TeamContextForOperation::new_for_test(team_a.uid),
+                    Harness::Claude,
+                ),
+                Some(AuthSecretPreference::Named("team-a-ftux-key".to_string()))
+            );
+            assert_eq!(
+                settings.auth_secret_preference(
+                    &TeamContextForOperation::new_for_test(team_b.uid),
+                    Harness::Claude,
+                ),
+                Some(AuthSecretPreference::Inherit)
+            );
+        });
+    });
+}
+
+#[test]
+fn teamless_cloud_mode_host_selector_ignores_team_worker_cache() {
+    // A personal/teamless window must not surface connected workers cached for a team.
+    App::test((), |mut app| async move {
+        let _cloud_mode_input_v2 = FeatureFlag::CloudModeInputV2.override_enabled(true);
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+
+        // Fresh cloud-mode composer: a dummy cloud-mode session in `ViewPending`.
+        terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.set_shared_session_status(SharedSessionStatus::ViewPending);
+            model.set_is_dummy_cloud_mode_session(true);
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let weak_terminal = terminal.downgrade();
+        input.update(&mut app, |input, ctx| {
+            let view_model = ctx
+                .add_model(|ctx| AmbientAgentViewModel::new(terminal_view_id, weak_terminal, ctx));
+            input.attach_ambient_agent_view_model(view_model, ctx);
+        });
+
+        // No workspace default host and no connected workers -> the dropdown stays hidden.
+        input.read(&app, |input, ctx| {
+            assert!(
+                input.host_selector().is_some(),
+                "the cloud composer must build the host selector"
+            );
+            assert!(
+                input.visible_host_selector(ctx).is_none(),
+                "host selector must be hidden with no default host and no connected workers"
+            );
+        });
+
+        // A worker connected under an unrelated team must not leak into this teamless window.
+        let team_scope = TeamContextForOperation::new_for_test(123_i64.into());
+        ConnectedSelfHostedWorkersModel::handle(&app).update(&mut app, |model, ctx| {
+            model.set_workers_for_test(&team_scope, &["oz-k8s-worker"], ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(
+                input.visible_host_selector(ctx).is_none(),
+                "a teamless window must not show another team's connected worker"
+            );
+        });
+    });
+}
+
+#[test]
+fn send_now_event_submits_through_active_pane_and_preserves_draft() {
+    // A queued-prompt "send now" surfaces as a SendNow event on the input. The host should
+    // immediately route the removed prompt through the active-pane submission path (here, the
+    // shared-session viewer path, which emits SendAgentPrompt) without clobbering a draft the
+    // user has typed locally.
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.block_list_mut().set_bootstrapped();
+            model
+                .block_list_mut()
+                .active_block_for_test()
+                .set_session_id(SessionId::from(0));
+            model.set_shared_session_status(SharedSessionStatus::executor());
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        let submitted_prompts = Rc::new(RefCell::new(Vec::<String>::new()));
+        let submitted_prompts_for_subscription = submitted_prompts.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if let super::Event::SendAgentPrompt { prompt, .. } = event {
+                    submitted_prompts_for_subscription
+                        .borrow_mut()
+                        .push(prompt.clone());
+                }
+            });
+        });
+
+        // Seed a queued row so the host can identify it by id, fire it, and remove it afterward.
+        let conversation_id = AIConversationId::new();
+        let query_id = QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new(
+                    "queued prompt".to_owned(),
+                    QueuedQueryOrigin::QueueSlashCommand,
+                ),
+                ctx,
+            )
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("draft in progress", ctx);
+            input.handle_queued_prompts_panel_event(
+                &QueuedPromptsPanelEvent::SendNow {
+                    conversation_id,
+                    query_id,
+                    text: "queued prompt".to_owned(),
+                    is_command: false,
+                },
+                ctx,
+            );
+        });
+
+        // The queued prompt was submitted immediately...
+        assert_eq!(submitted_prompts.borrow().as_slice(), ["queued prompt"]);
+        // ...the in-progress draft the user typed was left untouched...
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "draft in progress");
+        });
+        // ...and the host removed the fired row from the queue.
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+        });
+    });
+}
+
+#[test]
+fn send_now_command_event_executes_command_and_arms_in_flight() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let session_info = SessionInfo::new_for_test();
+        let session_id = session_info.session_id;
+        let terminal =
+            add_window_with_bootstrapped_terminal(&mut app, None, Some(session_info)).await;
+        simulate_directory_for_completion(session_id, &terminal, &mut app, "~");
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        let executed_commands = Rc::new(RefCell::new(Vec::<(String, bool)>::new()));
+        let executed_commands_for_subscription = executed_commands.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if let super::Event::ExecuteCommand(event) = event {
+                    executed_commands_for_subscription
+                        .borrow_mut()
+                        .push((event.command.clone(), event.source.should_preserve_input()));
+                }
+            });
+        });
+
+        let conversation_id = AIConversationId::new();
+        let query_id = QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new_command("echo 1".to_owned(), QueuedQueryOrigin::AutoQueueToggle),
+                ctx,
+            )
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("draft in progress", ctx);
+            input.handle_queued_prompts_panel_event(
+                &QueuedPromptsPanelEvent::SendNow {
+                    conversation_id,
+                    query_id,
+                    text: "echo 1".to_owned(),
+                    is_command: true,
+                },
+                ctx,
+            );
+        });
+
+        assert_eq!(
+            executed_commands.borrow().as_slice(),
+            [("echo 1".to_owned(), true)]
+        );
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "draft in progress");
+        });
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+            assert!(model.has_command_in_flight(conversation_id));
+        });
+    });
+}
+
+#[test]
+fn queued_command_completion_preserves_draft() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+        let conversation_id =
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+                let id = history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+                history.set_active_conversation_id(id, terminal_view_id, ctx);
+                id
+            });
+        QueuedQueryModel::handle(&app).update(&mut app, |model, _| {
+            model.arm_command_in_flight(conversation_id);
+        });
+
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("draft in progress", ctx);
+            input.deferred_remote_operations.latest_block_id = BlockId::new();
+            input.handle_block_completed_event(
+                BlockCompletedEvent {
+                    block_type: BlockType::User(UserBlockCompleted::new_for_test(
+                        BlockIndex::zero(),
+                        Arc::new(SerializedBlock::new_for_test(b"echo 1".to_vec(), vec![])),
+                        "echo 1".to_owned(),
+                        "echo 1".to_owned(),
+                        String::new(),
+                        String::new(),
+                        false,
+                        None,
+                        0,
+                        0,
+                    )),
+                    num_secrets_obfuscated: 0,
+                    block_index: BlockIndex::zero(),
+                    block_id: BlockId::new(),
+                    session_id: None,
+                    restored_block_was_local: None,
+                },
+                ctx,
+            );
+        });
+
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "draft in progress");
+        });
+    });
+}
+
+fn user_block_completed_for_test(command: &str) -> BlockType {
+    BlockType::User(UserBlockCompleted::new_for_test(
+        BlockIndex::zero(),
+        Arc::new(SerializedBlock::new_for_test(
+            command.as_bytes().to_vec(),
+            vec![],
+        )),
+        command.to_owned(),
+        command.to_owned(),
+        String::new(),
+        String::new(),
+        false,
+        None,
+        0,
+        0,
+    ))
+}
+
+async fn complete_ctrl_t_handoff(
+    app: &mut App,
+    apply_mode: ShellWidgetApplyMode,
+    original_buffer: &str,
+    cursor_offset: usize,
+    insertion: Option<&str>,
+) -> (String, ByteOffset) {
+    let terminal = add_window_with_bootstrapped_terminal(app, None, None).await;
+    let input = terminal.read(app, |view, _| view.input().clone());
+    let block_id = BlockId::new();
+    input.update(app, |input, ctx| {
+        input.pending_shell_widget_handoff = Some(PendingShellWidgetHandoff {
+            session_id: SessionId::from(1),
+            original_buffer: original_buffer.to_string(),
+            selection: insertion.map(str::to_string),
+            block_id: block_id.clone(),
+            apply_mode,
+            cursor_offset: Some(ByteOffset::from(cursor_offset)),
+        });
+        input.deferred_remote_operations.latest_block_id = BlockId::new();
+        input.handle_block_completed_event(
+            BlockCompletedEvent {
+                block_type: user_block_completed_for_test(original_buffer),
+                num_secrets_obfuscated: 0,
+                block_index: BlockIndex::zero(),
+                block_id,
+                session_id: None,
+                restored_block_was_local: None,
+            },
+            ctx,
+        );
+    });
+    input.read(app, |input, ctx| {
+        (
+            input.buffer_text(ctx),
+            input
+                .editor()
+                .as_ref(ctx)
+                .end_byte_index_of_last_selection(ctx),
+        )
+    })
+}
+
+async fn complete_ctrl_r_handoff(
+    app: &mut App,
+    original_buffer: &str,
+    selection: Option<&str>,
+) -> String {
+    let terminal = add_window_with_bootstrapped_terminal(app, None, None).await;
+    let input = terminal.read(app, |view, _| view.input().clone());
+    let block_id = BlockId::new();
+    input.update(app, |input, ctx| {
+        input.pending_shell_widget_handoff = Some(PendingShellWidgetHandoff {
+            session_id: SessionId::from(1),
+            original_buffer: original_buffer.to_string(),
+            selection: selection.map(str::to_string),
+            block_id: block_id.clone(),
+            apply_mode: ShellWidgetApplyMode::Replace,
+            cursor_offset: None,
+        });
+        input.deferred_remote_operations.latest_block_id = BlockId::new();
+        input.handle_block_completed_event(
+            BlockCompletedEvent {
+                block_type: user_block_completed_for_test(original_buffer),
+                num_secrets_obfuscated: 0,
+                block_index: BlockIndex::zero(),
+                block_id,
+                session_id: None,
+                restored_block_was_local: None,
+            },
+            ctx,
+        );
+    });
+    input.read(app, |input, ctx| input.buffer_text(ctx))
+}
+
+#[test]
+fn ctrl_r_handoff_replace_lands_selection() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let buffer = complete_ctrl_r_handoff(&mut app, "draft", Some("echo selected")).await;
+        assert_eq!(buffer, "echo selected");
+    });
+}
+
+#[test]
+fn ctrl_r_handoff_cancel_restores_draft() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let buffer = complete_ctrl_r_handoff(&mut app, "draft", None).await;
+        assert_eq!(buffer, "draft");
+    });
+}
+
+#[test]
+fn ctrl_t_handoff_splices_selection_in_middle_of_line() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let (buffer, cursor) = complete_ctrl_t_handoff(
+            &mut app,
+            ShellWidgetApplyMode::Splice,
+            "echo START END",
+            11,
+            Some("FILE.txt "),
+        )
+        .await;
+        assert_eq!(buffer, "echo START FILE.txt END");
+        assert_eq!(cursor, ByteOffset::from("echo START FILE.txt ".len()));
+    });
+}
+
+#[test]
+fn ctrl_t_handoff_splices_selection_at_end_of_line() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let (buffer, cursor) = complete_ctrl_t_handoff(
+            &mut app,
+            ShellWidgetApplyMode::Splice,
+            "echo ",
+            5,
+            Some("FILE.txt"),
+        )
+        .await;
+        assert_eq!(buffer, "echo FILE.txt");
+        assert_eq!(cursor, ByteOffset::from("echo FILE.txt".len()));
+    });
+}
+
+#[test]
+fn ctrl_t_handoff_splices_selection_into_empty_buffer() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let (buffer, cursor) = complete_ctrl_t_handoff(
+            &mut app,
+            ShellWidgetApplyMode::Splice,
+            "",
+            0,
+            Some("FILE.txt"),
+        )
+        .await;
+        assert_eq!(buffer, "FILE.txt");
+        assert_eq!(cursor, ByteOffset::from("FILE.txt".len()));
+    });
+}
+
+#[test]
+fn ctrl_t_handoff_splices_selection_after_multi_byte_character() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let original = "caf\u{e9} ";
+        let cursor_offset = original.len();
+        let (buffer, cursor) = complete_ctrl_t_handoff(
+            &mut app,
+            ShellWidgetApplyMode::Splice,
+            original,
+            cursor_offset,
+            Some("dest.txt"),
+        )
+        .await;
+        assert_eq!(buffer, "caf\u{e9} dest.txt");
+        assert_eq!(cursor, ByteOffset::from("caf\u{e9} dest.txt".len()));
+    });
+}
+
+#[test]
+fn ctrl_t_handoff_cancel_restores_cursor_to_original_offset_mid_line() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        for apply_mode in [ShellWidgetApplyMode::Splice, ShellWidgetApplyMode::Replace] {
+            let (buffer, cursor) =
+                complete_ctrl_t_handoff(&mut app, apply_mode, "echo START END", 11, None).await;
+            assert_eq!(
+                buffer, "echo START END",
+                "{apply_mode:?}: cancelling must leave the original text untouched"
+            );
+            assert_eq!(
+                cursor,
+                ByteOffset::from(11),
+                "{apply_mode:?}: cancelling must restore the cursor to where ctrl-t was pressed, \
+                 not the end of the buffer"
+            );
+        }
+    });
+}
+
+#[test]
+fn ctrl_t_handoff_cancel_restores_cursor_captured_by_a_real_trigger() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.user_insert("echo START MIDDLE", ctx);
+            input.editor().update(ctx, |editor, ctx| {
+                editor.select_ranges_by_byte_offset(
+                    [ByteOffset::from(11)..ByteOffset::from(11)],
+                    ctx,
+                );
+            });
+        });
+
+        let started = input.update(&mut app, |input, ctx| {
+            input.trigger_external_shell_widget_handoff(
+                "warp_run_external_ctrl_t_widget",
+                ShellWidgetApplyMode::Splice,
+                true,
+                ctx,
+            )
+        });
+        assert!(started, "the handoff command should have started");
+
+        let block_id = terminal.read(&app, |terminal, _| {
+            terminal.model.lock().block_list().active_block_id().clone()
+        });
+
+        input.update(&mut app, |input, _ctx| {
+            input.deferred_remote_operations.latest_block_id = BlockId::new();
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.handle_block_completed_event(
+                BlockCompletedEvent {
+                    block_type: user_block_completed_for_test(" warp_run_external_ctrl_t_widget"),
+                    num_secrets_obfuscated: 0,
+                    block_index: BlockIndex::zero(),
+                    block_id,
+                    session_id: None,
+                    restored_block_was_local: None,
+                },
+                ctx,
+            );
+        });
+
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "echo START MIDDLE");
+            assert_eq!(
+                input
+                    .editor()
+                    .as_ref(ctx)
+                    .end_byte_index_of_last_selection(ctx),
+                ByteOffset::from(11),
+                "cancelling a handoff whose cursor was captured by a real trigger must restore \
+                 the cursor to where ctrl-t was pressed, not the end of the buffer"
+            );
+        });
+    });
+}
+
+#[test]
+fn ctrl_t_handoff_replace_mode_lands_selection_wholesale() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let (buffer, cursor) = complete_ctrl_t_handoff(
+            &mut app,
+            ShellWidgetApplyMode::Replace,
+            "vim src/ END",
+            8,
+            Some("vim src/nested.rs "),
+        )
+        .await;
+        assert_eq!(buffer, "vim src/nested.rs ");
+        assert_eq!(cursor, ByteOffset::from("vim src/nested.rs ".len()));
+    });
+}
+
+#[test]
+fn ctrl_t_apply_mode_forks_between_splice_and_replace_for_the_same_draft() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let (splice_buffer, splice_cursor) = complete_ctrl_t_handoff(
+            &mut app,
+            ShellWidgetApplyMode::Splice,
+            "vim src/ END",
+            8,
+            Some("nested.rs "),
+        )
+        .await;
+        assert_eq!(splice_buffer, "vim src/nested.rs  END");
+        assert_eq!(splice_cursor, ByteOffset::from("vim src/nested.rs ".len()));
+
+        let (replace_buffer, replace_cursor) = complete_ctrl_t_handoff(
+            &mut app,
+            ShellWidgetApplyMode::Replace,
+            "vim src/ END",
+            8,
+            Some("vim src/nested.rs  END"),
+        )
+        .await;
+        assert_eq!(replace_buffer, "vim src/nested.rs  END");
+        assert_eq!(
+            replace_cursor,
+            ByteOffset::from("vim src/nested.rs  END".len())
+        );
+    });
+}
+
+#[test]
+fn ctrl_t_binding_is_ineligible_when_shell_widget_handoff_flag_is_disabled() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        assert!(
+            !FeatureFlag::ShellWidgetHandoff.is_enabled(),
+            "this test assumes the flag defaults to disabled in the test harness"
+        );
+        app.read(|ctx| {
+            assert!(
+                ctx.get_binding_by_name("workspace:trigger_external_ctrl_t_file_search")
+                    .is_none(),
+                "the ctrl-t binding must be ineligible while ShellWidgetHandoff is disabled"
+            );
+        });
+    });
+}
+
+/// Verifies deleting a queued row does not overwrite an existing draft.
+#[test]
+fn row_deleted_event_preserves_existing_draft() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("draft in progress", ctx);
+            input.handle_queued_prompts_panel_event(&QueuedPromptsPanelEvent::RowDeleted, ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "draft in progress");
+        });
+    });
+}
+
+/// Seeds an active conversation in the history model for `terminal_view_id` so the queued
+/// prompts panel (and the empty-buffer Enter path) can resolve it.
+fn seed_active_conversation(app: &mut App, terminal_view_id: EntityId) -> AIConversationId {
+    BlocklistAIHistoryModel::handle(app).update(app, |history, ctx| {
+        let id = history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+        history.set_active_conversation_id(id, terminal_view_id, ctx);
+        id
+    })
+}
+
+/// Enter on an empty buffer sends the top queued prompt; a second Enter sends the next row.
+/// The buffer stays empty throughout.
+#[test]
+fn empty_buffer_enter_sends_top_queued_prompt_then_next_on_repeat() {
+    App::test((), |mut app| async move {
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+        let conversation_id = seed_active_conversation(&mut app, terminal_view_id);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new("first".to_owned(), QueuedQueryOrigin::QueueSlashCommand),
+                ctx,
+            );
+            model.append(
+                conversation_id,
+                QueuedQuery::new("second".to_owned(), QueuedQueryOrigin::QueueSlashCommand),
+                ctx,
+            );
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if matches!(event, super::Event::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| input.input_enter(ctx));
+        assert_eq!(*ai_query_count.borrow(), 1);
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].text(), "second");
+        });
+        input.read(&app, |input, ctx| {
+            assert!(input.buffer_text(ctx).is_empty());
+        });
+
+        input.update(&mut app, |input, ctx| input.input_enter(ctx));
+        assert_eq!(*ai_query_count.borrow(), 2);
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+        });
+    });
+}
+
+/// With the input in (default) shell mode and an empty buffer, Enter executes the top queued
+/// command row instead of submitting an empty shell command.
+#[test]
+fn empty_buffer_enter_executes_top_queued_command() {
+    App::test((), |mut app| async move {
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let session_info = SessionInfo::new_for_test();
+        let session_id = session_info.session_id;
+        let terminal =
+            add_window_with_bootstrapped_terminal(&mut app, None, Some(session_info)).await;
+        simulate_directory_for_completion(session_id, &terminal, &mut app, "~");
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+        let conversation_id = seed_active_conversation(&mut app, terminal_view_id);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new_command("echo 1".to_owned(), QueuedQueryOrigin::AutoQueueToggle),
+                ctx,
+            );
+        });
+
+        let executed_commands = Rc::new(RefCell::new(Vec::<(String, bool)>::new()));
+        let executed_commands_for_subscription = executed_commands.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if let super::Event::ExecuteCommand(event) = event {
+                    executed_commands_for_subscription
+                        .borrow_mut()
+                        .push((event.command.clone(), event.source.should_preserve_input()));
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| input.input_enter(ctx));
+
+        assert_eq!(
+            executed_commands.borrow().as_slice(),
+            [("echo 1".to_owned(), true)]
+        );
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+            assert!(model.has_command_in_flight(conversation_id));
+        });
+    });
+}
+
+/// A non-empty buffer keeps Enter's existing behavior; the queued row is left in place.
+#[test]
+fn enter_with_nonempty_buffer_does_not_send_queued_row() {
+    App::test((), |mut app| async move {
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+        let conversation_id = seed_active_conversation(&mut app, terminal_view_id);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new("queued".to_owned(), QueuedQueryOrigin::QueueSlashCommand),
+                ctx,
+            );
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("echo draft", ctx);
+            input.input_enter(ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert_eq!(model.queue(conversation_id).len(), 1);
+        });
+    });
+}
+
+/// The locked initial cloud-mode head row never fires on Enter, and the locked head blocks the
+/// rows behind it (only the head row is Enter-sendable).
+#[test]
+fn empty_buffer_enter_skips_locked_initial_cloud_mode_head() {
+    App::test((), |mut app| async move {
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+        let conversation_id = seed_active_conversation(&mut app, terminal_view_id);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new("initial".to_owned(), QueuedQueryOrigin::InitialCloudMode),
+                ctx,
+            );
+            model.append(
+                conversation_id,
+                QueuedQuery::new("follow up".to_owned(), QueuedQueryOrigin::QueueSlashCommand),
+                ctx,
+            );
+        });
+
+        input.update(&mut app, |input, ctx| input.input_enter(ctx));
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert_eq!(model.queue(conversation_id).len(), 2);
+        });
+    });
+}
+
+/// Seeds an in-progress conversation for `terminal`.
+fn seed_in_progress_conversation(
+    app: &mut App,
+    terminal: &ViewHandle<TerminalView>,
+) -> AIConversationId {
+    let terminal_view_id = terminal.read(app, |view, _| view.id());
+    let conversation_id = seed_active_conversation(app, terminal_view_id);
+    BlocklistAIHistoryModel::handle(app).update(app, |history, ctx| {
+        let exchange = AIAgentExchange {
+            id: AIAgentExchangeId::new(),
+            input: vec![AIAgentInput::UserQuery {
+                query: "run the dev server".to_owned(),
+                context: Default::default(),
+                static_query_type: None,
+                referenced_attachments: Default::default(),
+                user_query_mode: UserQueryMode::Normal,
+                running_command: None,
+                intended_agent: None,
+                base: None,
+            }],
+            output_status: AIAgentOutputStatus::Streaming { output: None },
+            added_message_ids: HashSet::new(),
+            start_time: Local::now(),
+            finish_time: None,
+            time_to_first_token_ms: None,
+            working_directory: None,
+            model_id: LLMId::from("test-model"),
+            request_cost: None,
+            coding_model_id: LLMId::from("test-coding-model"),
+            cli_agent_model_id: LLMId::from("test-cli-agent-model"),
+            computer_use_model_id: LLMId::from("test-computer-use-model"),
+            response_initiator: None,
+        };
+        let response_stream_id = ResponseStreamId::new_for_test();
+        history
+            .conversation_mut(&conversation_id)
+            .expect("conversation should exist")
+            .append_reassigned_exchange(&response_stream_id, exchange, terminal_view_id, ctx)
+            .expect("exchange should append");
+        history.update_conversation_status(
+            terminal_view_id,
+            conversation_id,
+            ConversationStatus::InProgress,
+            ctx,
+        );
+    });
+    conversation_id
+}
+
+/// Puts the active block into the agent-requested, agent-in-control LRC state.
+fn simulate_agent_requested_lrc(
+    app: &mut App,
+    terminal: &ViewHandle<TerminalView>,
+) -> AIConversationId {
+    let conversation_id = seed_in_progress_conversation(app, terminal);
+    // Mirror production: the conversation is selected (agent view entered) before the agent
+    // requests the command. Selecting after the LRC is active would be rejected.
+    select_conversation(app, terminal, conversation_id);
+
+    terminal.update(app, |view, _ctx| {
+        let mut model = view.model.lock();
+        model.simulate_long_running_block("sleep 10", "running");
+        let active_block = model.block_list_mut().active_block_mut();
+        let action_id = AIAgentActionId::from("test-action".to_owned());
+        let task_id = TaskId::new("test-task".to_owned());
+        active_block.set_agent_interaction_mode_for_requested_command(
+            action_id,
+            Some(task_id.clone()),
+            conversation_id,
+        );
+        active_block
+            .set_agent_interaction_mode_for_agent_monitored_command(&task_id, conversation_id)
+            .expect("agent-requested command should transition to agent-monitored");
+        assert!(active_block.is_agent_in_control());
+        assert!(active_block.is_agent_requested_command());
+    });
+    conversation_id
+}
+/// Puts the active block into the user-tagged, agent-in-control LRC state.
+fn simulate_user_tagged_agent_controlled_lrc(
+    app: &mut App,
+    terminal: &ViewHandle<TerminalView>,
+) -> AIConversationId {
+    let conversation_id = seed_in_progress_conversation(app, terminal);
+    // Mirror production: the conversation is selected before the command becomes long-running.
+    select_conversation(app, terminal, conversation_id);
+    terminal.update(app, |view, _ctx| {
+        let mut model = view.model.lock();
+        model.simulate_long_running_block("sleep 10", "running");
+        let active_block = model.block_list_mut().active_block_mut();
+        active_block.set_is_agent_tagged_in(true);
+        let task_id = TaskId::new("test-task".to_owned());
+        active_block
+            .set_agent_interaction_mode_for_agent_monitored_command(&task_id, conversation_id)
+            .expect("tagged-in command should transition to agent-monitored");
+        assert!(active_block.is_agent_in_control());
+        assert!(!active_block.is_agent_requested_command());
+    });
+    conversation_id
+}
+
+/// Selects `conversation_id` for the input so `selected_conversation_id` resolves to it.
+/// Routes through the context model, which enters agent view for the conversation. The
+/// conversation must already exist in history and no long-running command may be active.
+fn select_conversation(
+    app: &mut App,
+    terminal: &ViewHandle<TerminalView>,
+    conversation_id: AIConversationId,
+) {
+    terminal.update(app, |view, ctx| {
+        view.ai_context_model().update(ctx, |context_model, ctx| {
+            context_model.set_pending_query_state_for_existing_conversation(
+                conversation_id,
+                AgentViewEntryOrigin::Input {
+                    was_prompt_autodetected: false,
+                },
+                ctx,
+            );
+        });
+    });
+}
+
+/// While an agent controls an agent-requested long-running command, a prompt submission
+/// auto-queues (with the `LrcAutoQueue` origin) instead of being sent.
+#[test]
+fn prompt_submission_auto_queues_during_agent_requested_lrc() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_agent_requested_lrc(&mut app, &terminal);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("queue me", ctx);
+            input.input_enter(ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].text(), "queue me");
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::LrcAutoQueue);
+        });
+        input.read(&app, |input, ctx| {
+            assert!(input.buffer_text(ctx).is_empty());
+        });
+    });
+}
+
+/// LRC queued prompts do not fire on command finish while the conversation still has an active
+/// subagent. They fire when history shows the subagent has handed back to the main agent.
+#[test]
+fn lrc_queued_prompts_wait_while_subagent_is_active() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_agent_requested_lrc(&mut app, &terminal);
+        let terminal_view_id = terminal.read(&app, |view, _| view.view_id());
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("/compact-and test", ctx);
+            input.input_enter(ctx);
+        });
+        let active_block_id = terminal.read(&app, |view, _| {
+            view.model.lock().block_list().active_block().id().clone()
+        });
+        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+            history
+                .conversation_mut(&conversation_id)
+                .expect("conversation should exist")
+                .create_optimistic_cli_subagent_task_for_test(&active_block_id);
+            ctx.notify();
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if matches!(event, super::Event::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.send_lrc_queued_prompts(conversation_id, ctx);
+        });
+
+        assert_eq!(*ai_query_count.borrow(), 0);
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].text(), "/compact-and test");
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::LrcAutoQueue);
+        });
+
+        BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+            history
+                .conversation_mut(&conversation_id)
+                .expect("conversation should exist")
+                .clear_optimistic_cli_subagent_task_for_test();
+            history.update_conversation_status(
+                terminal_view_id,
+                conversation_id,
+                ConversationStatus::InProgress,
+                ctx,
+            );
+        });
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].text(), "test");
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::CompactAndSlashCommand);
+        });
+    });
+}
+/// If the conversation already has queued rows, LRC submissions append as regular queued rows
+/// when the current queue head is not LRC-queued, so command-finish delivery never jumps it.
+#[test]
+fn prompt_submission_during_lrc_with_non_lrc_queue_head_uses_generic_origin() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_agent_requested_lrc(&mut app, &terminal);
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new(
+                    "already queued".to_owned(),
+                    QueuedQueryOrigin::QueueSlashCommand,
+                ),
+                ctx,
+            );
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("queue behind it", ctx);
+            input.input_enter(ctx);
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if matches!(event, super::Event::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.send_lrc_queued_prompts(conversation_id, ctx);
+        });
+
+        assert_eq!(*ai_query_count.borrow(), 0);
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue[0].text(), "already queued");
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::QueueSlashCommand);
+            assert_eq!(queue[1].text(), "queue behind it");
+            assert_eq!(queue[1].origin(), QueuedQueryOrigin::AutoQueueToggle);
+        });
+    });
+}
+
+/// If the current queue head is LRC-queued, later LRC submissions join that same
+/// command-finish batch and fire in FIFO order.
+#[test]
+fn prompt_submission_during_lrc_with_lrc_queue_head_uses_lrc_origin() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_agent_requested_lrc(&mut app, &terminal);
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new("first lrc".to_owned(), QueuedQueryOrigin::LrcAutoQueue),
+                ctx,
+            );
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("second lrc", ctx);
+            input.input_enter(ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue[0].text(), "first lrc");
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::LrcAutoQueue);
+            assert_eq!(queue[1].text(), "second lrc");
+            assert_eq!(queue[1].origin(), QueuedQueryOrigin::LrcAutoQueue);
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if matches!(event, super::Event::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.send_lrc_queued_prompts(conversation_id, ctx);
+        });
+
+        assert_eq!(*ai_query_count.borrow(), 2);
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+        });
+    });
+}
+/// Explicitly tagging the agent into a user-started long-running command preserves steering:
+/// prompts submit immediately instead of using the LRC auto-queue path.
+#[test]
+fn prompt_submission_does_not_auto_queue_for_user_tagged_lrc() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_user_tagged_agent_controlled_lrc(&mut app, &terminal);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("steer now", ctx);
+            input.input_enter(ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+        });
+    });
+}
+/// With the LRC submission mode set to send immediately, a submission during an
+/// agent-requested LRC is not queued.
+#[test]
+fn prompt_submission_is_not_queued_during_lrc_when_set_to_send_immediately() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_agent_requested_lrc(&mut app, &terminal);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .long_running_command_submission_mode
+                .set_value(LongRunningCommandSubmissionMode::SendImmediately, ctx);
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("send me", ctx);
+            input.input_enter(ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+        });
+    });
+}
+
+/// With the default submission mode set to Queue, the LRC machinery is inert: a submission
+/// during an agent-requested LRC still queues, but as a regular queued row (generic origin)
+/// that waits for the end of the full response rather than the end of the command.
+#[test]
+fn prompt_submission_during_lrc_with_queue_default_uses_generic_origin() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_agent_requested_lrc(&mut app, &terminal);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .default_prompt_submission_mode
+                .set_value(PromptSubmissionMode::Queue, ctx);
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("queue me", ctx);
+            input.input_enter(ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::AutoQueueToggle);
+        });
+    });
+}
+
+/// When the long-running command finishes, leading `LrcAutoQueue` rows fire to the agent in
+/// queue order; rows behind other origins stay queued for the normal end-of-response drain.
+#[test]
+fn lrc_queued_prompts_fire_from_queue_head_when_command_finishes() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = simulate_agent_requested_lrc(&mut app, &terminal);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new("first".to_owned(), QueuedQueryOrigin::LrcAutoQueue),
+                ctx,
+            );
+            model.append(
+                conversation_id,
+                QueuedQuery::new("keep me".to_owned(), QueuedQueryOrigin::QueueSlashCommand),
+                ctx,
+            );
+            model.append(
+                conversation_id,
+                QueuedQuery::new("second".to_owned(), QueuedQueryOrigin::LrcAutoQueue),
+                ctx,
+            );
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &super::Event, _| {
+                if matches!(event, super::Event::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.send_lrc_queued_prompts(conversation_id, ctx);
+        });
+        assert_eq!(*ai_query_count.borrow(), 1);
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue[0].text(), "keep me");
+            assert_eq!(queue[1].text(), "second");
+        });
+    });
+}
+
+/// While an agent controls an agent-requested LRC (and the setting is on), the empty-input
+/// ghost text shows the queue hint instead of the steer hint.
+#[test]
+fn ghost_text_shows_queue_hint_during_agent_requested_lrc() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        simulate_agent_requested_lrc(&mut app, &terminal);
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        let hint = input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.agent_mode_hint_text(ctx)
+        });
+        assert!(
+            hint.starts_with("Queue a follow up for the running agent"),
+            "expected queue hint, got {hint:?}"
+        );
+    });
+}
+
+#[test]
+fn shell_submission_queues_as_command_row_when_gated_under_v2() {
+    // A shell-mode submission while a queued command is already in flight is captured as a
+    // command row (not executed and not interrupting the queue), carries no attachments, and
+    // clears the editor.
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_slash_command = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        let _queued_prompts_v2 = FeatureFlag::QueuedPromptsV2.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        // Select a conversation, turn on auto-queue, and mark a command as in flight so the gate
+        // keeps queueing while the agent is idle.
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+        let conversation_id = seed_active_conversation(&mut app, terminal_view_id);
+        select_conversation(&mut app, &terminal, conversation_id);
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.toggle_queue_next_prompt(conversation_id, ctx);
+            model.arm_command_in_flight(conversation_id);
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_terminal(/* steal_focus */ false, ctx);
+            input.replace_buffer_content("echo 1", ctx);
+            input.input_enter(ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1);
+            assert!(queue[0].is_command());
+            assert_eq!(queue[0].text(), "echo 1");
+            assert!(queue[0].attachments().is_empty());
+        });
+        input.read(&app, |input, ctx| {
+            assert!(input.buffer_text(ctx).is_empty())
+        });
+    });
+}
+
+#[test]
+fn shell_submission_is_not_queued_when_v2_disabled() {
+    // With QueuedPromptsV2 off, a shell submission is never captured as a command row even when
+    // every other queue condition is met; it falls through to normal execution.
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_slash_command = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        let _queued_prompts_v2 = FeatureFlag::QueuedPromptsV2.override_enabled(false);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        let terminal_view_id = terminal.read(&app, |view, _| view.id());
+        let conversation_id = seed_active_conversation(&mut app, terminal_view_id);
+        select_conversation(&mut app, &terminal, conversation_id);
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.toggle_queue_next_prompt(conversation_id, ctx);
+            model.arm_command_in_flight(conversation_id);
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_terminal(/* steal_focus */ false, ctx);
+            input.replace_buffer_content("echo 1", ctx);
+            input.input_enter(ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+        });
+    });
+}
+
+/// `/fork` emits an action and does not reiterate input into the conversation, so it must bypass
+/// prompt queuing and run immediately even while an agent is in progress with queued-prompts mode
+/// on.
+#[test]
+fn slash_fork_bypasses_prompt_queue_while_in_progress() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = seed_in_progress_conversation(&mut app, &terminal);
+        select_conversation(&mut app, &terminal, conversation_id);
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.toggle_queue_next_prompt(conversation_id, ctx);
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("/fork", ctx);
+            input.close_input_suggestions(/* should_focus_input */ false, ctx);
+            input.input_enter(ctx);
+        });
+
+        // /fork emits an action and is never added to the queue.
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(
+                model.queue(conversation_id).is_empty(),
+                "/fork should bypass prompt queuing and run immediately"
+            );
+        });
+    });
+}
+
+/// Counterpart to the fork bypass: prompt-submitting commands like `/compact` reiterate their text
+/// into the conversation, so they are still queued while an agent is in progress. This keeps the
+/// bypass scoped to action-emitting commands only.
+#[test]
+fn slash_compact_still_queues_while_in_progress() {
+    App::test((), |mut app| async move {
+        let _agent_view = FeatureFlag::AgentView.override_enabled(false);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let conversation_id = seed_in_progress_conversation(&mut app, &terminal);
+        select_conversation(&mut app, &terminal, conversation_id);
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.toggle_queue_next_prompt(conversation_id, ctx);
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.set_input_mode_agent(/* ensure_input_is_focused */ false, ctx);
+            input.replace_buffer_content("/compact", ctx);
+            input.close_input_suggestions(/* should_focus_input */ false, ctx);
+            input.input_enter(ctx);
+        });
+
+        // /compact reiterates into the conversation as a prompt, so it is queued.
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(
+                queue.len(),
+                1,
+                "/compact should be queued while in progress"
+            );
+            assert_eq!(queue[0].text(), "/compact");
+        });
+    });
+}
+
+#[test]
 fn test_history_up_multiline() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1356,6 +3511,211 @@ fn build_suggestion_results<S: Into<Span>>(
 }
 
 #[test]
+fn native_completions_after_empty_specs_bails_when_stale() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(
+            &mut app, None, /* history_file_commands */
+            None,
+        )
+        .await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        // Fresh dispatch: the buffer still matches what the request was computed from, so the
+        // shell is asked and the abort handle is armed.
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("git ", ctx);
+        });
+        let snapshot_git = input.update(&mut app, |input, ctx| editor_model_snapshot(input, ctx));
+        input.update(&mut app, |input, ctx| {
+            input.dispatch_native_shell_completions(
+                "git ".to_string(),
+                "git ".len(),
+                CompletionsTrigger::Keybinding,
+                snapshot_git.clone(),
+                ctx,
+            );
+            assert!(
+                input.completions_abort_handle.is_some(),
+                "a real dispatch arms the completions abort handle"
+            );
+        });
+
+        // Stale dispatch: the buffer moved on while the (async) spec pass was running, so this
+        // phase-two callback -- computed from the older snapshot -- must not ask the shell, and
+        // must leave the abort handle a newer request may already own untouched.
+        input.update(&mut app, |input, ctx| {
+            input.completions_abort_handle = None;
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("git checkout", ctx);
+            input.dispatch_native_shell_completions(
+                "git ".to_string(),
+                "git ".len(),
+                CompletionsTrigger::Keybinding,
+                snapshot_git.clone(),
+                ctx,
+            );
+            assert!(
+                input.completions_abort_handle.is_none(),
+                "a stale request must not ask the shell or arm/clobber the abort handle"
+            );
+        });
+    });
+}
+
+fn count_native_shell_completions_dispatches(
+    app: &mut App,
+    terminal: &ViewHandle<TerminalView>,
+) -> Rc<RefCell<u32>> {
+    let count = Rc::new(RefCell::new(0));
+    let count_clone = count.clone();
+    app.update(|ctx| {
+        ctx.subscribe_to_view(terminal, move |_, event: &TerminalViewEvent, _| {
+            if let TerminalViewEvent::RunNativeShellCompletions { .. } = event {
+                *count_clone.borrow_mut() += 1;
+            }
+        });
+    });
+    count
+}
+
+#[test]
+fn input_tab_does_not_ask_the_shell_when_bundled_specs_are_non_empty() {
+    let _native_completions_flag = FeatureFlag::NativeShellCompletions.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let session_info = SessionInfo::new_for_test();
+        let session_id = session_info.session_id;
+        let terminal = add_window_with_bootstrapped_terminal(
+            &mut app,
+            None, /* history_file_commands */
+            Some(session_info),
+        )
+        .await;
+        simulate_directory_for_completion(session_id, &terminal, &mut app, "/usr/bin");
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+        let dispatch_count = count_native_shell_completions_dispatches(&mut app, &terminal);
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("git ", ctx);
+            input.input_tab(ctx);
+        });
+
+        assert_eventually!(
+            600 => input.read(&app, |input, ctx| {
+                input.suggestions_mode_model.as_ref(ctx).is_visible()
+            }),
+            "gave up after 600 attempts waiting for the bundled-spec completions menu to open"
+        );
+
+        assert_eq!(
+            *dispatch_count.borrow(),
+            0,
+            "a command with a real bundled spec must never ask the shell"
+        );
+    });
+}
+
+#[test]
+fn input_tab_asks_the_shell_once_when_bundled_specs_are_empty() {
+    let _native_completions_flag = FeatureFlag::NativeShellCompletions.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let session_info = SessionInfo::new_for_test();
+        let session_id = session_info.session_id;
+        let terminal = add_window_with_bootstrapped_terminal(
+            &mut app,
+            None, /* history_file_commands */
+            Some(session_info),
+        )
+        .await;
+        simulate_directory_for_completion(session_id, &terminal, &mut app, "/usr/bin");
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+        let dispatch_count = count_native_shell_completions_dispatches(&mut app, &terminal);
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("definitelynotarealcommand ", ctx);
+            input.input_tab(ctx);
+        });
+
+        assert_eventually!(
+            600 => *dispatch_count.borrow() == 1,
+            "gave up after 600 attempts waiting for the shell to be asked"
+        );
+
+        assert_eq!(
+            *dispatch_count.borrow(),
+            1,
+            "an unrecognized command must reach the shell exactly once, not fall back to \
+             file-path completions"
+        );
+    });
+}
+
+#[test]
+fn native_shell_replacement_span_is_clamped_into_the_buffer_before_the_cursor() {
+    let buffer_text = "cd app/D";
+    let cursor_position = buffer_text.len();
+
+    let honored = native_shell_suggestion_results(
+        Vec::new(),
+        Some(Span::new(3, 8)),
+        buffer_text,
+        cursor_position,
+    );
+    assert_eq!(
+        honored.replacement_span,
+        Span::new(3, 8),
+        "a span a shell can really report must survive untouched"
+    );
+
+    let out_of_range = native_shell_suggestion_results(
+        Vec::new(),
+        Some(Span::new(1_000_000, 1_000_001)),
+        buffer_text,
+        cursor_position,
+    );
+    assert_eq!(out_of_range.replacement_span, Span::new(8, 8));
+
+    let saturated = native_shell_suggestion_results(
+        Vec::new(),
+        Some(Span::new(usize::MAX, usize::MAX)),
+        buffer_text,
+        cursor_position,
+    );
+    assert_eq!(saturated.replacement_span, Span::new(8, 8));
+}
+
+#[test]
+fn native_shell_replacement_span_is_clamped_to_the_cursor_not_the_whole_buffer() {
+    let buffer_text = "cd app/Documents";
+    let cursor_position = "cd app/D".len();
+
+    let results = native_shell_suggestion_results(
+        Vec::new(),
+        Some(Span::new(12, 16)),
+        buffer_text,
+        cursor_position,
+    );
+
+    assert_eq!(results.replacement_span, Span::new(8, 8));
+}
+
+#[test]
+fn native_shell_replacement_span_falls_back_to_the_whitespace_token_when_none_is_reported() {
+    let buffer_text = "cd app/D";
+
+    let results = native_shell_suggestion_results(Vec::new(), None, buffer_text, buffer_text.len());
+
+    assert_eq!(results.replacement_span, Span::new(3, 8));
+}
+
+#[test]
 fn test_tab_completion_with_multibyte_chars() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1438,11 +3798,13 @@ fn test_tab_completion_with_cursor_movement() {
             input
                 .input_suggestions
                 .read(&app, |input_suggestions, _ctx| {
-                    assert!(input_suggestions
-                        .items()
-                        .iter()
-                        .map(|item| item.text())
-                        .eq(["add", "audit", "autoclean",]))
+                    assert!(
+                        input_suggestions
+                            .items()
+                            .iter()
+                            .map(|item| item.text())
+                            .eq(["add", "audit", "autoclean",])
+                    )
                 });
         });
 
@@ -1455,11 +3817,13 @@ fn test_tab_completion_with_cursor_movement() {
             input
                 .input_suggestions
                 .read(&app, |input_suggestions, _ctx| {
-                    assert!(input_suggestions
-                        .items()
-                        .iter()
-                        .map(|item| item.text())
-                        .eq(["audit", "autoclean",]))
+                    assert!(
+                        input_suggestions
+                            .items()
+                            .iter()
+                            .map(|item| item.text())
+                            .eq(["audit", "autoclean",])
+                    )
                 });
 
             assert!(matches!(
@@ -1479,11 +3843,13 @@ fn test_tab_completion_with_cursor_movement() {
             input
                 .input_suggestions
                 .read(&app, |input_suggestions, _ctx| {
-                    assert!(input_suggestions
-                        .items()
-                        .iter()
-                        .map(|item| item.text())
-                        .eq(["add", "audit", "autoclean",]))
+                    assert!(
+                        input_suggestions
+                            .items()
+                            .iter()
+                            .map(|item| item.text())
+                            .eq(["add", "audit", "autoclean",])
+                    )
                 });
 
             assert!(matches!(
@@ -2280,11 +4646,13 @@ fn test_tab_completion_hides_autosuggestion() {
             ));
 
             // Autosuggestion should be closed.
-            assert!(input
-                .editor
-                .as_ref(ctx)
-                .current_autosuggestion_text()
-                .is_none());
+            assert!(
+                input
+                    .editor
+                    .as_ref(ctx)
+                    .current_autosuggestion_text()
+                    .is_none()
+            );
         });
     });
 }
@@ -2322,11 +4690,13 @@ fn test_completions_while_typing_doesnt_hide_autosuggestion() {
 
         // Autosuggestion should be active.
         input.read(&app, |input, ctx| {
-            assert!(input
-                .editor
-                .as_ref(ctx)
-                .current_autosuggestion_text()
-                .is_some());
+            assert!(
+                input
+                    .editor
+                    .as_ref(ctx)
+                    .current_autosuggestion_text()
+                    .is_some()
+            );
         });
 
         input.update(&mut app, |input, ctx| {
@@ -2349,11 +4719,13 @@ fn test_completions_while_typing_doesnt_hide_autosuggestion() {
                 InputSuggestionsMode::CompletionSuggestions { .. }
             ));
 
-            assert!(input
-                .editor
-                .as_ref(ctx)
-                .current_autosuggestion_text()
-                .is_some());
+            assert!(
+                input
+                    .editor
+                    .as_ref(ctx)
+                    .current_autosuggestion_text()
+                    .is_some()
+            );
         });
     });
 }
@@ -2426,10 +4798,7 @@ fn test_plan_slash_command_argument_with_slash_does_not_disable_slash_command_pa
 
         input.read(&app, |input, ctx| {
             assert!(
-                !matches!(
-                    input.slash_command_model.as_ref(ctx).state(),
-                    SlashCommandEntryState::DisabledUntilEmptyBuffer
-                ),
+                !input.slash_command_model.as_ref(ctx).is_disabled(),
                 "slash command parsing should not be disabled when the argument contains '/'"
             );
         });
@@ -2469,6 +4838,59 @@ fn test_open_slash_command_triggers_completions_on_space() {
                 InputSuggestionsMode::SlashCommands
             ));
             assert!(input.completions_abort_handle.is_some());
+        });
+    });
+}
+
+#[test]
+fn test_open_slash_command_does_not_autofill_single_file_completion() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(
+            &mut app, None, /* history_file_commands */
+            None,
+        )
+        .await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.editor.update(ctx, |editor, ctx| {
+                editor.set_buffer_text("/open-file ", ctx)
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.handle_completion_suggestions_results(
+                build_suggestion_results(
+                    vec![file_suggestion("test.md")],
+                    (11, 11),
+                    MatchStrategy::CaseInsensitive,
+                ),
+                CompletionsTrigger::SlashCommandAutoOpen,
+                editor_model_snapshot(input, ctx),
+                ctx,
+            );
+        });
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "/open-file ");
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.handle_completion_suggestions_results(
+                build_suggestion_results(
+                    vec![file_suggestion("test.md")],
+                    (11, 11),
+                    MatchStrategy::CaseInsensitive,
+                ),
+                CompletionsTrigger::Keybinding,
+                editor_model_snapshot(input, ctx),
+                ctx,
+            );
+        });
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "/open-file test.md ");
         });
     });
 }
@@ -2802,6 +5224,110 @@ fn test_new_conversation_keybinding_requires_double_press_in_non_empty_agent_vie
     });
 }
 
+/// Pressing `?` while editing a queued prompt must NOT toggle the agent help/shortcuts panel —
+/// the keystroke should fall through to the inline editor so a literal `?` is typed. The `shift-?`
+/// binding is gated on an empty *main* input buffer, which is also true while the queued-prompt
+/// inline editor is focused, so without the `QueuedPromptInlineEditorOpen` guard the help panel
+/// would wrongly open instead of inserting `?`.
+#[test]
+fn question_mark_does_not_toggle_shortcuts_while_editing_queued_prompt() {
+    App::test((), |mut app| async move {
+        let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app(&mut app);
+
+        let (window_id, terminal) =
+            add_window_with_bootstrapped_terminal_and_window_id(&mut app, None, None).await;
+        let (input, editor) = terminal.read(&app, |terminal, ctx| {
+            let input = terminal.input().clone();
+            let editor = input.as_ref(ctx).editor().clone();
+            (input, editor)
+        });
+
+        // Enter fullscreen agent view so the `shift-?` binding's ACTIVE_AGENT_VIEW context is set.
+        let conversation_id = terminal.update(&mut app, |view, ctx| {
+            view.agent_view_controller().update(ctx, |controller, ctx| {
+                controller
+                    .try_enter_agent_view(
+                        None,
+                        AgentViewEntryOrigin::Input {
+                            was_prompt_autodetected: false,
+                        },
+                        ctx,
+                    )
+                    .expect("Should be able to enter agent view")
+            })
+        });
+
+        // Queue a prompt and put it into inline edit mode; the main input buffer stays empty.
+        let query_id = QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new(
+                    "queued prompt".to_owned(),
+                    QueuedQueryOrigin::QueueSlashCommand,
+                ),
+                ctx,
+            )
+        });
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.enter_edit_mode(conversation_id, query_id, ctx);
+        });
+
+        let focus_path = [terminal.id(), input.id(), editor.id()];
+
+        // While editing the queued prompt, `?` must NOT be consumed by the shortcuts binding.
+        let handled = app
+            .dispatch_keystroke(
+                window_id,
+                &focus_path,
+                &Keystroke::parse("shift-?").unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            !handled,
+            "`?` must not be consumed by the shortcuts binding while editing a queued prompt"
+        );
+        input.read(&app, |input, ctx| {
+            assert!(
+                !input
+                    .agent_shortcut_view_model
+                    .as_ref(ctx)
+                    .is_shortcut_view_open(),
+                "help/shortcuts panel must not open when typing `?` in the queued-prompt editor"
+            );
+        });
+
+        // Control: with no queued-prompt edit in progress, the same `?` DOES toggle the panel,
+        // confirming the binding is otherwise active in this exact state.
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.cancel_edit(conversation_id, ctx);
+        });
+        let handled = app
+            .dispatch_keystroke(
+                window_id,
+                &focus_path,
+                &Keystroke::parse("shift-?").unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            handled,
+            "`?` should toggle the shortcuts panel in agent view when not editing a queued prompt"
+        );
+        input.read(&app, |input, ctx| {
+            assert!(
+                input
+                    .agent_shortcut_view_model
+                    .as_ref(ctx)
+                    .is_shortcut_view_open(),
+                "help/shortcuts panel should open for `?` outside the queued-prompt editor"
+            );
+        });
+    });
+}
+
 #[test]
 fn test_new_conversation_keybinding_does_not_require_confirmation_in_empty_agent_view() {
     App::test((), |mut app| async move {
@@ -2895,6 +5421,8 @@ fn test_new_conversation_input_trigger_remains_single_step_in_non_empty_agent_vi
                 None,
                 SlashCommandTrigger::input(),
                 /*is_queued_prompt*/ false,
+                None,
+                None,
                 ctx,
             );
             assert!(handled);
@@ -2932,6 +5460,8 @@ fn test_create_docker_sandbox_slash_command_executes_and_clears_buffer() {
                 None,
                 SlashCommandTrigger::input(),
                 /*is_queued_prompt*/ false,
+                None,
+                None,
                 ctx,
             );
             assert!(handled);
@@ -4158,13 +6688,18 @@ fn test_workflow_view_does_not_panic() {
             Workflow::new("Test Workflow", "echo \"Hello World\""),
             Workflow::new("Test Workflow with Description", "echo \"Hello World\"")
                 .with_description("This is a test workflow that prints Hello World!".into()),
-            Workflow::new("Test Workflow with Args", "echo \"Hello {{person}}\"")
-                .with_arguments(vec![Argument::new("person", ArgumentType::Text)
-                    .with_description("The person you want to say hello to".to_string())]),
+            Workflow::new("Test Workflow with Args", "echo \"Hello {{person}}\"").with_arguments(
+                vec![
+                    Argument::new("person", ArgumentType::Text)
+                        .with_description("The person you want to say hello to".to_string()),
+                ],
+            ),
             Workflow::new("test", "echo \"Hello {{person}}\"")
                 .with_description("This is a test workflow that prints Hello {{person}}!".into())
-                .with_arguments(vec![Argument::new("person", ArgumentType::Text)
-                    .with_description("The person you want to say hello to".to_string())]),
+                .with_arguments(vec![
+                    Argument::new("person", ArgumentType::Text)
+                        .with_description("The person you want to say hello to".to_string()),
+                ]),
         ];
 
         for workflow in workflows {
@@ -4909,6 +7444,7 @@ fn test_alias_expansion_disabled_in_ai_input_mode() {
                         is_locked: true,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -4937,6 +7473,7 @@ fn test_alias_expansion_disabled_in_ai_input_mode() {
                         is_locked: true,
                     },
                     false, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -5170,6 +7707,126 @@ fn test_tab_completions_menu_for_classic_completions_with_files() {
 }
 
 #[test]
+fn test_classic_tab_completions_close_after_user_backspace() {
+    let _flag = FeatureFlag::ClassicCompletions.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+        let editor = input.read(&app, |input, _| input.editor().clone());
+
+        app.update(|ctx| {
+            InputSettings::handle(ctx).update(ctx, |setting, ctx| {
+                setting
+                    .classic_completions_mode
+                    .toggle_and_save_value(ctx)
+                    .expect("Able to turn on classic completions");
+            })
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("cd Do", ctx);
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.input_tab(ctx);
+            input.handle_completion_suggestions_results(
+                build_suggestion_results(
+                    vec![file_suggestion("Downloads"), file_suggestion("Documents")],
+                    (3, 5),
+                    MatchStrategy::CaseInsensitive,
+                ),
+                CompletionsTrigger::Keybinding,
+                editor_model_snapshot(input, ctx),
+                ctx,
+            );
+            // Cycle to apply a candidate into the buffer. This is a system-applied
+            // edit, which must keep the result set alive.
+            input.input_tab(ctx);
+        });
+
+        // The user now backspaces all the way past the original completion query
+        // (`cd Do`). Once the buffer no longer starts with the original query, the
+        // stale result set must be discarded and the menu closed.
+        while input.read(&app, |input, ctx| input.buffer_text(ctx).len()) > "cd ".len() {
+            editor.update(&mut app, |editor, ctx| editor.backspace(ctx));
+        }
+
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "cd ");
+            // A closed menu is represented by `InputSuggestionsMode::Closed`; a closed
+            // menu is never rendered, so its stale result set is no longer shown. This
+            // mirrors the existing (non-classic) backspace-past-boundary behavior.
+            assert!(
+                matches!(
+                    input.suggestions_mode_model.as_ref(ctx).mode(),
+                    InputSuggestionsMode::Closed
+                ),
+                "completion menu should close after the user backspaces past the query"
+            );
+        });
+    })
+}
+
+#[test]
+fn test_classic_tab_completions_keep_menu_open_while_cycling() {
+    let _flag = FeatureFlag::ClassicCompletions.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        app.update(|ctx| {
+            InputSettings::handle(ctx).update(ctx, |setting, ctx| {
+                setting
+                    .classic_completions_mode
+                    .toggle_and_save_value(ctx)
+                    .expect("Able to turn on classic completions");
+            })
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("cd Do", ctx);
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.input_tab(ctx);
+            input.handle_completion_suggestions_results(
+                build_suggestion_results(
+                    vec![file_suggestion("Downloads"), file_suggestion("Documents")],
+                    (3, 5),
+                    MatchStrategy::CaseInsensitive,
+                ),
+                CompletionsTrigger::Keybinding,
+                editor_model_snapshot(input, ctx),
+                ctx,
+            );
+            // Cycling rewrites the buffer to each candidate in turn. These are
+            // system-applied edits and must keep the menu open even though the
+            // buffer no longer matches the original query.
+            input.input_tab(ctx);
+            input.input_tab(ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(
+                matches!(
+                    input.suggestions_mode_model.as_ref(ctx).mode(),
+                    InputSuggestionsMode::CompletionSuggestions { .. }
+                ),
+                "completion menu should stay open while cycling candidates"
+            );
+            assert!(
+                !input.input_suggestions.as_ref(ctx).items().is_empty(),
+                "result set should be preserved while cycling candidates"
+            );
+        });
+    })
+}
+
+#[test]
 fn test_vim_escape_with_history_menu() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -5320,6 +7977,7 @@ fn test_voice_input_toggle_preserves_lock_state() {
                         is_locked: true,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -5365,6 +8023,7 @@ fn test_voice_input_toggle_preserves_lock_state() {
                         is_locked: false, // Unlocked (auto-detection enabled)
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -5415,6 +8074,7 @@ fn test_input_type_button_explicit_lock() {
                         is_locked: false,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -5448,6 +8108,15 @@ fn test_input_type_button_explicit_lock() {
             after_click_config.is_locked,
             "Input should be locked when user explicitly clicks AgentMode button"
         );
+        let after_click_source = input.read(&app, |input, _| {
+            app.read_model(input.ai_input_model(), |ai_input, _| {
+                ai_input.last_ai_autodetection_source()
+            })
+        });
+        assert_eq!(
+            after_click_source,
+            Some(InputTypeAutoDetectionSource::ManualToggle)
+        );
 
         // Explicitly click Terminal button - should lock to Shell mode
         input.update(&mut app, |input, ctx| {
@@ -5467,6 +8136,15 @@ fn test_input_type_button_explicit_lock() {
         assert!(
             final_config.is_locked,
             "Input should be locked when user explicitly clicks Terminal button"
+        );
+        let final_source = input.read(&app, |input, _| {
+            app.read_model(input.ai_input_model(), |ai_input, _| {
+                ai_input.last_ai_autodetection_source()
+            })
+        });
+        assert_eq!(
+            final_source,
+            Some(InputTypeAutoDetectionSource::ManualToggle)
         );
     });
 }
@@ -5492,6 +8170,7 @@ fn test_auto_detection_toggle() {
                         is_locked: true,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -5633,11 +8312,7 @@ fn test_input_mode_setting_methods() {
     });
 }
 
-fn run_input_mode_prefix_test(
-    nld_improvements_enabled: bool,
-    udi_enabled: bool,
-    input_type: InputType,
-) {
+fn run_input_mode_prefix_test(udi_enabled: bool, input_type: InputType) {
     let input_prefix = match input_type {
         InputType::Shell => super::TERMINAL_INPUT_PREFIX,
         InputType::AI => super::AI_INPUT_PREFIX,
@@ -5645,7 +8320,6 @@ fn run_input_mode_prefix_test(
 
     App::test((), |mut app| async move {
         let _am_flag = FeatureFlag::AgentMode.override_enabled(true);
-        let _nld_flag = FeatureFlag::NldImprovements.override_enabled(nld_improvements_enabled);
 
         initialize_app(&mut app);
 
@@ -5699,25 +8373,21 @@ fn run_input_mode_prefix_test(
 }
 
 macro_rules! input_mode_prefix_tests {
-    ($($name:ident: ($nld_improvements_enabled:literal, $udi_enabled:literal, $input_mode:expr),)*) => {
+    ($($name:ident: ($udi_enabled:literal, $input_mode:expr_2021),)*) => {
         $(
             #[test]
             fn $name() {
-                run_input_mode_prefix_test($nld_improvements_enabled, $udi_enabled, $input_mode);
+                run_input_mode_prefix_test($udi_enabled, $input_mode);
             }
         )*
     };
 }
 
 input_mode_prefix_tests! {
-    test_ai_input_prefix_with_nld_improvements_and_udi: (true, true, InputType::AI),
-    test_ai_input_prefix_with_nld_improvements_and_no_udi: (true, false, InputType::AI),
-    test_ai_input_prefix_with_no_nld_improvements_and_udi: (false, true, InputType::AI),
-    test_ai_input_prefix_with_no_nld_improvements_and_no_udi: (false, false, InputType::AI),
-    test_shell_input_prefix_with_nld_improvements_and_udi: (true, true, InputType::Shell),
-    test_shell_input_prefix_with_nld_improvements_and_no_udi: (true, false, InputType::Shell),
-    test_shell_input_prefix_with_no_nld_improvements_and_udi: (false, true, InputType::Shell),
-    test_shell_input_prefix_with_no_nld_improvements_and_no_udi: (false, false, InputType::Shell),
+    test_ai_input_prefix_with_udi: (true, InputType::AI),
+    test_ai_input_prefix_with_no_udi: (false, InputType::AI),
+    test_shell_input_prefix_with_udi: (true, InputType::Shell),
+    test_shell_input_prefix_with_no_udi: (false, InputType::Shell),
 }
 fn enter_fullscreen_agent_view_for_test(terminal: &ViewHandle<TerminalView>, app: &mut App) {
     terminal.update(app, |view, ctx| {
@@ -5767,6 +8437,11 @@ fn test_cloud_handoff_prefix_activates_when_handoff_flags_enabled() {
         let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
 
         initialize_app(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx);
+        });
         let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
         let input = terminal.read(&app, |terminal, _| terminal.input().clone());
         enter_fullscreen_agent_view_for_test(&terminal, &mut app);
@@ -5796,6 +8471,11 @@ fn test_cloud_handoff_prefix_normal_deletion_does_not_exit() {
         let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
 
         initialize_app(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx);
+        });
         let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
         let input = terminal.read(&app, |terminal, _| terminal.input().clone());
         enter_fullscreen_agent_view_for_test(&terminal, &mut app);
@@ -5843,6 +8523,11 @@ fn test_cloud_handoff_prefix_exits_on_backspace_at_beginning_of_buffer() {
         let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
 
         initialize_app(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx);
+        });
         let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
         let input = terminal.read(&app, |terminal, _| terminal.input().clone());
         enter_fullscreen_agent_view_for_test(&terminal, &mut app);
@@ -5883,6 +8568,11 @@ fn test_cloud_handoff_prefix_keeps_shell_prefix_as_query_text() {
         let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
 
         initialize_app(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx);
+        });
         let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
         let input = terminal.read(&app, |terminal, _| terminal.input().clone());
         enter_fullscreen_agent_view_for_test(&terminal, &mut app);
@@ -5914,6 +8604,11 @@ fn test_cloud_handoff_prefix_escape_exits_mode_preserving_prompt_text() {
         let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
 
         initialize_app(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx);
+        });
         let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
         let input = terminal.read(&app, |terminal, _| terminal.input().clone());
         enter_fullscreen_agent_view_for_test(&terminal, &mut app);
@@ -5943,6 +8638,130 @@ fn test_cloud_handoff_prefix_escape_exits_mode_preserving_prompt_text() {
 }
 
 #[test]
+fn test_cloud_handoff_prefix_remains_text_in_powershell_with_nld_enabled() {
+    App::test((), |mut app| async move {
+        let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
+        let _oz_handoff_flag = FeatureFlag::OzHandoff.override_enabled(true);
+        let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
+
+        initialize_app(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(true, ctx);
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+        enter_fullscreen_agent_view_for_test(&terminal, &mut app);
+        input.update(&mut app, |input, ctx| {
+            input.editor.update(ctx, |editor, _| {
+                editor.set_shell_family(ShellFamily::PowerShell);
+            });
+            input.user_insert(CLOUD_HANDOFF_INPUT_PREFIX, ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), CLOUD_HANDOFF_INPUT_PREFIX);
+            assert_eq!(input.prefix_mode(ctx), InputPrefixMode::None);
+            assert!(!input.handoff_compose_state.as_ref(ctx).is_active());
+        });
+    });
+}
+
+#[test]
+fn test_cloud_handoff_prefix_activates_in_powershell_when_nld_disabled() {
+    App::test((), |mut app| async move {
+        let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
+        let _oz_handoff_flag = FeatureFlag::OzHandoff.override_enabled(true);
+        let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
+
+        initialize_app(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx);
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+        enter_fullscreen_agent_view_for_test(&terminal, &mut app);
+        input.update(&mut app, |input, ctx| {
+            input.editor.update(ctx, |editor, _| {
+                editor.set_shell_family(ShellFamily::PowerShell);
+            });
+            input.user_insert(CLOUD_HANDOFF_INPUT_PREFIX, ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(input.buffer_text(ctx).is_empty());
+            assert_eq!(input.prefix_mode(ctx), InputPrefixMode::CloudHandoff);
+            assert!(input.handoff_compose_state.as_ref(ctx).is_active());
+        });
+    });
+}
+#[test]
+fn test_cloud_handoff_prefix_vim_escape_exits_insert_before_handoff_mode() {
+    App::test((), |mut app| async move {
+        let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
+        let _oz_handoff_flag = FeatureFlag::OzHandoff.override_enabled(true);
+        let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
+
+        initialize_app(&mut app);
+        enable_vim_mode(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx);
+        });
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let (input, editor) = terminal.read(&app, |terminal, ctx| {
+            let input = terminal.input().clone();
+            let editor = input.as_ref(ctx).editor().clone();
+            (input, editor)
+        });
+        enter_fullscreen_agent_view_for_test(&terminal, &mut app);
+
+        input.update(&mut app, |input, ctx| {
+            input.activate_cloud_handoff_compose(HandoffEntryPoint::Ampersand, ctx);
+            input.user_insert("fix tests", ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            assert_eq!(editor.vim_mode(ctx), Some(VimMode::Insert));
+        });
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "fix tests");
+            assert_eq!(input.prefix_mode(ctx), InputPrefixMode::CloudHandoff);
+        });
+
+        editor.update(&mut app, |editor, ctx| {
+            editor.escape(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            assert_eq!(editor.vim_mode(ctx), Some(VimMode::Normal));
+        });
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "fix tests");
+            assert_eq!(input.prefix_mode(ctx), InputPrefixMode::CloudHandoff);
+        });
+
+        editor.update(&mut app, |editor, ctx| {
+            editor.escape(ctx);
+        });
+
+        editor.read(&app, |editor, ctx| {
+            assert_eq!(editor.vim_mode(ctx), Some(VimMode::Normal));
+        });
+        input.read(&app, |input, ctx| {
+            assert_eq!(input.buffer_text(ctx), "fix tests");
+            assert_eq!(input.prefix_mode(ctx), InputPrefixMode::None);
+            assert!(!input.handoff_compose_state.as_ref(ctx).is_active());
+        });
+    });
+}
+#[test]
 fn test_cloud_handoff_prefix_ignores_terminal_input_mode_toggle() {
     App::test((), |mut app| async move {
         let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
@@ -5950,6 +8769,11 @@ fn test_cloud_handoff_prefix_ignores_terminal_input_mode_toggle() {
         let _handoff_local_cloud_flag = FeatureFlag::HandoffLocalCloud.override_enabled(true);
 
         initialize_app(&mut app);
+        AISettings::handle(&app).update(&mut app, |ai_settings, ctx| {
+            let _ = ai_settings
+                .ai_autodetection_enabled_internal
+                .set_value(false, ctx);
+        });
         let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
         let input = terminal.read(&app, |terminal, _| terminal.input().clone());
         enter_fullscreen_agent_view_for_test(&terminal, &mut app);
@@ -5973,6 +8797,67 @@ fn test_cloud_handoff_prefix_ignores_terminal_input_mode_toggle() {
         });
     });
 }
+
+#[test]
+fn test_terminal_prefix_sets_shell_prefix_decision_source() {
+    App::test((), |mut app| async move {
+        let _am_flag = FeatureFlag::AgentMode.override_enabled(true);
+        let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
+
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+        enter_fullscreen_agent_view_for_test(&terminal, &mut app);
+
+        input.update(&mut app, |input, ctx| {
+            input.user_insert(TERMINAL_INPUT_PREFIX, ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(input.buffer_text(ctx).is_empty());
+            app.read_model(input.ai_input_model(), |input_model, _| {
+                assert_eq!(input_model.input_type(), InputType::Shell);
+                assert!(input_model.is_input_type_locked());
+                assert_eq!(
+                    input_model.last_ai_autodetection_source(),
+                    Some(InputTypeAutoDetectionSource::ShellPrefix)
+                );
+            });
+        });
+    });
+}
+
+#[test]
+fn test_source_less_locked_config_clears_decision_source() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        input.update(&mut app, |input, ctx| {
+            input.ai_input_model().update(ctx, |input_model, ctx| {
+                let locked_shell_config = InputConfig {
+                    input_type: InputType::Shell,
+                    is_locked: true,
+                };
+                input_model.set_input_config(
+                    locked_shell_config,
+                    true,
+                    Some(InputTypeAutoDetectionSource::ShellPrefix),
+                    ctx,
+                );
+                input_model.set_input_config(locked_shell_config, true, None, ctx);
+            });
+        });
+
+        input.read(&app, |input, _| {
+            app.read_model(input.ai_input_model(), |input_model, _| {
+                assert_eq!(input_model.last_ai_autodetection_source(), None);
+            });
+        });
+    });
+}
+
 #[test]
 fn test_image_attachment_preserves_lock_state() {
     App::test((), |mut app| async move {
@@ -5994,6 +8879,7 @@ fn test_image_attachment_preserves_lock_state() {
                         is_locked: true,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -6018,6 +8904,15 @@ fn test_image_attachment_preserves_lock_state() {
             locked_config.is_locked,
             "Lock state should be preserved when selecting image"
         );
+        let locked_source = input.read(&app, |input, _| {
+            app.read_model(input.ai_input_model(), |ai_input, _| {
+                ai_input.last_ai_autodetection_source()
+            })
+        });
+        assert_eq!(
+            locked_source,
+            Some(InputTypeAutoDetectionSource::AttachmentForcedAi)
+        );
 
         // Test with unlocked Shell mode
         input.update(&mut app, |input, ctx| {
@@ -6028,6 +8923,7 @@ fn test_image_attachment_preserves_lock_state() {
                         is_locked: false,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -6051,6 +8947,15 @@ fn test_image_attachment_preserves_lock_state() {
         assert!(
             !unlocked_config.is_locked,
             "Auto-detection should be preserved when selecting image"
+        );
+        let unlocked_source = input.read(&app, |input, _| {
+            app.read_model(input.ai_input_model(), |ai_input, _| {
+                ai_input.last_ai_autodetection_source()
+            })
+        });
+        assert_eq!(
+            unlocked_source,
+            Some(InputTypeAutoDetectionSource::AttachmentForcedAi)
         );
     });
 }
@@ -6118,6 +9023,7 @@ fn test_ai_context_menu_preserves_lock_state() {
                         is_locked: true,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -6152,6 +9058,7 @@ fn test_ai_context_menu_preserves_lock_state() {
                         is_locked: false,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -6219,6 +9126,7 @@ fn test_input_config_transitions() {
                         is_locked: true,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -6387,11 +9295,11 @@ fn test_remove_ignored_suggestion_on_ai_query_execution() {
         // Set up AI input mode and execute the query
         input.update(&mut app, |input, ctx| {
             input.ai_input_model.update(ctx, |ai_input, ctx| {
-                ai_input.set_input_type(InputType::AI, ctx);
+                ai_input.set_input_type(InputType::AI, None, ctx);
             });
             input.clear_buffer_and_reset_undo_stack(ctx);
             input.user_insert(test_query, ctx);
-            input.submit_ai_query(None, ctx);
+            input.submit_ai_query_local(None, ctx);
         });
 
         // Verify the query is no longer ignored
@@ -6444,7 +9352,6 @@ fn test_agent_view_terminal_only_initial_input_config_unlocked_when_autodetectio
 
 #[test]
 fn test_terminal_only_ai_enter_enters_agent_view_and_clears_buffer() {
-    use crate::ai::blocklist::agent_view::AgentViewState;
     use crate::ai::blocklist::InputConfig;
 
     App::test((), |mut app| async move {
@@ -6472,6 +9379,7 @@ fn test_terminal_only_ai_enter_enters_agent_view_and_clears_buffer() {
                         is_locked: false,
                     },
                     false, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -6491,13 +9399,11 @@ fn test_terminal_only_ai_enter_enters_agent_view_and_clears_buffer() {
 
         // Agent view should now be active.
         terminal.read(&app, |terminal, _| {
-            let state = terminal
-                .model
-                .lock()
-                .block_list()
-                .agent_view_state()
-                .clone();
-            assert!(matches!(state, AgentViewState::Active { .. }));
+            let state = *terminal.model.lock().block_list().transcript_scope();
+            assert!(matches!(
+                state,
+                crate::terminal::model::block::TranscriptScope::Conversation(_)
+            ));
         });
     });
 }
@@ -6533,6 +9439,7 @@ fn test_terminal_only_escape_locks_shell_mode() {
                         is_locked: false,
                     },
                     true, /* is_input_buffer_empty */
+                    None,
                     ctx,
                 );
             });
@@ -6550,6 +9457,12 @@ fn test_terminal_only_escape_locks_shell_mode() {
         });
         assert_eq!(config.input_type, InputType::Shell);
         assert!(config.is_locked);
+        let source = input.read(&app, |input, _| {
+            app.read_model(input.ai_input_model(), |ai_input, _| {
+                ai_input.last_ai_autodetection_source()
+            })
+        });
+        assert_eq!(source, Some(InputTypeAutoDetectionSource::ManualToggle));
     });
 }
 
@@ -6744,9 +9657,9 @@ fn test_custom_terminal_page_scroll_binding_applies_when_prompt_is_focused() {
         app.update(|ctx| {
             ctx.set_custom_trigger(
                 "terminal:scroll_up_one_page".to_owned(),
-                warpui::keymap::Trigger::Keystrokes(
-                    vec![Keystroke::parse("shift-pageup").unwrap()],
-                ),
+                warpui::keymap::Trigger::Keystrokes(vec![
+                    Keystroke::parse("shift-pageup").unwrap(),
+                ]),
             );
         });
 
@@ -6784,4 +9697,953 @@ fn test_custom_terminal_page_scroll_binding_applies_when_prompt_is_focused() {
             ));
         });
     });
+}
+
+// Helper: open the CLI-agent rich input for the terminal view under test.
+fn open_rich_input_for_terminal(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+    terminal.update(app, |view, ctx| {
+        let view_id = view.view_id();
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.set_session(
+                view_id,
+                CLIAgentSession {
+                    agent: crate::terminal::CLIAgent::Claude,
+                    status: CLIAgentSessionStatus::InProgress,
+                    session_context: CLIAgentSessionContext::default(),
+                    input_state: CLIAgentInputState::Closed,
+                    should_auto_toggle_input: false,
+                    listener: None,
+                    remote_host: None,
+                    plugin_version: None,
+                    draft_text: None,
+                    custom_command_prefix: None,
+                    received_rich_notification: false,
+                },
+                ctx,
+            );
+        });
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.open_input(
+                view_id,
+                CLIAgentInputEntrypoint::CtrlG,
+                crate::ai::blocklist::InputConfig {
+                    input_type: crate::ai::blocklist::InputType::AI,
+                    is_locked: true,
+                },
+                false,
+                false,
+                ctx,
+            );
+        });
+    });
+}
+
+#[test]
+fn enter_submits_when_submit_on_ctrl_enter_is_false() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        // Default must be false (guards existing Enter-submits behaviour).
+        let default_value =
+            AISettings::handle(&app).read(&app, |settings, _| *settings.submit_on_ctrl_enter);
+        assert!(!default_value, "submit_on_ctrl_enter must default to false");
+
+        // Explicitly confirm false so the test doesn't rely on the global default.
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .submit_on_ctrl_enter
+                .set_value(false, ctx)
+                .expect("setting value must succeed");
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let submitted_clone = submitted.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| {
+                if let Event::SubmitCLIAgentInput { text } = event {
+                    submitted_clone.borrow_mut().push(text.clone());
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("hello", ctx);
+        });
+        input.update(&mut app, |input, ctx| {
+            input.input_enter(ctx);
+        });
+
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Enter should submit once when submit_on_ctrl_enter=false"
+        );
+        assert_eq!(
+            submitted.borrow()[0],
+            "hello",
+            "submitted text should match buffer contents"
+        );
+    });
+}
+
+#[test]
+fn ctrl_enter_emits_ctrl_enter_event_when_submit_on_ctrl_enter_is_false() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        // Ensure the setting is false (the default).
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .submit_on_ctrl_enter
+                .set_value(false, ctx)
+                .expect("setting value must succeed");
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        let ctrl_enter_fired: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let ctrl_enter_clone = ctrl_enter_fired.clone();
+        let submitted_clone = submitted.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| match event {
+                Event::CtrlEnter => *ctrl_enter_clone.borrow_mut() = true,
+                Event::SubmitCLIAgentInput { text } => {
+                    submitted_clone.borrow_mut().push(text.clone())
+                }
+                _ => {}
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("hello", ctx);
+        });
+        input.update(&mut app, |input, ctx| {
+            input.input_ctrl_enter(ctx);
+        });
+
+        assert!(
+            *ctrl_enter_fired.borrow(),
+            "Ctrl+Enter should emit Event::CtrlEnter when submit_on_ctrl_enter=false"
+        );
+        assert!(
+            submitted.borrow().is_empty(),
+            "Ctrl+Enter must NOT submit when submit_on_ctrl_enter=false"
+        );
+    });
+}
+
+#[test]
+fn enter_inserts_newline_when_submit_on_ctrl_enter_is_true() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .submit_on_ctrl_enter
+                .set_value(true, ctx)
+                .expect("setting value must succeed");
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let submitted_clone = submitted.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| {
+                if let Event::SubmitCLIAgentInput { text } = event {
+                    submitted_clone.borrow_mut().push(text.clone());
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("hello", ctx);
+        });
+        input.update(&mut app, |input, ctx| {
+            input.input_enter(ctx);
+        });
+
+        assert!(
+            submitted.borrow().is_empty(),
+            "Enter must NOT submit when submit_on_ctrl_enter=true"
+        );
+
+        input.read(&app, |input, ctx| {
+            let text = input.buffer_text(ctx);
+            assert!(
+                text.contains('\n'),
+                "Enter should insert a newline when submit_on_ctrl_enter=true; got: {text:?}"
+            );
+        });
+    });
+}
+
+#[test]
+fn ctrl_enter_submits_when_submit_on_ctrl_enter_is_true() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .submit_on_ctrl_enter
+                .set_value(true, ctx)
+                .expect("setting value must succeed");
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let ctrl_enter_fired: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        let submitted_clone = submitted.clone();
+        let ctrl_enter_clone = ctrl_enter_fired.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| match event {
+                Event::SubmitCLIAgentInput { text } => {
+                    submitted_clone.borrow_mut().push(text.clone())
+                }
+                Event::CtrlEnter => *ctrl_enter_clone.borrow_mut() = true,
+                _ => {}
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("world", ctx);
+        });
+        input.update(&mut app, |input, ctx| {
+            input.input_ctrl_enter(ctx);
+        });
+
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Ctrl+Enter should submit once when submit_on_ctrl_enter=true"
+        );
+        assert_eq!(
+            submitted.borrow()[0],
+            "world",
+            "submitted text should match buffer contents"
+        );
+        assert!(
+            !*ctrl_enter_fired.borrow(),
+            "Ctrl+Enter must NOT emit Event::CtrlEnter when submit_on_ctrl_enter=true"
+        );
+
+        input.read(&app, |input, ctx| {
+            assert!(
+                input.buffer_text(ctx).is_empty(),
+                "buffer should be cleared after submit"
+            );
+        });
+    });
+}
+
+#[test]
+fn ctrl_enter_with_selection_preserves_selection_in_submit_when_setting_is_true() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .submit_on_ctrl_enter
+                .set_value(true, ctx)
+                .expect("setting value must succeed");
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let submitted_clone = submitted.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| {
+                if let Event::SubmitCLIAgentInput { text } = event {
+                    submitted_clone.borrow_mut().push(text.clone());
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("hello world", ctx);
+        });
+
+        // Programmatically select "world" (columns 6–11 on the single line).
+        input.update(&mut app, |input, ctx| {
+            input.editor.update(ctx, |editor, ctx| {
+                editor
+                    .select_ranges(vec![DisplayPoint::new(0, 6)..DisplayPoint::new(0, 11)], ctx)
+                    .expect("select_ranges should succeed");
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.input_ctrl_enter(ctx);
+        });
+
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Ctrl+Enter should submit exactly once"
+        );
+        assert_eq!(
+            submitted.borrow()[0],
+            "hello world",
+            "submitted text must equal the full buffer — selected text must not be dropped"
+        );
+
+        input.read(&app, |input, ctx| {
+            assert!(
+                input.buffer_text(ctx).is_empty(),
+                "buffer should be cleared after submit"
+            );
+        });
+    });
+}
+
+#[test]
+fn editor_keymap_context_excludes_ctrl_enter_enters_agent_view_when_rich_input_is_open() {
+    App::test((), |mut app| async move {
+        let _agent_view_flag = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        input.read(&app, |input, ctx| {
+            let km_ctx = input
+                .editor
+                .read(ctx, |editor, ctx| editor.keymap_context(ctx));
+            assert!(
+                !km_ctx.set.contains(flags::CTRL_ENTER_ENTERS_AGENT_VIEW),
+                "CTRL_ENTER_ENTERS_AGENT_VIEW must NOT be set when the CLI agent rich input \
+                 is open; got flags: {:?}",
+                km_ctx.set
+            );
+            assert!(
+                km_ctx.set.contains(flags::CLI_AGENT_RICH_INPUT_OPEN),
+                "CLI_AGENT_RICH_INPUT_OPEN must be set when the rich input is open; \
+                 got flags: {:?}",
+                km_ctx.set
+            );
+        });
+    });
+}
+
+#[test]
+fn enter_accepts_inline_menu_item_when_submit_on_ctrl_enter_is_true() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .submit_on_ctrl_enter
+                .set_value(true, ctx)
+                .expect("setting value must succeed");
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        let submitted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let submitted_clone = submitted.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| {
+                if let Event::SubmitCLIAgentInput { text } = event {
+                    submitted_clone.borrow_mut().push(text.clone());
+                }
+            });
+        });
+
+        // Insert some text so we can detect whether a newline was appended.
+        input.update(&mut app, |input, ctx| {
+            input.clear_buffer_and_reset_undo_stack(ctx);
+            input.user_insert("hello", ctx);
+        });
+
+        // Simulate the slash-commands menu being open.  In production this
+        // happens when the user types `/`; here we set it directly so the test
+        // doesn't depend on command-registry data being loaded.
+        input.update(&mut app, |input, ctx| {
+            input.suggestions_mode_model.update(ctx, |model, ctx| {
+                model.set_mode(InputSuggestionsMode::SlashCommands, ctx);
+            });
+        });
+
+        input.read(&app, |input, ctx| {
+            assert!(
+                matches!(
+                    input.suggestions_mode_model.as_ref(ctx).mode(),
+                    InputSuggestionsMode::SlashCommands
+                ),
+                "slash-commands mode should be active before Enter"
+            );
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.input_enter(ctx);
+        });
+
+        assert!(
+            submitted.borrow().is_empty(),
+            "Enter must NOT submit when the slash-commands menu is open"
+        );
+
+        input.read(&app, |input, ctx| {
+            let text = input.buffer_text(ctx);
+            assert!(
+                !text.contains('\n'),
+                "Enter must NOT insert a newline when the slash-commands menu is open \
+                 (submit_on_ctrl_enter=true); got buffer: {text:?}"
+            );
+        });
+    });
+}
+
+/// Pre-fix this failed because `update_cli_agent_enter_settings` always set `ctrl_enter: Emit`
+/// regardless of toggle, causing `ctrl_enter()` to hit the `_ => ()` no-op arm (#11588).
+#[test]
+fn ctrl_enter_inserts_newline_when_submit_on_ctrl_enter_is_false() {
+    use crate::editor::EnterAction;
+
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        // Ensure the setting is false (the default).
+        let default_value =
+            AISettings::handle(&app).read(&app, |settings, _| *settings.submit_on_ctrl_enter);
+        assert!(!default_value, "submit_on_ctrl_enter must default to false");
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        // Open the rich input — update_cli_agent_enter_settings fires.
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        input.read(&app, |input, ctx| {
+            let settings = input.editor().as_ref(ctx).enter_settings();
+            assert!(
+                matches!(settings.ctrl_enter, EnterAction::InsertNewLineIfMultiLine),
+                "with submit_on_ctrl_enter=false, ctrl_enter must be \
+                 InsertNewLineIfMultiLine when rich input is open; got Emit instead"
+            );
+        });
+    });
+}
+
+/// `unfreeze_agent_input` must NOT clear the buffer. The buffer is cleared via CRDT
+/// delete ops emitted by `system_clear_buffer` when `SentRequest` fires, which flow to
+/// both the server (for new viewers) and existing viewers (via `InputUpdated`).
+/// Clearing the buffer here would cause CRDT inconsistencies (see the function doc).
+#[test]
+fn unfreeze_agent_input_does_not_clear_buffer() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+
+        // Test for ActiveSharer
+        let (_, sharer_terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        sharer_terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.block_list_mut().set_bootstrapped();
+            model.set_shared_session_status(SharedSessionStatus::ActiveSharer);
+        });
+        let sharer_input = sharer_terminal.read(&app, |view, _| view.input().clone());
+
+        sharer_input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("help me write a test", ctx);
+        });
+        assert_eq!(
+            sharer_input.read(&app, |i, ctx| i.buffer_text(ctx)),
+            "help me write a test"
+        );
+
+        sharer_input.update(&mut app, |input, ctx| {
+            input.unfreeze_agent_input(false, ctx);
+        });
+
+        // Buffer must be unchanged — clearing is the responsibility of system_clear_buffer
+        // via the SentRequest event, not of this unfreeze function.
+        assert_eq!(
+            sharer_input.read(&app, |i, ctx| i.buffer_text(ctx)),
+            "help me write a test",
+            "unfreeze_agent_input must not clear the sharer's buffer"
+        );
+
+        // Same for ActiveViewer
+        let tips_model2 = app.add_model(|_| TipsCompleted::default());
+        let (_, viewer_terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model2, None, ctx)
+        });
+        viewer_terminal.update(&mut app, |view, _| {
+            let mut model = view.model.lock();
+            model.block_list_mut().set_bootstrapped();
+            model.set_shared_session_status(SharedSessionStatus::executor());
+        });
+        let viewer_input = viewer_terminal.read(&app, |view, _| view.input().clone());
+
+        viewer_input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("follow-up question", ctx);
+        });
+        assert_eq!(
+            viewer_input.read(&app, |i, ctx| i.buffer_text(ctx)),
+            "follow-up question"
+        );
+
+        viewer_input.update(&mut app, |input, ctx| {
+            input.unfreeze_agent_input(false, ctx);
+        });
+
+        assert_eq!(
+            viewer_input.read(&app, |i, ctx| i.buffer_text(ctx)),
+            "follow-up question",
+            "unfreeze_agent_input must not clear the viewer's buffer"
+        );
+    });
+}
+
+#[test]
+fn ctrl_enter_inserts_newline_in_normal_input_after_rich_input_closes() {
+    use crate::editor::EnterAction;
+
+    App::test((), |mut app| async move {
+        let _cli_agent_flag = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        open_rich_input_for_terminal(&terminal, &mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            let view_id = view.view_id();
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.close_input(view_id, false, ctx);
+            });
+        });
+
+        input.read(&app, |input, ctx| {
+            let settings = input.editor().as_ref(ctx).enter_settings();
+            assert!(
+                matches!(settings.ctrl_enter, EnterAction::InsertNewLineIfMultiLine),
+                "after Rich Input closes, ctrl_enter must be InsertNewLineIfMultiLine \
+                 (the default); got Emit instead"
+            );
+        });
+    });
+}
+
+/// Directly exercises `restore_cloud_followup_input_after_upload_failure`:
+/// after the editor is frozen into the loading state, calling the restore
+/// function must put the exact original prompt text back and leave the
+/// editor editable.
+#[test]
+fn restore_cloud_followup_input_after_upload_failure_restores_prompt() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        terminal.update(&mut app, |view, _| {
+            view.model.lock().block_list_mut().set_bootstrapped();
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        // Write a prompt that should survive a failed upload.
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content("cloud follow-up prompt", ctx);
+        });
+
+        // Freeze the editor (simulates the upload-in-progress loading state).
+        input.update(&mut app, |input, ctx| {
+            input.freeze_input_in_loading_state(ctx);
+        });
+        let frozen_text = input.read(&app, |i, ctx| i.buffer_text(ctx));
+        assert!(
+            frozen_text.contains("cloud follow-up prompt"),
+            "frozen text must contain the original prompt; got: {frozen_text:?}"
+        );
+        assert!(
+            frozen_text.contains('◌'),
+            "frozen text must contain the loading indicator '◌'; got: {frozen_text:?}"
+        );
+
+        // Simulate an upload failure restoring the input.
+        input.update(&mut app, |input, ctx| {
+            input.restore_cloud_followup_input_after_upload_failure("cloud follow-up prompt", ctx);
+        });
+
+        // The buffer must be restored to the original prompt without the loading marker.
+        assert_eq!(
+            input.read(&app, |i, ctx| i.buffer_text(ctx)),
+            "cloud follow-up prompt",
+            "restore must set the buffer back to the original prompt after upload failure"
+        );
+    });
+}
+
+#[test]
+fn should_upload_cloud_followup_attachments_matches_cloud_mode_image_context_flag() {
+    use base64::Engine as _;
+
+    let attachment = PendingAttachment::Image(ImageContext {
+        data: base64::engine::general_purpose::STANDARD.encode(b"fake image"),
+        mime_type: "image/png".to_string(),
+        file_name: "test.png".to_string(),
+        is_figma: false,
+    });
+
+    assert!(
+        !Input::should_upload_cloud_followup_attachments(&[]),
+        "no pending attachments should submit the text-only follow-up immediately"
+    );
+
+    let flag_guard = FeatureFlag::CloudModeImageContext.override_enabled(false);
+    assert!(
+        !Input::should_upload_cloud_followup_attachments(std::slice::from_ref(&attachment)),
+        "follow-up attachments should not upload while CloudModeImageContext is disabled"
+    );
+    drop(flag_guard);
+    let _flag_guard = FeatureFlag::CloudModeImageContext.override_enabled(true);
+    assert!(
+        Input::should_upload_cloud_followup_attachments(&[attachment]),
+        "follow-up attachments should upload when CloudModeImageContext is enabled"
+    );
+}
+
+/// Exercises the async failure path of `upload_files_then_submit_cloud_followup`:
+/// when the server API rejects the attachment upload (the test HTTP client never
+/// connects to a real server), the callback must restore the prompt text so the
+/// user can retry.
+#[test]
+fn upload_files_then_submit_cloud_followup_restores_input_on_upload_error() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let tips_model = app.add_model(|_| TipsCompleted::default());
+        let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        terminal.update(&mut app, |view, _| {
+            view.model.lock().block_list_mut().set_bootstrapped();
+        });
+        let input = terminal.read(&app, |view, _| view.input().clone());
+
+        let prompt = "attach and follow up".to_string();
+        input.update(&mut app, |input, ctx| {
+            input.replace_buffer_content(&prompt, ctx);
+        });
+
+        // A tiny base64-encoded image used as the test attachment.  The decode
+        // succeeds in the async task, but `prepare_attachments_for_upload` then
+        // fails because the test HTTP client has no real server to contact.
+        use base64::Engine as _;
+        let attachment = PendingAttachment::Image(ImageContext {
+            data: base64::engine::general_purpose::STANDARD.encode(b"fake image"),
+            mime_type: "image/png".to_string(),
+            file_name: "test.png".to_string(),
+            is_figma: false,
+        });
+        let task_id: crate::ai::ambient_agents::AmbientAgentTaskId =
+            "11111111-1111-1111-1111-111111111111".parse().unwrap();
+
+        // Spawn the upload and await the completion of its foreground callback
+        // (which runs after the background tokio task finishes — immediately
+        // with an error in this test environment).
+        let await_future = input.update(&mut app, |input, ctx| {
+            let handle = input.upload_files_then_submit_cloud_followup(
+                task_id,
+                prompt.clone(),
+                vec![attachment],
+                ctx,
+            );
+            ctx.await_spawned_future(handle.future_id())
+        });
+        await_future.await;
+
+        // After the upload error, the callback must have restored the prompt.
+        assert_eq!(
+            input.read(&app, |i, ctx| i.buffer_text(ctx)),
+            prompt,
+            "input must be restored to the original prompt after a failed attachment upload"
+        );
+    });
+}
+
+/// With the '#' AI Command Search trigger disabled (APP-5557), typing '#' at the start of the
+/// buffer must leave it (and any text typed after it) as literal input, and must not open AI
+/// Command Search — this is what lets the text be finished and submitted as a shell comment
+/// instead of trapping the user in the panel.
+#[test]
+fn hash_trigger_disabled_keeps_hash_literal_and_does_not_open_ai_command_search() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        InputSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .enable_ai_command_search_hash_trigger
+                .set_value(false, ctx)
+                .expect("setting value must succeed");
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        let open_count = Rc::new(RefCell::new(0));
+        let open_count_for_subscription = open_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| {
+                if matches!(event, Event::ShowCommandSearch(_)) {
+                    *open_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.user_insert("#", ctx);
+            input.user_insert(" this is a test comment", ctx);
+        });
+
+        input.read(&app, |input, ctx| {
+            assert_eq!(
+                input.buffer_text(ctx),
+                "# this is a test comment",
+                "the '#' and the text typed after it must remain literal input"
+            );
+        });
+        assert_eq!(
+            *open_count.borrow(),
+            0,
+            "AI Command Search must not open when the '#' trigger setting is disabled"
+        );
+    });
+}
+
+/// With the '#' trigger left at its default (enabled), typing '#' at the start of the buffer
+/// must still open AI Command Search, preserving pre-existing behavior.
+#[test]
+fn hash_trigger_enabled_by_default_opens_ai_command_search() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        let open_count = Rc::new(RefCell::new(0));
+        let open_count_for_subscription = open_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| {
+                if matches!(event, Event::ShowCommandSearch(_)) {
+                    *open_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.user_insert("#", ctx);
+        });
+
+        assert_eq!(
+            *open_count.borrow(),
+            1,
+            "AI Command Search must open on typing '#' when the trigger setting defaults to enabled"
+        );
+    });
+}
+
+#[test]
+fn hotkey_opens_ai_command_search_even_when_hash_trigger_disabled() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        InputSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .enable_ai_command_search_hash_trigger
+                .set_value(false, ctx)
+                .expect("setting value must succeed");
+        });
+
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        let open_count = Rc::new(RefCell::new(0));
+        let open_count_for_subscription = open_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event, _| {
+                if matches!(event, Event::ShowCommandSearch(_)) {
+                    *open_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.handle_action(&InputAction::ShowAiCommandSearch, ctx);
+        });
+
+        assert_eq!(
+            *open_count.borrow(),
+            1,
+            "the AI Command Search hotkey must still open the panel when the '#' trigger is disabled"
+        );
+    });
+}
+
+#[cfg(test)]
+mod completion_sources_resolution_tests {
+    use super::super::{CompletionSources, CompletionsTrigger, resolve_completion_sources};
+
+    #[test]
+    fn feature_flag_off_is_warp_only_regardless_of_toggles() {
+        for warp_completions_enabled in [true, false] {
+            for native_shell_completions_enabled in [true, false] {
+                assert_eq!(
+                    resolve_completion_sources(
+                        false,
+                        false,
+                        false,
+                        CompletionsTrigger::Keybinding,
+                        warp_completions_enabled,
+                        native_shell_completions_enabled,
+                    ),
+                    CompletionSources::WarpOnly,
+                    "flag off must resolve to WarpOnly (warp={warp_completions_enabled}, native={native_shell_completions_enabled})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ai_input_is_warp_only_regardless_of_flag_and_toggles() {
+        for feature_flag_enabled in [true, false] {
+            for warp_completions_enabled in [true, false] {
+                for native_shell_completions_enabled in [true, false] {
+                    assert_eq!(
+                        resolve_completion_sources(
+                            feature_flag_enabled,
+                            true,
+                            false,
+                            CompletionsTrigger::Keybinding,
+                            warp_completions_enabled,
+                            native_shell_completions_enabled,
+                        ),
+                        CompletionSources::WarpOnly,
+                        "AI input must resolve to WarpOnly (flag={feature_flag_enabled}, warp={warp_completions_enabled}, native={native_shell_completions_enabled})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn feature_flag_on_maps_the_four_toggle_states() {
+        let resolve = |warp_completions_enabled, native_shell_completions_enabled| {
+            resolve_completion_sources(
+                true,
+                false,
+                false,
+                CompletionsTrigger::Keybinding,
+                warp_completions_enabled,
+                native_shell_completions_enabled,
+            )
+        };
+        assert_eq!(resolve(true, true), CompletionSources::WarpThenNative);
+        assert_eq!(resolve(true, false), CompletionSources::WarpOnly);
+        assert_eq!(resolve(false, true), CompletionSources::NativeOnly);
+        assert_eq!(resolve(false, false), CompletionSources::None);
+    }
+
+    #[test]
+    fn as_you_type_never_selects_native_even_with_both_toggles_on() {
+        assert_eq!(
+            resolve_completion_sources(
+                true,  // feature flag on
+                false, // not AI input
+                false, // single-line
+                CompletionsTrigger::AsYouType,
+                true, // warp completions on
+                true, // native shell completions on
+            ),
+            CompletionSources::WarpOnly
+        );
+    }
+
+    // A multi-line buffer disables native completions even on a Tab trigger with both toggles on.
+    #[test]
+    fn multiline_buffer_never_selects_native() {
+        assert_eq!(
+            resolve_completion_sources(
+                true,  // feature flag on
+                false, // not AI input
+                true,  // multi-line
+                CompletionsTrigger::Keybinding,
+                true, // warp completions on
+                true, // native shell completions on
+            ),
+            CompletionSources::WarpOnly
+        );
+    }
 }

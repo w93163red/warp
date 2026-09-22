@@ -1,17 +1,15 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use channel_versions::VersionInfo;
 use instant::Duration;
 use warp_core::channel::{Channel, ChannelState};
 use warp_terminal::shell::ShellType;
 use warpui::ViewContext;
 
+use super::{DownloadReady, ReadyForRelaunch, release_assets_directory_url};
 use crate::workspace::Workspace;
-
-use super::release_assets_directory_url;
-use super::{DownloadReady, ReadyForRelaunch};
 
 lazy_static::lazy_static! {
     /// Stores the path to the current executable.
@@ -164,14 +162,11 @@ mod package_manager {
     use markdown_parser::{
         FormattedText, FormattedTextFragment, FormattedTextHeader, FormattedTextLine,
     };
-    use warpui::{
-        elements::{Container, FormattedTextElement, HighlightedHyperlink},
-        Element, SingletonEntity as _,
-    };
-
-    use crate::appearance::Appearance;
+    use warpui::elements::{Container, FormattedTextElement, HighlightedHyperlink};
+    use warpui::{Element, SingletonEntity as _};
 
     use super::*;
+    use crate::appearance::Appearance;
 
     pub struct AutoupdateContextBlock {
         package_manager: PackageManager,
@@ -397,7 +392,9 @@ impl PackageManager {
                     let cache_dir_str = cache_dir.display();
                     // Back up the existing pacman.conf file just in case
                     // anything goes wrong, then add the repository config.
-                    format!("mkdir -p {cache_dir_str}{and}\\\ncp /etc/pacman.conf {cache_dir_str}{and}\\\nsudo sh -c \"echo '\n[{repo_name}]\nServer = https://releases.warp.dev/linux/pacman/\\$repo/\\$arch' >> /etc/pacman.conf\"{and}\\\n")
+                    format!(
+                        "mkdir -p {cache_dir_str}{and}\\\ncp /etc/pacman.conf {cache_dir_str}{and}\\\nsudo sh -c \"echo '\n[{repo_name}]\nServer = https://releases.warp.dev/linux/pacman/\\$repo/\\$arch' >> /etc/pacman.conf\"{and}\\\n"
+                    )
                 } else {
                     String::new()
                 };
@@ -405,7 +402,9 @@ impl PackageManager {
                     // Retrieve our key from keys.openpgp.org and locally sign
                     // it before retrieving the package repository and
                     // installing the updated package.
-                    format!("sudo pacman-key -r \"linux-maintainers@warp.dev\" --keyserver hkp://keys.openpgp.org:80{and}\\\nsudo pacman-key --lsign-key \"linux-maintainers@warp.dev\"{and}\\\n")
+                    format!(
+                        "sudo pacman-key -r \"linux-maintainers@warp.dev\" --keyserver hkp://keys.openpgp.org:80{and}\\\nsudo pacman-key --lsign-key \"linux-maintainers@warp.dev\"{and}\\\n"
+                    )
                 } else {
                     String::new()
                 };

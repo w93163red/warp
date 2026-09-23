@@ -120,7 +120,7 @@ use crate::{
     ReferralThemeStatus, experiments,
 };
 
-fn pending_ctrl_r_handoff() -> PendingShellWidgetHandoff {
+fn pending_replace_handoff() -> PendingShellWidgetHandoff {
     PendingShellWidgetHandoff {
         session_id: SessionId::from(1),
         original_buffer: "draft".to_string(),
@@ -144,7 +144,7 @@ fn pending_ctrl_t_handoff() -> PendingShellWidgetHandoff {
 
 #[test]
 fn matching_shell_widget_handoff_selection_is_applied() {
-    let mut handoff = pending_ctrl_r_handoff();
+    let mut handoff = pending_replace_handoff();
     handoff.maybe_apply_selection(SessionId::from(1), "echo selected");
     assert_eq!(handoff.restore_text(), "echo selected");
 
@@ -155,14 +155,14 @@ fn matching_shell_widget_handoff_selection_is_applied() {
 
 #[test]
 fn unsolicited_or_stale_shell_widget_handoff_selection_is_ignored() {
-    let mut handoff = pending_ctrl_r_handoff();
+    let mut handoff = pending_replace_handoff();
     handoff.maybe_apply_selection(SessionId::from(2), "echo selected");
     assert_eq!(handoff.restore_text(), "draft");
 }
 
 #[test]
 fn empty_shell_widget_handoff_selection_keeps_original_buffer() {
-    let mut handoff = pending_ctrl_r_handoff();
+    let mut handoff = pending_replace_handoff();
     handoff.maybe_apply_selection(SessionId::from(1), "");
     assert_eq!(handoff.restore_text(), "draft");
 
@@ -2144,7 +2144,7 @@ async fn complete_ctrl_t_handoff(
     })
 }
 
-async fn complete_ctrl_r_handoff(
+async fn complete_replace_handoff(
     app: &mut App,
     original_buffer: &str,
     selection: Option<&str>,
@@ -2178,19 +2178,19 @@ async fn complete_ctrl_r_handoff(
 }
 
 #[test]
-fn ctrl_r_handoff_replace_lands_selection() {
+fn shell_widget_handoff_replace_lands_selection() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
-        let buffer = complete_ctrl_r_handoff(&mut app, "draft", Some("echo selected")).await;
+        let buffer = complete_replace_handoff(&mut app, "draft", Some("echo selected")).await;
         assert_eq!(buffer, "echo selected");
     });
 }
 
 #[test]
-fn ctrl_r_handoff_cancel_restores_draft() {
+fn shell_widget_handoff_cancel_restores_draft() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);
-        let buffer = complete_ctrl_r_handoff(&mut app, "draft", None).await;
+        let buffer = complete_replace_handoff(&mut app, "draft", None).await;
         assert_eq!(buffer, "draft");
     });
 }

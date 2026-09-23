@@ -551,23 +551,6 @@ function warp_escape_json
     string join \n $argv | command sed -E 's/(["\\\\])/\\\\\\1/g; s/'\b'/\\\\b/g; s/'\t'/\\\\t/g; s/'\f'/\\\\f/g; s/'\r'/\\\\r/g; $!s/$/\\\\n/' | command tr -d '\n'
 end
 
-# Reports the widget `^R` is bound to, if the user has rebound it away from fish's own
-# history search. Returns non-zero when `^R` is still on a fish default.
-function warp_external_ctrl_r_widget
-  # fish >= 4.0 renamed key specifications, so `bind` echoes back `ctrl-r` where earlier
-  # versions echo `\cr`.
-  set -l widget ""
-  for binding in (bind \cr 2>/dev/null)
-    if string match --quiet -- 'bind --preset *' "$binding"
-      continue
-    end
-    # Strip the leading `bind [-M <mode>] <key>`, leaving just the widget/command.
-    set widget (string replace --regex -- '^bind (-M \S+ +)?\S+ +' '' "$binding")
-  end
-  test -n "$widget"; or return 1
-  echo "$widget"
-end
-
 # Reports the widget `^T` is bound to, if the user has rebound it away from fish's default (no
 # binding at all). Returns non-zero when `^T` has no non-preset binding.
 function warp_external_ctrl_t_widget
@@ -580,27 +563,6 @@ function warp_external_ctrl_t_widget
   end
   test -n "$widget"; or return 1
   echo "$widget"
-end
-
-# Runs the shell's own ctrl-r history tool as a foreground command.
-function warp_run_external_ctrl_r_widget
-  set -l result ""
-  switch "$_WARP_EXTERNAL_CTRL_R_WIDGET"
-    case 'fzf-history-widget' '_fzf_search_history'
-      test -z "$fish_private_mode"; and builtin history merge
-      $_WARP_EXTERNAL_CTRL_R_WIDGET
-      set result (commandline | string collect)
-      commandline -r ''
-    case '_atuin_search'
-      # atuin writes its TUI to stdout and the selection to fd 3, so the two are swapped here to
-      # leave the UI on the terminal and capture only the selection.
-      set -l output (ATUIN_SHELL_FISH=t ATUIN_LOG=error atuin search -i 3>&1 1>&2 2>&3 | string collect)
-      # atuin prefixes the selection with __atuin_accept__: when `enter_accept` is on and the
-      # user pressed enter. Warp always inserts without executing, so the prefix is dropped.
-      set result (string replace "__atuin_accept__:" "" -- "$output" | string collect)
-  end
-  set -l warp_escaped_selection (warp_escape_json "$result")
-  warp_send_json_message "{ \"hook\": \"ExternalShellWidgetSelection\", \"value\": { \"buffer\": \"$warp_escaped_selection\", \"session_id\": $WARP_SESSION_ID } }"
 end
 
 function warp_ctrl_t_widget_result
@@ -626,8 +588,8 @@ function warp_run_external_ctrl_t_widget
   warp_send_json_message "{ \"hook\": \"ExternalShellWidgetSelection\", \"value\": { \"buffer\": \"$warp_escaped_selection\", \"session_id\": $WARP_SESSION_ID } }"
 end
 
-# Exclude the ctrl-r/ctrl-t external handoff helpers (see warp_run_external_ctrl_r_widget/
-# warp_run_external_ctrl_t_widget above) from the user's history.
+# Exclude the ctrl-t external handoff helper (see warp_run_external_ctrl_t_widget above) from
+# the user's history.
 #
 # fish only supports a single fish_should_add_to_history function (unlike zsh's array of
 # zshaddhistory hooks or bash's PROMPT_COMMAND-style stacking), so compose with any
@@ -640,12 +602,12 @@ end
 # shell reload, or a nested fish subshell), and a user or plugin can define or replace
 # fish_should_add_to_history at any point, including between two of our sourcings -- so on every
 # run, re-derive the backup from whatever fish_should_add_to_history currently is, unless that's
-# already our own wrapper from a previous run (identified by the warp_run_external_ctrl_r_widget
+# already our own wrapper from a previous run (identified by the warp_run_external_ctrl_t_widget
 # sentinel in its body), in which case the existing backup -- the last real hook we captured, or
 # the accept-everything default if none ever existed -- is left alone. Backing up our own wrapper
 # as if it were the original would make every history check call itself.
 if functions -q fish_should_add_to_history
-  and not functions fish_should_add_to_history | string match --quiet -- '*warp_run_external_ctrl_r_widget*'
+  and not functions fish_should_add_to_history | string match --quiet -- '*warp_run_external_ctrl_t_widget*'
   functions -q warp_original_fish_should_add_to_history; and functions -e warp_original_fish_should_add_to_history
   functions -c fish_should_add_to_history warp_original_fish_should_add_to_history
 else if not functions -q warp_original_fish_should_add_to_history
@@ -654,7 +616,6 @@ else if not functions -q warp_original_fish_should_add_to_history
   end
 end
 function fish_should_add_to_history
-  string match --quiet -- '*warp_run_external_ctrl_r_widget*' $argv[1]; and return 1
   string match --quiet -- '*warp_run_external_ctrl_t_widget*' $argv[1]; and return 1
   warp_original_fish_should_add_to_history $argv
 end
@@ -673,16 +634,6 @@ function warp_bootstrapped
   end
 
   set -l shell_plugins
-  set -g _WARP_EXTERNAL_CTRL_R_WIDGET ""
-  set -l warp_ctrl_r_widget (warp_external_ctrl_r_widget)
-  switch "$warp_ctrl_r_widget"
-    case 'fzf-history-widget' '_atuin_search' '_fzf_search_history'
-      if functions -q $warp_ctrl_r_widget
-        set -g _WARP_EXTERNAL_CTRL_R_WIDGET "$warp_ctrl_r_widget"
-        set -a shell_plugins external_ctrl_r_history
-      end
-  end
-
   set -g _WARP_EXTERNAL_CTRL_T_WIDGET ""
   set -l warp_ctrl_t_widget (warp_external_ctrl_t_widget)
   switch "$warp_ctrl_t_widget"

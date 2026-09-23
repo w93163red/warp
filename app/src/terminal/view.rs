@@ -724,22 +724,10 @@ pub const DEFAULT_ASK_AI_AUTOSUGGESTION_TEXT: &str = "What happened here?";
 
 const WARP_MD_PATH: &str = "WARP.md";
 
-/// `shell_plugins` tag reported by bootstrap when the shell's `^R` binding has been rebound away
-/// from its default reverse-history-search widget (e.g. by fzf or atuin). Must match the tag
-/// name used in `app/assets/bundled/bootstrap/zsh_body.sh`.
-const EXTERNAL_CTRL_R_HISTORY_PLUGIN_TAG: &str = "external_ctrl_r_history";
-
 /// `shell_plugins` tag reported by bootstrap when the shell's `^T` binding has been rebound away
-/// from its default line-editor binding to an external file-search widget (e.g. fzf). Independent
-/// of [`EXTERNAL_CTRL_R_HISTORY_PLUGIN_TAG`] -- a shell can have either, both, or neither, since
-/// each binding is detected and reported on its own. Must match the tag name used in
-/// `app/assets/bundled/bootstrap/zsh_body.sh`.
+/// from its default line-editor binding to an external file-search widget (e.g. fzf). Must match
+/// the tag name used in `app/assets/bundled/bootstrap/zsh_body.sh`.
 const EXTERNAL_CTRL_T_FILE_PLUGIN_TAG: &str = "external_ctrl_t_file";
-
-/// Name of the bootstrap-installed shell function invoked to hand ctrl-r off to the shell's
-/// own external history widget. Must match the function name defined in
-/// `app/assets/bundled/bootstrap/zsh_body.sh`.
-const EXTERNAL_CTRL_R_HELPER_COMMAND: &str = "warp_run_external_ctrl_r_widget";
 
 /// Name of the bootstrap-installed shell function invoked to hand ctrl-t off to the shell's own
 /// external file-search widget. Must match the function name defined in
@@ -9598,52 +9586,10 @@ impl TerminalView {
             && !model.is_read_only()
     }
 
-    /// If ctrl-r was pressed at an idle prompt on a session whose shell has rebound `^R` away
-    /// from its default reverse-history-search widget (reported via the
-    /// [`EXTERNAL_CTRL_R_HISTORY_PLUGIN_TAG`] shell plugin tag, e.g. by fzf or atuin), hands the
-    /// keypress off to that widget instead of opening Warp's own command search.
-    ///
-    /// Returns `true` if the handoff was triggered, in which case the caller should not open
-    /// Warp's command search.
-    pub fn maybe_trigger_external_ctrl_r_history_search(
-        &mut self,
-        ctx: &mut ViewContext<Self>,
-    ) -> bool {
-        if !FeatureFlag::ShellWidgetHandoff.is_enabled() || self.is_long_running() {
-            return false;
-        }
-        let Some(session_id) = self.active_block_session_id() else {
-            return false;
-        };
-        let has_external_ctrl_r_widget =
-            self.sessions
-                .as_ref(ctx)
-                .get(session_id)
-                .is_some_and(|session| {
-                    session
-                        .shell()
-                        .plugins()
-                        .contains(EXTERNAL_CTRL_R_HISTORY_PLUGIN_TAG)
-                });
-        if !has_external_ctrl_r_widget || self.model.lock().is_alt_screen_active() {
-            return false;
-        }
-
-        self.input.update(ctx, |input, ctx| {
-            input.trigger_external_shell_widget_handoff(
-                EXTERNAL_CTRL_R_HELPER_COMMAND,
-                ShellWidgetApplyMode::Replace,
-                false, /* capture_cursor */
-                ctx,
-            )
-        })
-    }
-
     /// If ctrl-t was pressed at an idle prompt on a session whose shell has rebound `^T` to an
     /// external file-search widget (reported via the [`EXTERNAL_CTRL_T_FILE_PLUGIN_TAG`] shell
-    /// plugin tag, e.g. by fzf), hands the keypress off to that widget. Mirrors
-    /// [`Self::maybe_trigger_external_ctrl_r_history_search`], but lands the selection either by
-    /// inserting it into the input editor at the cursor position or by replacing the whole
+    /// plugin tag, e.g. by fzf), hands the keypress off to that widget. The selection lands either
+    /// by being inserted into the input editor at the cursor position or by replacing the whole
     /// buffer, depending on the session's shell; see [`Input::trigger_external_shell_widget_handoff`]
     /// and [`ShellWidgetApplyMode`].
     ///

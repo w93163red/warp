@@ -173,9 +173,13 @@ define_settings_group!(TerminalSettings, settings: [
     },
     // This field should not be referenced directly to check zero state block visibility -- use
     // the `should_show_zero_state_block()` getter, which also considers global AI enablement.
+    //
+    // Off by default in this fork: the block is an agent onboarding guide that
+    // appears in every new terminal session until dismissed, so it shows up on
+    // every launch. It can still be turned back on in settings.
     show_terminal_zero_state_block: ShowTerminalZeroStateBlock {
         type: bool,
-        default: true,
+        default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         surface: settings::SettingSurfaces::GUI,

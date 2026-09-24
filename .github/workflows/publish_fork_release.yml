@@ -9,10 +9,11 @@
 #
 # What this needs instead: nothing but the automatic GITHUB_TOKEN.
 #
-# The runner also supplies a complete Xcode, which is the practical reason to
-# build here rather than locally -- `crates/warpui/build.rs` shells out to
-# `xcrun metal`, and the Metal Toolchain is a separately downloaded component
-# that a local Xcode may not have.
+# Releases are also published by hand, from a local build signed with a real
+# Apple Development certificate. Creating such a release pushes its tag, which
+# triggers this workflow; a runner has no certificate, so its build would be
+# ad-hoc signed. To avoid replacing the better artifact, a tag whose release
+# already has assets is left alone.
 name: Publish fork release
 
 on:
@@ -25,6 +26,11 @@ on:
         description: Tag to create the release at (e.g. lx-term-v0.1.0).
         required: true
         type: string
+      publish:
+        description: Attach the build to a release. Off builds and uploads a workflow artifact only.
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -34,15 +40,60 @@ jobs:
     name: Build and publish macOS app
     runs-on: macos-latest
     steps:
+      - name: Check whether this tag is already published
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          skip=false
+          if [ "${{ github.event_name }}" = push ]; then
+            assets="$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq '.assets | length' 2>/dev/null || echo 0)"
+            if [ "$assets" -gt 0 ]; then
+              echo "::notice::$TAG already has $assets asset(s), presumably from a local build; not rebuilding."
+              skip=true
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
+        if: steps.check.outputs.skip != 'true'
         with:
           lfs: true
 
       - uses: ./.github/actions/prepare_environment
+        if: steps.check.outputs.skip != 'true'
         with:
           target_os: macos
           is_self_hosted: "false"
           install_release_deps: "true"
+
+      # Same bundling tools upstream's create_release.yml installs.
+      - name: Install cargo-bundle
+        if: steps.check.outputs.skip != 'true'
+        run: ./script/install_cargo_bundle
+
+      - name: Install create-dmg
+        if: steps.check.outputs.skip != 'true'
+        run: brew install create-dmg
+
+      # create-dmg lays out the DMG window by scripting Finder, which is known to
+      # time out on CI (https://github.com/create-dmg/create-dmg/issues/72) and
+      # did so on a local run too. script/macos/bundle only passes
+      # --skip-jenkins on upstream's own runners, so wrap create-dmg to always
+      # pass it. The DMG is still built; only its window styling is skipped.
+      - name: Skip create-dmg's Finder styling
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          real="$(brew --prefix)/bin/create-dmg"
+          shim_dir="$RUNNER_TEMP/create-dmg-shim"
+          mkdir -p "$shim_dir"
+          printf '#!/bin/bash\nexec "%s" --skip-jenkins "$@"\n' "$real" > "$shim_dir/create-dmg"
+          chmod +x "$shim_dir/create-dmg"
+          echo "$shim_dir" >> "$GITHUB_PATH"
 
       # `--channel oss` names the binary, bundle and CLI `lx-term` and drops the
       # crash_reporting feature, so no Sentry SDK is linked in.
@@ -54,39 +105,40 @@ jobs:
       #   xattr -dr com.apple.quarantine /Applications/lx-term.app
       # or a right-click -> Open on first launch.
       - name: Bundle
+        if: steps.check.outputs.skip != 'true'
         run: ./script/bundle --channel oss --selfsign
 
       - name: Collect artifacts
-        id: artifacts
+        if: steps.check.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          # The bundle script picks the profile directory, so discover the
-          # output rather than hard-coding a profile that may change.
+          # The bundle script picks the profile and arch directories, so
+          # discover the outputs rather than hard-coding either.
           mkdir -p dist
-          found=false
-          while IFS= read -r artifact; do
-            cp "$artifact" dist/
-            found=true
-          done < <(find target -path '*/bundle/osx/*' \( -name '*.dmg' -o -name '*.zip' \) -type f)
-          if [ "$found" = false ]; then
-            echo "No macOS bundle artifact was produced." >&2
-            find target -path '*/bundle/osx/*' -maxdepth 6 >&2 || true
+          app="$(find target -path '*/bundle/osx/lx-term.app' -maxdepth 6 -type d | head -1)"
+          if [ -z "$app" ]; then
+            echo "No lx-term.app was produced." >&2
             exit 1
           fi
+          # Zip the app as well as shipping the DMG, matching the hand-published
+          # releases. ditto keeps the signature and extended attributes intact.
+          ditto -c -k --sequesterRsrc --keepParent "$app" dist/lx-term-macos-universal.zip
+          find target -path '*/bundle/osx/dmg/*' -name 'lx-term.dmg' -type f -exec cp {} dist/ \;
           ls -la dist
-          echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.skip != 'true'
         with:
           name: lx-term-macos
           path: dist/*
 
       - name: Publish release
+        if: steps.check.outputs.skip != 'true' && (github.event_name == 'push' || inputs.publish)
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.check.outputs.tag }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.artifacts.outputs.tag }}"
           # `--generate-notes` is deliberately omitted: this fork's history is a
           # merge of thousands of upstream commits, so generated notes would be
           # noise rather than a changelog.
@@ -95,5 +147,5 @@ jobs:
           else
             gh release create "$TAG" dist/* \
               --title "lx-term $TAG" \
-              --notes "Unsigned, ad-hoc signed macOS build of this fork. On first launch: \`xattr -dr com.apple.quarantine /Applications/lx-term.app\`"
+              --notes "Ad-hoc signed macOS build of this fork, built by CI. On first launch: \`xattr -dr com.apple.quarantine /Applications/lx-term.app\`"
           fi

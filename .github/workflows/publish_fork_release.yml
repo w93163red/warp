@@ -1,0 +1,99 @@
+# Builds the lx-term macOS app on a GitHub-hosted runner and attaches it to a
+# release on this fork.
+#
+# This exists because upstream's `create_release.yml` cannot run here: it signs
+# with Warp's Apple Developer identity, uploads to Warp's GCS bucket and reads a
+# private channel-config repo. None of those secrets exist on a fork, and this
+# fork ships without autoupdate or crash reporting, so the parts that feed those
+# services would be dead weight anyway.
+#
+# What this needs instead: nothing but the automatic GITHUB_TOKEN.
+#
+# The runner also supplies a complete Xcode, which is the practical reason to
+# build here rather than locally -- `crates/warpui/build.rs` shells out to
+# `xcrun metal`, and the Metal Toolchain is a separately downloaded component
+# that a local Xcode may not have.
+name: Publish fork release
+
+on:
+  push:
+    tags:
+      - "lx-term-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to create the release at (e.g. lx-term-v0.1.0).
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: Build and publish macOS app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: ./.github/actions/prepare_environment
+        with:
+          target_os: macos
+          is_self_hosted: "false"
+          install_release_deps: "true"
+
+      # `--channel oss` names the binary, bundle and CLI `lx-term` and drops the
+      # crash_reporting feature, so no Sentry SDK is linked in.
+      #
+      # `--selfsign` uses a local Apple Development certificate when one exists
+      # and otherwise falls back to ad-hoc signing. A hosted runner has no
+      # certificate, so the result is ad-hoc signed: fine to run yourself, but
+      # not notarized, so Gatekeeper needs one of
+      #   xattr -dr com.apple.quarantine /Applications/lx-term.app
+      # or a right-click -> Open on first launch.
+      - name: Bundle
+        run: ./script/bundle --channel oss --selfsign
+
+      - name: Collect artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+          # The bundle script picks the profile directory, so discover the
+          # output rather than hard-coding a profile that may change.
+          mkdir -p dist
+          found=false
+          while IFS= read -r artifact; do
+            cp "$artifact" dist/
+            found=true
+          done < <(find target -path '*/bundle/osx/*' \( -name '*.dmg' -o -name '*.zip' \) -type f)
+          if [ "$found" = false ]; then
+            echo "No macOS bundle artifact was produced." >&2
+            find target -path '*/bundle/osx/*' -maxdepth 6 >&2 || true
+            exit 1
+          fi
+          ls -la dist
+          echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lx-term-macos
+          path: dist/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.artifacts.outputs.tag }}"
+          # `--generate-notes` is deliberately omitted: this fork's history is a
+          # merge of thousands of upstream commits, so generated notes would be
+          # noise rather than a changelog.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "lx-term $TAG" \
+              --notes "Unsigned, ad-hoc signed macOS build of this fork. On first launch: \`xattr -dr com.apple.quarantine /Applications/lx-term.app\`"
+          fi

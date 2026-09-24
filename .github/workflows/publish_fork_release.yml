@@ -123,7 +123,16 @@ jobs:
           # Zip the app as well as shipping the DMG, matching the hand-published
           # releases. ditto keeps the signature and extended attributes intact.
           ditto -c -k --sequesterRsrc --keepParent "$app" dist/lx-term-macos-universal.zip
-          find target -path '*/bundle/osx/dmg/*' -name 'lx-term.dmg' -type f -exec cp {} dist/ \;
+          # The bundle script copies the finished DMG to
+          # target/<profile>/bundle/osx/. The copy it builds under
+          # .../bundle/osx/dmg/ is deleted by its own exit trap, which removes
+          # every *.dmg there, so it must not be looked for.
+          dmg="$(find target -path '*/bundle/osx/lx-term.dmg' -type f | head -1)"
+          if [ -z "$dmg" ]; then
+            echo "No lx-term.dmg was produced." >&2
+            exit 1
+          fi
+          cp "$dmg" dist/
           ls -la dist
 
       - uses: actions/upload-artifact@v4

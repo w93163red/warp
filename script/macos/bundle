@@ -1015,7 +1015,13 @@ if [[ "$ARTIFACT" = app ]]; then
     echo "Cleaning up any existing DMG files before creating new ones..."
     cleanup_dmg_files "$DMG_DIR"
 
-    create_warp_dmg "$BUNDLE_DIR"
+    # Stage just the app, as the codesigning branch above does. Building the
+    # DMG from $BUNDLE_DIR itself would also pack $DMG_DIR, which lives inside
+    # it, so the mounted image showed a stray `dmg` folder next to the app.
+    rm -rf "${DMG_DIR:?}/$WARP_APP_NAME.app"
+    cp -R "$BUNDLE_DIR/$WARP_APP_NAME.app" "$DMG_DIR"
+
+    create_warp_dmg "$DMG_DIR"
   fi
 fi
 

@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::pin;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -90,6 +90,7 @@ use crate::terminal::view::shared_session::ConversationEndedTombstoneView;
 use crate::terminal::{
     CLIAgent, MockTerminalManager, TerminalManager, TerminalModel, should_right_click_paste,
 };
+use crate::test_util::billing_unit::set_charge_unit;
 use crate::test_util::terminal::{
     add_window_with_id_and_terminal, initialize_app_for_terminal_view,
 };
@@ -98,6 +99,7 @@ use crate::view_components::find::FindWithinBlockState;
 use crate::workspace::view::tests::{initialize_app as initialize_workspace_app, mock_workspace};
 use crate::workspace::{ToastStack, WorkspaceAction};
 use crate::workspaces::user_workspaces::TeamlessScopeForTest;
+use crate::workspaces::workspace::ChargeUnit;
 
 fn add_window_with_cloud_mode_terminal(app: &mut App) -> ViewHandle<TerminalView> {
     let tips_model = app.add_model(|_| Default::default());
@@ -2096,6 +2098,53 @@ fn is_passive_conversation_is_false_for_a_directly_issued_user_query() {
 }
 
 #[test]
+fn turn_panel_does_not_insert_a_block_after_its_footer() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        set_charge_unit(&mut app, ChargeUnit::Cents);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let ai_block = terminal.update(&mut app, |view, ctx| {
+            view.insert_dummy_ai_block("query".to_string(), "response".to_string(), ctx)
+        });
+
+        let initial_content_ids = terminal.read(&app, |view, _| {
+            view.rich_content_views
+                .iter()
+                .map(|content| content.view_id())
+                .collect::<Vec<_>>()
+        });
+
+        ai_block.update(&mut app, |block, ctx| {
+            block.handle_action(&AIBlockAction::ToggleIsTurnPanelExpanded, ctx);
+        });
+        terminal.read(&app, |view, _| {
+            assert!(view.turn_panel_view_ids.contains_key(&ai_block.id()));
+            assert_eq!(
+                view.rich_content_views
+                    .iter()
+                    .map(|content| content.view_id())
+                    .collect::<Vec<_>>(),
+                initial_content_ids
+            );
+        });
+
+        ai_block.update(&mut app, |block, ctx| {
+            block.handle_action(&AIBlockAction::ToggleIsTurnPanelExpanded, ctx);
+        });
+        terminal.read(&app, |view, _| {
+            assert!(!view.turn_panel_view_ids.contains_key(&ai_block.id()));
+            assert_eq!(
+                view.rich_content_views
+                    .iter()
+                    .map(|content| content.view_id())
+                    .collect::<Vec<_>>(),
+                initial_content_ids
+            );
+        });
+    })
+}
+
+#[test]
 fn is_passive_conversation_is_recomputed_on_conversation_reassignment() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
@@ -3802,6 +3851,7 @@ fn cloud_mode_dispatched_agent_inserts_queued_user_query() {
                 .update(ctx, |model, ctx| {
                     model.spawn_agent_with_request(
                         SpawnAgentRequest {
+                            metadata: Default::default(),
                             prompt: Some("write the tests".to_string()),
                             mode: UserQueryMode::Normal,
                             config: None,
@@ -8564,6 +8614,34 @@ fn submit_cli_agent_rich_input_opencode_defers_enter_and_close() {
             "carriage return should be written after delay"
         );
         assert_eq!(pty_writes.borrow()[1], b"\r");
+    })
+}
+
+#[test]
+fn submit_cli_agent_rich_input_muse_uses_bracketed_paste() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        let (_terminal, pty_writes) =
+            submit_rich_input_and_collect_pty_writes(&mut app, CLIAgent::Muse, "hello");
+
+        let writes = pty_writes.borrow();
+        assert_eq!(
+            writes.len(),
+            2,
+            "expected 2 PTY writes, got {}",
+            writes.len()
+        );
+
+        let mut expected_paste =
+            Vec::with_capacity(BRACKETED_PASTE_START.len() + 5 + BRACKETED_PASTE_END.len());
+        expected_paste.extend_from_slice(BRACKETED_PASTE_START);
+        expected_paste.extend_from_slice(b"hello");
+        expected_paste.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(writes[0], expected_paste);
+        assert_eq!(writes[1], b"\r");
     })
 }
 

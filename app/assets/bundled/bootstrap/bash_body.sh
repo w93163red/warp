@@ -971,16 +971,38 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         READLINE_LINE=""
     }
 
-    # Runs the shell's own ctrl-t file-search widget as a foreground command.
-    warp_run_external_ctrl_t_widget () {
+    # Runs the shell's ctrl-r history widget as a foreground command.
+    warp_run_external_ctrl_r_widget () {
         local result=""
-        case "$_WARP_EXTERNAL_CTRL_T_WIDGET" in
-          fzf-file-widget)
-            result="$(__fzf_select__)"
+        case "$_WARP_EXTERNAL_CTRL_R_WIDGET" in
+          __fzf_history__)
+            result="$(__fzf_history__)"
+            ;;
+          __atuin_history)
+            # Bypass atuin's own bash key-binding machinery entirely and invoke the underlying
+            # `atuin search` command directly, exactly as atuin's own integration does
+            # (__atuin_search_cmd's non-tmux branch).
+            result="$(ATUIN_SHELL=bash atuin search -i 3>&1 1>&2 2>&3 3>&-)"
+            # If the user has atuin's enter_accept config on, Enter both selects and runs the
+            # command, signaled by this prefix; we only ever want the selection, never to run
+            # it, so strip the prefix in both cases (see atuin's __atuin_history for the same
+            # check).
+            result="${result#__atuin_accept__:}"
             ;;
         esac
         local warp_escaped_selection="$(warp_escape_json "$result")"
         warp_send_json_message "{ \"hook\": \"ExternalShellWidgetSelection\", \"value\": { \"buffer\": \"$warp_escaped_selection\", \"session_id\": $WARP_SESSION_ID } }"
+    }
+
+    # Runs fzf's ctrl-t file-search widget as a foreground command.
+    warp_run_external_ctrl_t_widget () {
+        local result="$(__fzf_select__)"
+        local warp_escaped_selection="$(warp_escape_json "$result")"
+        warp_send_json_message "{ \"hook\": \"ExternalShellWidgetSelection\", \"value\": { \"buffer\": \"$warp_escaped_selection\", \"session_id\": $WARP_SESSION_ID } }"
+    }
+
+    warp_run_external_alt_c_widget () {
+        eval "$(__fzf_cd__)"
     }
 
     # Check whether the prompt-related variables have OSC prompt marker sequences,
@@ -1426,9 +1448,9 @@ esac
     # HISTIGNORE value which may been set in an RC file sourced above. It is important to
     # ensure that this happens _after_ the user's RC files have been sourced.
     if [[ ! -z $HISTIGNORE ]]; then
-        HISTIGNORE="*warp_run_generator_command*:*warp_run_external_ctrl_t_widget*:$HISTIGNORE"
+        HISTIGNORE="*warp_run_generator_command*:*warp_run_external_ctrl_r_widget*:*warp_run_external_ctrl_t_widget*:*warp_run_external_alt_c_widget*:$HISTIGNORE"
     else
-        HISTIGNORE="*warp_run_generator_command*:*warp_run_external_ctrl_t_widget*"
+        HISTIGNORE="*warp_run_generator_command*:*warp_run_external_ctrl_r_widget*:*warp_run_external_ctrl_t_widget*:*warp_run_external_alt_c_widget*"
     fi
 
     # If the user has PROMPT_COMMAND set in their bootstrap scripts,
@@ -1543,17 +1565,37 @@ esac
 
     shell_plugins=()
 
+    # Detect whether ctrl-r has been rebound to fzf's or atuin's bash history widget.
+    _WARP_EXTERNAL_CTRL_R_WIDGET=""
     if [ "$WARP_IN_MSYS2" = false ]; then
-      _WARP_EXTERNAL_CTRL_T_WIDGET=""
-      warp_ctrl_t_binding="$(bind -X 2>/dev/null | command -p sed -n 's/^"\\C-t"[ :] *"\(.*\)"$/\1/p')"
-      case "$warp_ctrl_t_binding" in
-        fzf-file-widget)
-          if declare -F __fzf_select__ >/dev/null; then
-            _WARP_EXTERNAL_CTRL_T_WIDGET="$warp_ctrl_t_binding"
-            shell_plugins+=(external_ctrl_t_file)
-          fi
+      warp_ctrl_r_binding="$(bind -X 2>/dev/null | command -p sed -n 's/^"\\C-r"[ :] *"\(.*\)"$/\1/p')"
+      if [ -z "$warp_ctrl_r_binding" ] && declare -F __fzf_history__ >/dev/null; then
+        warp_ctrl_r_macro="$(bind -s 2>/dev/null | command -p sed -n 's/^"\\C-r"[ :] *"\(.*\)"$/\1/p')"
+        case "$warp_ctrl_r_macro" in
+          *'`__fzf_history__`'*)
+            warp_ctrl_r_binding="__fzf_history__"
+            ;;
+        esac
+      fi
+      case "$warp_ctrl_r_binding" in
+        __fzf_history__)
+          _WARP_EXTERNAL_CTRL_R_WIDGET="$warp_ctrl_r_binding"
+          shell_plugins+=(fzf)
+          ;;
+        __atuin_history)
+          _WARP_EXTERNAL_CTRL_R_WIDGET="$warp_ctrl_r_binding"
+          shell_plugins+=(atuin)
           ;;
       esac
+      # atuin >= 18.10 binds ctrl-r through the indirect dispatcher above rather than a plain
+      # `bind -x`. Instead use atuin's own init-time flag ($__atuin_bind_ctrl_r) plus
+        # __atuin_history being defined.
+      # shellcheck disable=SC2154
+      if [ -z "$_WARP_EXTERNAL_CTRL_R_WIDGET" ] && [ "$__atuin_bind_ctrl_r" = true ] &&
+        declare -F __atuin_history >/dev/null; then
+        _WARP_EXTERNAL_CTRL_R_WIDGET="__atuin_history"
+        shell_plugins+=(atuin)
+      fi
     fi
 
     function warp_bootstrapped () {

@@ -1,10 +1,19 @@
+use std::fs;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use chrono::Utc;
 use clap::Parser;
 use cloud_object_models::CodeForge;
+use command::blocking::Command as ProcessCommand;
+use futures::FutureExt;
+use http::StatusCode;
+use mockito::{Matcher, Server};
 use serde_json::json;
 use warp_cli::agent::{
-    AgentCommand, Harness, OutputFormat, RepositoryForge, RepositoryHeadRef,
+    AgentCommand, Harness, HarnessTransport, OutputFormat, RepositoryForge, RepositoryHeadRef,
     RepositoryPreparationOverride, RunAgentArgs,
 };
 use warp_cli::artifact::{
@@ -12,6 +21,7 @@ use warp_cli::artifact::{
 };
 use warp_cli::task::{MessageCommand, MessageSendArgs, MessageWatchArgs, TaskCommand};
 use warp_cli::{Args, CliCommand, Command};
+use warp_core::features::FeatureFlag;
 use warp_core::telemetry::TelemetryEvent;
 use warp_graphql::ai::AgentTaskState;
 use warpui::{App, SingletonEntity, WindowId};
@@ -19,27 +29,383 @@ use warpui::{App, SingletonEntity, WindowId};
 use super::{
     AgentDriverRunner, CommandAuthentication, command_authentication, command_requires_auth,
     command_to_telemetry_event, reconcile_task_harness, resolve_agent_driver_team_scope,
-    team_scope_for_task_scope, validated_driver_repositories_for_preparation,
+    selected_execution_skills,
 };
-use crate::ai::agent_sdk::driver::{AgentDriverError, AgentDriverOptions};
-use crate::ai::ambient_agents::task::TaskScope;
+use crate::ai::agent_sdk::driver::environment::WorkspaceConfiguration;
+use crate::ai::agent_sdk::driver::harness::HarnessKind;
+use crate::ai::agent_sdk::driver::{AgentDriverError, AgentDriverOptions, AgentRunPrompt, Task};
+use crate::ai::ambient_agents::task::{
+    AmbientAgentTask, AmbientAgentTaskState, TaskAttachment, TaskScope,
+};
 use crate::ai::cloud_environments::{AmbientAgentEnvironment, SourceRepo};
+use crate::ai::skills::ResolvedSkill;
 use crate::auth::AuthStateProvider;
 use crate::auth::user::{PrincipalType, User};
 use crate::network::NetworkStatus;
 use crate::root_view::NewWorkspaceSource;
+use crate::server::graphql::GraphQLError;
 use crate::server::ids::ServerId;
 use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::ai::{AIClient, AgentConfigSnapshot, MockAIClient};
+use crate::server::server_api::managed_secrets::AppManagedSecretManager;
 use crate::server::server_api::team::MockTeamClient;
 use crate::server::server_api::workspace::MockWorkspaceClient;
+use crate::settings::PrivacySettings;
 use crate::workspaces::team::{Team, TeamVisibility};
 use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
-use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
-use crate::workspaces::workspace::{Workspace, WorkspaceUid};
+#[cfg(not(target_family = "wasm"))]
+use crate::workspaces::update_manager::WorkspaceMetadataRetryPolicy;
+use crate::workspaces::user_workspaces::{
+    HeadlessTeamScope, TeamScope, UserWorkspaces, WorkspacesMetadataResponse,
+    WorkspacesMetadataWithPricing,
+};
+use crate::workspaces::workspace::{ChargeUnit, UserTier, Workspace, WorkspaceUid};
 
 const TASK_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+#[test]
+fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
+    App::test((), |mut app| async move {
+        let root = tempfile::TempDir::new().unwrap();
+        let args =
+            parse_run_agent_args(&["agent", "run", "--task-id", TASK_ID, "--execution-id", "42"]);
+        let eager_repository = json!([{
+            "forge": "GITHUB", "owner": "acme", "name": "api",
+            "ref": {"type": "BRANCH", "value": "feature"},
+            "cloneFrom": null, "preserveOrigin": true,
+        }]);
+        for (use_factory_repositories, eager, deferred_forge) in [
+            (true, json!([]), "GITLAB"),
+            (true, eager_repository.clone(), "GITLAB"),
+            (false, eager_repository, "UNSUPPORTED_FORGE"),
+        ] {
+            let expected_eager_count = eager.as_array().unwrap().len();
+            let config = serde_json::from_value(json!({
+                "taskId": TASK_ID, "executionId": "42", "harness": "OZ",
+                "conversationId": null, "parentRunId": null, "teamId": null, "modelId": null,
+                "reasoningLevel": null, "profileId": null, "computerUseModelId": null,
+                "inferenceProviders": null, "providers": null,
+                "idleOnCompleteSeconds": null, "idleOnFailSeconds": null,
+                "mcpServersJson": "{}", "skills": [], "factorySkillDirs": [],
+                "computerUseEnabled": false, "repositories": eager,
+                "deferredRepositories": [{
+                    "codeForge": deferred_forge, "owner": "platform/backend", "repo": "api",
+                }],
+                "setupCommands": [], "sessionSharingAcls": [],
+                "skipInitialTurn": false, "snapshotDisabled": false,
+            }))
+            .unwrap();
+            let (options, _, _, _) = app.update(|ctx| {
+                super::build_execution_task_and_options(
+                    &args,
+                    config,
+                    use_factory_repositories,
+                    root.path().to_path_buf(),
+                    None,
+                    Vec::new(),
+                    ctx,
+                )
+                .unwrap()
+            });
+            assert_eq!(options.workspace.source_repos.len(), expected_eager_count);
+            assert_eq!(options.use_factory_repositories, use_factory_repositories);
+            if expected_eager_count != 0 {
+                assert_eq!(
+                    options.workspace.source_repos,
+                    vec![SourceRepo::new(
+                        CodeForge::GitHub,
+                        "acme".into(),
+                        "api".into(),
+                    )]
+                );
+            }
+            if use_factory_repositories {
+                assert_eq!(
+                    options.workspace.deferred_repos,
+                    vec![SourceRepo::new(
+                        CodeForge::GitLab,
+                        "platform/backend".into(),
+                        "api".into(),
+                    )]
+                );
+            } else {
+                assert!(options.workspace.deferred_repos.is_empty());
+            }
+            assert_eq!(options.workspace.factory_skill_dirs, Some(Vec::new()));
+        }
+    });
+}
+
+#[test]
+fn paired_execution_retains_deferred_capability_through_task_setup() {
+    for scenario in ["eager", "deferred", "empty"] {
+        let output = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ai::agent_sdk::tests::deferred_capability_bootstrap_subprocess",
+                "--nocapture",
+            ])
+            .env("WARP_TEST_DEFERRED_CAPABILITY_SCENARIO", scenario)
+            .env("WARP_ISOLATION_PLATFORM", "docker")
+            .env("WARP_WORKLOAD_TOKEN", "test-workload-token")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{scenario}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn deferred_capability_bootstrap_subprocess() {
+    let Ok(scenario) = std::env::var("WARP_TEST_DEFERRED_CAPABILITY_SCENARIO") else {
+        return;
+    };
+    let use_factory_repositories = scenario != "eager";
+    let eager = if use_factory_repositories {
+        json!([])
+    } else {
+        json!([{
+            "forge": "GITLAB", "owner": "platform/backend", "name": "api",
+            "ref": null, "cloneFrom": null, "preserveOrigin": true,
+        }])
+    };
+    let deferred = if scenario == "deferred" {
+        json!([{"codeForge": "GITLAB", "owner": "platform/backend", "repo": "api"}])
+    } else {
+        json!([])
+    };
+    let config = json!({
+        "taskId": TASK_ID, "executionId": "42", "harness": "OZ",
+        "conversationId": null, "parentRunId": null, "teamId": null, "modelId": null,
+        "reasoningLevel": null, "profileId": null, "computerUseModelId": null,
+        "inferenceProviders": null, "providers": null,
+        "idleOnCompleteSeconds": null, "idleOnFailSeconds": null,
+        "mcpServersJson": "{}", "skills": [], "factorySkillDirs": [],
+        "computerUseEnabled": false, "repositories": eager,
+        "deferredRepositories": deferred,
+        "setupCommands": [], "sessionSharingAcls": [],
+        "skipInitialTurn": false, "snapshotDisabled": false,
+    });
+    let mut server = warp_core::channel::ChannelState::mock_server();
+    let bootstrap = server
+        .mock("POST", "/graphql/v2")
+        .match_query(Matcher::UrlEncoded(
+            "op".into(),
+            "ExecutionBootstrap".into(),
+        ))
+        .match_body(Matcher::PartialJson(json!({"variables": {
+            "executionId": "42",
+            "supportsDeferredRepositories": use_factory_repositories,
+            "secretsInput": {"taskId": TASK_ID, "workloadToken": "test-workload-token"},
+            "taskInput": {"taskId": TASK_ID}
+        }})))
+        .with_status(200)
+        .with_body(
+            json!({"data": {
+                "task": {"__typename": "TaskOutput", "task": {
+                    "executionConfig": config, "attachments": []
+                }},
+                "taskSecrets": {"__typename": "TaskSecretsOutput", "secrets": []}
+            }})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let mut credentials_input = json!({
+        "taskId": TASK_ID, "workloadToken": "test-workload-token",
+        "acceptsPartialRefresh": false
+    });
+    if use_factory_repositories {
+        credentials_input["useFactoryRepositories"] = json!(true);
+    }
+    let credentials = server
+        .mock("POST", "/graphql/v2")
+        .match_query(Matcher::UrlEncoded(
+            "op".into(),
+            "TaskGitCredentials".into(),
+        ))
+        .match_request(move |request| {
+            let body: serde_json::Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+            body["variables"]["input"] == credentials_input
+        })
+        .with_status(200)
+        .with_body(
+            json!({"data": {"taskGitCredentials": {
+                "__typename": "TaskGitCredentialsOutput", "credentials": [], "failedHosts": []
+            }}})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    App::test((), |mut app| async move {
+        let _refresh = FeatureFlag::GitCredentialRefresh.override_enabled(true);
+        let _handoff = FeatureFlag::OzHandoff.override_enabled(false);
+        let capability =
+            FeatureFlag::FactoryDeferredRepositories.override_enabled(use_factory_repositories);
+        let provider = app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        let ai_client = provider.read(&app, |provider, _| provider.get_ai_client());
+        let runner = app.add_singleton_model(|_| AgentDriverRunner);
+        let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        let data = AgentDriverRunner::fetch_execution_task_data(&foreground, TASK_ID, "42")
+            .await
+            .unwrap();
+        assert_eq!(data.use_factory_repositories, use_factory_repositories);
+        drop(capability);
+        let _opposite =
+            FeatureFlag::FactoryDeferredRepositories.override_enabled(!use_factory_repositories);
+        let events = runner.update(&mut app, |_, ctx| {
+            super::SetupClientEventReporter::noop(ai_client.clone(), ctx.background_executor())
+        });
+        let args =
+            parse_run_agent_args(&["agent", "run", "--task-id", TASK_ID, "--execution-id", "42"]);
+        let (options, _, _) = AgentDriverRunner::build_driver_options_and_task(
+            &foreground,
+            args,
+            None,
+            &ai_client,
+            &events,
+            Some(data),
+        )
+        .await
+        .unwrap();
+        assert_eq!(options.use_factory_repositories, use_factory_repositories);
+        assert_eq!(
+            options.workspace.source_repos.len(),
+            usize::from(scenario == "eager")
+        );
+        assert_eq!(
+            options.workspace.deferred_repos.len(),
+            usize::from(scenario == "deferred")
+        );
+    });
+    bootstrap.assert();
+    credentials.assert();
+}
+#[test]
+fn paired_task_data_downloads_listed_attachment_without_refetching_it() {
+    let _images = FeatureFlag::AmbientAgentsImageUpload.override_enabled(true);
+    let _handoff = FeatureFlag::OzHandoff.override_enabled(false);
+    let working_dir = tempfile::TempDir::new().unwrap();
+    let mut server = Server::new();
+    let download = server
+        .mock("GET", "/attachment")
+        .with_status(200)
+        .with_body("attachment body")
+        .expect(1)
+        .create();
+    let attachment = TaskAttachment {
+        file_id: "file-id".to_owned(),
+        filename: "file-id_report.txt".to_owned(),
+        download_url: format!("{}/attachment", server.url()),
+        mime_type: "text/plain".to_owned(),
+    };
+    App::test((), |app| async move {
+        let provider = app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        let server_api = provider.read(&app, |provider, _| provider.get());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = runtime.enter();
+        let mut ai_client = MockAIClient::new();
+        ai_client.expect_get_task_attachments().times(0);
+        let ai_client: Arc<dyn AIClient> = Arc::new(ai_client);
+        let mut options = agent_driver_options();
+        options.working_dir = working_dir.path().to_path_buf();
+        let mut task = Task {
+            prompt: AgentRunPrompt::ServerSide {
+                skill: None,
+                attachments_dir: None,
+            },
+            model: None,
+            profile: None,
+            mcp_specs: vec![],
+            harness: HarnessKind::Oz,
+        };
+        AgentDriverRunner::prepare_execution_task_data(
+            server_api,
+            &ai_client,
+            TASK_ID.parse().unwrap(),
+            std::collections::HashMap::from([(
+                "API_KEY".to_owned(),
+                warp_managed_secrets::ManagedSecretValue::raw_value("secret"),
+            )]),
+            Ok(vec![attachment]),
+            &mut options,
+            &mut task,
+        )
+        .await
+        .unwrap();
+        assert!(options.secrets.contains_key("API_KEY"));
+        let AgentRunPrompt::ServerSide {
+            attachments_dir: Some(dir),
+            ..
+        } = task.prompt
+        else {
+            panic!("expected downloaded attachments directory");
+        };
+        assert_eq!(
+            fs::read(std::path::Path::new(&dir).join("file-id_report.txt")).unwrap(),
+            b"attachment body"
+        );
+    });
+    download.assert();
+}
+
+#[test]
+fn ordered_execution_skills_attach_only_first_and_expose_all_for_discovery() {
+    let root = tempfile::TempDir::new().unwrap();
+    let (none, empty_dirs) = selected_execution_skills(Vec::new()).unwrap();
+    assert!(none.is_none());
+    assert!(empty_dirs.is_empty());
+    let skill_paths = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            let skill_path = root
+                .path()
+                .join(name)
+                .join("skills")
+                .join(name)
+                .join("SKILL.md");
+            fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+            fs::write(
+                &skill_path,
+                format!("---\nname: {name}\ndescription: example\n---\nInstructions for {name}"),
+            )
+            .unwrap();
+            let parsed_skill = ai::skills::parse_skill(&skill_path).unwrap();
+            ResolvedSkill {
+                skill_path,
+                name: name.to_owned(),
+                instructions: format!("Instructions for {name}"),
+                parsed_skill,
+            }
+        })
+        .collect::<Vec<_>>();
+    let (only, only_dirs) = selected_execution_skills(vec![skill_paths[0].clone()]).unwrap();
+    assert_eq!(only.unwrap().name, "first");
+    assert_eq!(only_dirs, vec![root.path().join("first").join("skills")]);
+
+    let (first, dirs) = selected_execution_skills(skill_paths).unwrap();
+    assert_eq!(first.unwrap().name, "first");
+    assert_eq!(
+        dirs,
+        ["first", "second"]
+            .into_iter()
+            .map(|name| root.path().join(name).join("skills"))
+            .collect::<Vec<_>>()
+    );
+}
 
 fn parse_run_agent_args(args: &[&str]) -> RunAgentArgs {
     let parsed = Args::try_parse_from(std::iter::once("warp").chain(args.iter().copied()))
@@ -55,7 +421,6 @@ fn parse_run_agent_args(args: &[&str]) -> RunAgentArgs {
 
 #[test]
 fn driver_validation_uses_live_repository_membership() {
-    let mut options = agent_driver_options();
     let mut environment =
         AmbientAgentEnvironment::new(String::new(), None, vec![], String::new(), vec![]);
     environment.source_repos = Some(vec![SourceRepo::new(
@@ -63,13 +428,12 @@ fn driver_validation_uses_live_repository_membership() {
         "warpdotdev".to_string(),
         "warp".to_string(),
     )]);
-    options.additional_source_repos = vec![SourceRepo::new(
+    let additional_source_repos = vec![SourceRepo::new(
         CodeForge::GitHub,
         "warpdotdev".to_string(),
         "added-after-dispatch".to_string(),
     )];
-    options.environment = Some(environment);
-    options.repository_preparation_overrides = vec![RepositoryPreparationOverride {
+    let repository_preparation_overrides = vec![RepositoryPreparationOverride {
         code_forge: RepositoryForge::GitHub,
         repo_owner: "WarpDotDev".to_string(),
         repo_name: "Warp".to_string(),
@@ -82,10 +446,16 @@ fn driver_validation_uses_live_repository_membership() {
         preserve_origin: true,
     }];
 
-    let repositories = validated_driver_repositories_for_preparation(&options).unwrap();
+    let workspace = WorkspaceConfiguration::from_legacy(
+        Some(&environment),
+        additional_source_repos,
+        repository_preparation_overrides,
+        false,
+    )
+    .unwrap();
 
     assert_eq!(
-        repositories,
+        workspace.source_repos,
         vec![
             SourceRepo::new(
                 CodeForge::GitHub,
@@ -138,10 +508,12 @@ fn initialize_team_scope_test_app(app: &mut App, teams: Vec<Team>) {
     });
 }
 
-fn agent_driver_options() -> AgentDriverOptions {
+pub(crate) fn agent_driver_options() -> AgentDriverOptions {
     AgentDriverOptions {
         working_dir: std::env::current_dir().unwrap(),
         task_id: None,
+        use_factory_repositories: false,
+        experimental: None,
         parent_run_id: None,
         should_share: false,
         idle_on_complete: None,
@@ -149,13 +521,13 @@ fn agent_driver_options() -> AgentDriverOptions {
         secrets: Default::default(),
         resume: None,
         cloud_providers: vec![],
-        environment: None,
-        additional_source_repos: vec![],
-        repository_preparation_overrides: vec![],
-        remove_repository_origins: false,
+        workspace: WorkspaceConfiguration::default(),
+        computer_use_config: None,
         selected_harness: Harness::Oz,
+        harness_transport: HarnessTransport::Pty,
         third_party_harness_model_config: None,
         team_scope: None,
+        bedrock_oidc_credentials: None,
         snapshot_disabled: None,
         snapshot_upload_timeout: None,
         snapshot_script_timeout: None,
@@ -167,8 +539,196 @@ fn agent_driver_options() -> AgentDriverOptions {
 }
 
 #[test]
-fn agent_run_setup_reports_terminal_team_metadata_refresh_failure() {
+fn existing_task_factory_experiments_bootstrap_and_log_without_payload() {
+    for (scenario, expected_line) in [
+        (
+            "present",
+            "factory_experimental_config state=read_uninterpreted key_count=4",
+        ),
+        (
+            "absent",
+            "factory_experimental_config state=absent key_count=0",
+        ),
+        ("local", ""),
+    ] {
+        let output = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ai::agent_sdk::tests::factory_experiment_bootstrap_subprocess",
+                "--nocapture",
+            ])
+            .env("WARP_TEST_FACTORY_EXPERIMENT_SCENARIO", scenario)
+            .env("WARP_ISOLATION_PLATFORM", "docker")
+            .env_remove("WARP_WORKLOAD_TOKEN")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lifecycle_lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("factory_experimental_config"))
+            .collect();
+        if scenario == "local" {
+            assert!(lifecycle_lines.is_empty(), "{output}");
+            continue;
+        }
+        assert_eq!(lifecycle_lines.len(), 1, "{output}");
+        assert!(lifecycle_lines[0].contains(expected_line), "{output}");
+        for private_value in ["private-uid-sentinel", "secret-value-sentinel", "183749"] {
+            assert!(!output.contains(private_value), "{output}");
+        }
+        for private_value in ["true", "null"] {
+            assert!(!lifecycle_lines[0].contains(private_value), "{output}");
+        }
+    }
+}
+
+#[test]
+fn factory_experiment_bootstrap_subprocess() {
+    let Ok(scenario) = std::env::var("WARP_TEST_FACTORY_EXPERIMENT_SCENARIO") else {
+        return;
+    };
     App::test((), |mut app| async move {
+        let _attachments = FeatureFlag::AmbientAgentsImageUpload.override_enabled(false);
+        let _handoff = FeatureFlag::OzHandoff.override_enabled(false);
+        let provider = ServerApiProvider::new_for_test();
+        let managed_secrets_client = provider.get_managed_secrets_client();
+        app.add_singleton_model(|_| provider);
+        let auth_provider = AuthStateProvider::new_for_test();
+        let auth_state = auth_provider.get().clone();
+        app.add_singleton_model(|_| auth_provider);
+        app.add_singleton_model(|_| {
+            AppManagedSecretManager::new(managed_secrets_client, auth_state)
+        });
+
+        let runner = app.add_singleton_model(|_| AgentDriverRunner);
+        let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
+        let mut options = agent_driver_options();
+
+        if scenario == "local" {
+            let mut ai_client = MockAIClient::new();
+            ai_client
+                .expect_create_agent_task()
+                .times(1)
+                .returning(|_, _, _, _, _, _| Ok(TASK_ID.parse().unwrap()));
+            let ai_client: Arc<dyn AIClient> = Arc::new(ai_client);
+            AgentDriverRunner::initialize_new_task(
+                &foreground,
+                &ai_client,
+                "local prompt".to_string(),
+                AgentConfigSnapshot::default(),
+                HeadlessTeamScope::Personal,
+                &mut options,
+            )
+            .await
+            .unwrap();
+            assert!(options.experimental.is_none());
+            return;
+        }
+
+        let experimental: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(json!({
+                "private-uid-sentinel": "secret-value-sentinel",
+                "boolean": true,
+                "numeric": 183749,
+                "nullable": null
+            }))
+            .unwrap();
+        let mut task_metadata = AmbientAgentTask {
+            task_id: TASK_ID.parse().unwrap(),
+            parent_run_id: None,
+            title: String::new(),
+            state: AmbientAgentTaskState::InProgress,
+            prompt: String::new(),
+            created_at: Utc::now(),
+            started_at: None,
+            updated_at: Utc::now(),
+            run_time: None,
+            status_message: None,
+            source: None,
+            execution_location: None,
+            session_id: None,
+            session_link: None,
+            creator: None,
+            executor: None,
+            conversation_id: None,
+            request_usage: None,
+            is_sandbox_running: false,
+            agent_config_snapshot: None,
+            artifacts: vec![],
+            last_event_sequence: None,
+            children: vec![],
+            debug_agent_available: false,
+            scope: None,
+        };
+        if scenario == "present" {
+            task_metadata.agent_config_snapshot = Some(AgentConfigSnapshot {
+                experimental: Some(experimental.clone()),
+                ..Default::default()
+            });
+        }
+        let mut ai_client = MockAIClient::new();
+        ai_client
+            .expect_get_ambient_agent_task()
+            .times(1)
+            .return_once(move |_| Ok(task_metadata));
+        let ai_client: Arc<dyn AIClient> = Arc::new(ai_client);
+        let mut task = Task {
+            prompt: AgentRunPrompt::ServerSide {
+                skill: None,
+                attachments_dir: None,
+            },
+            model: None,
+            profile: None,
+            mcp_specs: vec![],
+            harness: HarnessKind::Oz,
+        };
+        AgentDriverRunner::fetch_secrets_and_attachments(
+            &foreground,
+            &ai_client,
+            TASK_ID.to_string(),
+            &mut options,
+            &mut task,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            options.experimental,
+            if scenario == "present" {
+                Some(experimental)
+            } else {
+                None
+            }
+        );
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn test_with_paused_time<F: Future<Output = ()> + 'static>(test: impl FnOnce(App) -> F) {
+    drop(warp_core::channel::ChannelState::mock_server());
+    let app = App::test((), |app| async move { app });
+    let executor = app.foreground_executor();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(executor.run(test(app)));
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn legacy_execution_launch_skips_bootstrap_and_reports_team_metadata_refresh_failure() {
+    test_with_paused_time(|mut app| async move {
+        let _execution_config = FeatureFlag::CloudAgentExecutionConfig.override_enabled(false);
         app.add_singleton_model(|_| NetworkStatus::new());
         app.add_singleton_model(TeamTesterStatus::new);
         app.add_singleton_model(|_| AuthStateProvider::new_for_test());
@@ -177,7 +737,7 @@ fn agent_run_setup_reports_terminal_team_metadata_refresh_failure() {
         let mut team_client = MockTeamClient::new();
         team_client
             .expect_workspaces_metadata()
-            .times(4)
+            .times(1..)
             .returning(|| Err(anyhow::anyhow!("workspace metadata unavailable")));
         app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
         let mut ai_client = MockAIClient::new();
@@ -202,7 +762,7 @@ fn agent_run_setup_reports_terminal_team_metadata_refresh_failure() {
                         && conversation_id.is_none()
                         && status_message.as_ref().is_some_and(|status| {
                             status.message
-                                == "Failed to refresh team metadata: workspace metadata unavailable"
+                                == "Failed to refresh team metadata: Timed out refreshing team metadata"
                         })
                         && session_debug_until.is_none()
                         && debug_agent_active.is_none()
@@ -213,8 +773,16 @@ fn agent_run_setup_reports_terminal_team_metadata_refresh_failure() {
 
         let runner = app.add_singleton_model(|_| AgentDriverRunner);
         let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
-        let args = parse_run_agent_args(&["agent", "run", "--task-id", TASK_ID]);
+        let args = parse_run_agent_args(&[
+            "agent",
+            "run",
+            "--task-id",
+            TASK_ID,
+            "--execution-id",
+            "123",
+        ]);
 
+        let started = tokio::time::Instant::now();
         let error = AgentDriverRunner::setup_and_run_driver(
             foreground,
             args,
@@ -226,7 +794,137 @@ fn agent_run_setup_reports_terminal_team_metadata_refresh_failure() {
         let AgentDriverError::TeamMetadataRefreshFailed(source) = error else {
             panic!("unexpected setup error: {error:#}");
         };
+        assert_eq!(source.to_string(), "Timed out refreshing team metadata");
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+    });
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn cloud_startup_refresh_applies_metadata_after_delayed_authorization() {
+    test_with_paused_time(|mut app| async move {
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(TeamTesterStatus::new);
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.add_singleton_model(PrivacySettings::mock);
+        initialize_team_scope_test_app(&mut app, vec![]);
+
+        let started = tokio::time::Instant::now();
+        let mut team_client = MockTeamClient::new();
+        team_client.expect_workspaces_metadata().returning(move || {
+            if started.elapsed() < Duration::from_secs(12) {
+                return Err(GraphQLError::HttpError {
+                    status: StatusCode::UNAUTHORIZED,
+                    body: "execution not claimed".to_string(),
+                }
+                .into());
+            }
+            Ok(WorkspacesMetadataWithPricing {
+                metadata: WorkspacesMetadataResponse {
+                    workspaces: vec![],
+                    joinable_teams: vec![],
+                    experiments: None,
+                    ai_credit_availability: None,
+                    user_tier: UserTier {
+                        charge_unit: ChargeUnit::Cents,
+                        ..Default::default()
+                    },
+                },
+                pricing_info: None,
+            })
+        });
+        app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
+        let runner = app.add_singleton_model(|_| AgentDriverRunner);
+        let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
+
+        AgentDriverRunner::refresh_team_metadata(&foreground, true)
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_secs(12));
+        assert!(started.elapsed() < Duration::from_secs(14));
+        app.read(|ctx| {
+            assert_eq!(UserWorkspaces::as_ref(ctx).charge_unit(), ChargeUnit::Cents);
+        });
+    });
+}
+
+#[test]
+fn ordinary_metadata_refresh_keeps_four_attempt_limit() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(TeamTesterStatus::new);
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        let mut team_client = MockTeamClient::new();
+        team_client
+            .expect_workspaces_metadata()
+            .times(4)
+            .returning(|| Err(anyhow::anyhow!("workspace metadata unavailable")));
+        app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
+        let runner = app.add_singleton_model(|_| AgentDriverRunner);
+        let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
+
+        let error = AgentDriverRunner::refresh_team_metadata(&foreground, false)
+            .await
+            .unwrap_err();
+
+        let AgentDriverError::TeamMetadataRefreshFailed(source) = error else {
+            panic!("unexpected refresh error: {error:#}");
+        };
         assert_eq!(source.to_string(), "workspace metadata unavailable");
+    });
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn cloud_startup_metadata_refresh_is_a_logged_out_noop() {
+    test_with_paused_time(|mut app| async move {
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(TeamTesterStatus::new);
+        app.add_singleton_model(|_| AuthStateProvider::new_logged_out_for_test());
+        let mut team_client = MockTeamClient::new();
+        team_client.expect_workspaces_metadata().never();
+        app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
+        let runner = app.add_singleton_model(|_| AgentDriverRunner);
+        let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
+        let started = tokio::time::Instant::now();
+
+        AgentDriverRunner::refresh_team_metadata(&foreground, true)
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    });
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn dropping_cloud_startup_metadata_refresh_stops_retries() {
+    test_with_paused_time(|mut app| async move {
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(TeamTesterStatus::new);
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = attempts.clone();
+        let mut team_client = MockTeamClient::new();
+        team_client.expect_workspaces_metadata().returning(move || {
+            observed_attempts.fetch_add(1, Ordering::Relaxed);
+            Err(anyhow::anyhow!("workspace metadata unavailable"))
+        });
+        let manager =
+            app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
+        let refresh = manager.update(&mut app, |manager, ctx| {
+            manager.refresh_workspace_metadata_with_retry(
+                WorkspaceMetadataRetryPolicy::TimeBudget(Duration::from_secs(30)),
+                ctx,
+            )
+        });
+
+        assert!(refresh.now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     });
 }
 
@@ -260,8 +958,8 @@ fn multi_team_run_passes_selected_team_to_task_creation_and_headless_window() {
         ai_client
             .expect_create_agent_task()
             .times(1)
-            .withf(move |_, _, _, _, scope| scope.team_uid() == Some(selected_team_uid))
-            .returning(|_, _, _, _, _| Ok(TASK_ID.parse().unwrap()));
+            .withf(move |_, _, _, _, _, scope| scope.team_uid() == Some(selected_team_uid))
+            .returning(|_, _, _, _, _, _| Ok(TASK_ID.parse().unwrap()));
         let ai_client: Arc<dyn AIClient> = Arc::new(ai_client);
         let mut driver_options = agent_driver_options();
         let runner = app.add_singleton_model(|_| AgentDriverRunner);
@@ -349,7 +1047,7 @@ fn service_account_task_id_run_uses_sole_team_for_agent_driver() {
 }
 
 #[test]
-fn team_scope_for_task_scope_resolves_a_team_scoped_task() {
+fn agent_run_scope_resolves_a_team_scoped_task() {
     let owning_team_uid = ServerId::from(7);
     let scope = TaskScope {
         scope_type: "team".to_string(),
@@ -357,29 +1055,29 @@ fn team_scope_for_task_scope_resolves_a_team_scoped_task() {
     };
 
     assert_eq!(
-        team_scope_for_task_scope(&scope).team_uid(),
+        HeadlessTeamScope::from_task_scope(&scope).team_uid(),
         Some(owning_team_uid)
     );
 }
 
 #[test]
-fn team_scope_for_task_scope_resolves_a_personal_task() {
+fn agent_run_scope_resolves_a_personal_task() {
     let scope = TaskScope {
         scope_type: "user".to_string(),
         uid: "some-user-uid".to_string(),
     };
 
-    assert_eq!(team_scope_for_task_scope(&scope).team_uid(), None);
+    assert_eq!(HeadlessTeamScope::from_task_scope(&scope).team_uid(), None);
 }
 
 #[test]
-fn team_scope_for_task_scope_falls_back_to_personal_for_an_unparseable_team_uid() {
+fn agent_run_scope_falls_back_to_personal_for_an_unparseable_team_uid() {
     let scope = TaskScope {
         scope_type: "team".to_string(),
         uid: "not-a-valid-uid".to_string(),
     };
 
-    assert_eq!(team_scope_for_task_scope(&scope).team_uid(), None);
+    assert_eq!(HeadlessTeamScope::from_task_scope(&scope).team_uid(), None);
 }
 
 #[test]
@@ -541,8 +1239,13 @@ fn run_message_send_telemetry_defaults_to_unknown_harness() {
 #[test]
 fn reconcile_task_harness_adopts_task_harness_when_cli_uses_default() {
     let mut selected_harness = Harness::Oz;
-    let harness = reconcile_task_harness(TASK_ID, &mut selected_harness, Harness::Claude)
-        .expect("default harness should adopt task harness");
+    let harness = reconcile_task_harness(
+        TASK_ID,
+        &mut selected_harness,
+        Harness::Claude,
+        HarnessTransport::Pty,
+    )
+    .expect("default harness should adopt task harness");
 
     assert_eq!(selected_harness, Harness::Claude);
     assert_eq!(harness.harness(), Harness::Claude);
@@ -551,8 +1254,13 @@ fn reconcile_task_harness_adopts_task_harness_when_cli_uses_default() {
 #[test]
 fn reconcile_task_harness_allows_matching_explicit_harness() {
     let mut selected_harness = Harness::Claude;
-    let harness = reconcile_task_harness(TASK_ID, &mut selected_harness, Harness::Claude)
-        .expect("matching harness should succeed");
+    let harness = reconcile_task_harness(
+        TASK_ID,
+        &mut selected_harness,
+        Harness::Claude,
+        HarnessTransport::Pty,
+    )
+    .expect("matching harness should succeed");
 
     assert_eq!(selected_harness, Harness::Claude);
     assert_eq!(harness.harness(), Harness::Claude);
@@ -561,13 +1269,37 @@ fn reconcile_task_harness_allows_matching_explicit_harness() {
 #[test]
 fn reconcile_task_harness_rejects_explicit_mismatch() {
     let mut selected_harness = Harness::Gemini;
-    let err = reconcile_task_harness(TASK_ID, &mut selected_harness, Harness::Claude)
-        .expect_err("mismatched harness should fail");
+    let err = reconcile_task_harness(
+        TASK_ID,
+        &mut selected_harness,
+        Harness::Claude,
+        HarnessTransport::Pty,
+    )
+    .expect_err("mismatched harness should fail");
 
     assert_eq!(selected_harness, Harness::Gemini);
     assert!(err.to_string().contains("Task"));
     assert!(err.to_string().contains("--harness gemini"));
     assert!(err.to_string().contains("claude"));
+}
+
+#[test]
+fn reconcile_task_harness_keeps_the_requested_transport() {
+    let mut selected_harness = Harness::Oz;
+    let harness = reconcile_task_harness(
+        TASK_ID,
+        &mut selected_harness,
+        Harness::Claude,
+        HarnessTransport::Acp,
+    )
+    .expect("the task's harness should be driven over the requested transport");
+
+    assert_eq!(selected_harness, Harness::Claude);
+    assert_eq!(harness.harness(), Harness::Claude);
+    let HarnessKind::ThirdParty(harness) = harness else {
+        panic!("ACP transport should produce a third-party harness");
+    };
+    assert!(!harness.drives_cli_agent_session());
 }
 
 #[test]

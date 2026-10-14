@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
@@ -10,24 +10,35 @@ use instant::Instant;
 use parking_lot::Mutex;
 use warp_errors::report_if_error;
 use warpui::r#async::executor::Background;
-use warpui::r#async::{BoxFuture, FutureExt as _};
+use warpui::r#async::{BoxFuture, FutureExt as _, Timer};
 
 use super::SavePoint;
 
+const SAVE_DEBOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 const FINAL_SAVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An active runner worker's operation, which may service initial and coalesced save points.
 ///
 /// It must reread runner state rather than capture state from an individual request.
-type SaveOperation = Arc<dyn Fn(SavePoint) -> BoxFuture<'static, Result<()>> + Send + Sync>;
+pub(super) type SaveOperation =
+    Arc<dyn Fn(SavePoint) -> BoxFuture<'static, Result<()>> + Send + Sync>;
 
 #[derive(Default)]
 struct SaveState {
     pending: Option<SavePoint>,
     active: Option<ActiveSave>,
+    pending_save_at: Option<Instant>,
+    save_in_progress: bool,
     closing: bool,
     final_deadline: Option<Instant>,
     final_succeeded: Option<bool>,
+}
+impl SaveState {
+    fn save_delay(&self) -> Duration {
+        self.pending_save_at.map_or(Duration::ZERO, |next| {
+            next.saturating_duration_since(Instant::now())
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -42,33 +53,52 @@ impl Drop for ActiveSave {
     }
 }
 
-/// Runs one save at a time, retaining at most one pending request with `PostTurn` precedence.
+/// Serializes saves, retaining at most one pending request while one is running.
+///
+/// Each request pushes the next save out by the debounce interval, so a burst of requests
+/// produces one save once the burst ends; a zero interval saves as soon as the worker is free.
 ///
 /// Closing rejects new requests and retains the final deadline and outcome across calls.
-#[derive(Default)]
 pub(crate) struct SaveCoordinator {
     state: Arc<Mutex<SaveState>>,
+    worker_operation: OnceLock<SaveOperation>,
+    debounce_interval: Duration,
+}
+
+impl Default for SaveCoordinator {
+    fn default() -> Self {
+        Self::new(SAVE_DEBOUNCE_INTERVAL)
+    }
 }
 
 impl SaveCoordinator {
+    pub(super) fn new(debounce_interval: Duration) -> Self {
+        Self {
+            state: Arc::default(),
+            worker_operation: OnceLock::new(),
+            debounce_interval,
+        }
+    }
+
+    pub(super) fn set_worker_operation(&self, worker_operation: SaveOperation) {
+        let _ = self.worker_operation.set(worker_operation);
+    }
     /// Starts a runner-scoped worker or coalesces this save point into its pending work.
-    // TODO(vkodithala): Separate request coalescing from worker startup so this only accepts a
-    // SavePoint.
-    pub(super) fn request(
-        &self,
-        save_point: SavePoint,
-        worker_operation: SaveOperation,
-        background: &Background,
-    ) {
+    pub(super) fn enqueue(&self, save_point: SavePoint, background: &Background) {
+        let Some(worker_operation) = self.worker_operation.get().cloned() else {
+            log::error!("Harness save coordinator was not initialized");
+            return;
+        };
         let mut state = self.state.lock();
         if state.closing {
             return;
         }
         state.pending = Some(match (state.pending, save_point) {
-            (Some(SavePoint::PostTurn), _) | (_, SavePoint::PostTurn) => SavePoint::PostTurn,
             (Some(SavePoint::Final), _) | (_, SavePoint::Final) => SavePoint::Final,
+            (Some(SavePoint::PostTurn), _) | (_, SavePoint::PostTurn) => SavePoint::PostTurn,
             (Some(SavePoint::Periodic) | None, SavePoint::Periodic) => SavePoint::Periodic,
         });
+        state.pending_save_at = Some(Instant::now() + self.debounce_interval);
         if state.active.is_some() {
             return;
         }
@@ -84,10 +114,26 @@ impl SaveCoordinator {
             .spawn(async move {
                 let worker = async {
                     loop {
+                        let delay = {
+                            let mut state = shared_state.lock();
+                            if state.closing || state.pending.is_none() {
+                                state.active = None;
+                                return;
+                            }
+                            state.save_delay()
+                        };
+                        Timer::after(delay).await;
                         let save_point = {
                             let mut state = shared_state.lock();
+                            if !state.save_delay().is_zero() {
+                                continue;
+                            }
                             match state.pending.take().filter(|_| !state.closing) {
-                                Some(save_point) => save_point,
+                                Some(save_point) => {
+                                    state.pending_save_at = None;
+                                    state.save_in_progress = true;
+                                    save_point
+                                }
                                 None => {
                                     state.active = None;
                                     return;
@@ -99,6 +145,7 @@ impl SaveCoordinator {
                                 .await
                                 .context("Failed to save harness conversation")
                         );
+                        shared_state.lock().save_in_progress = false;
                     }
                 };
                 let _ = Abortable::new(worker, registration).await;
@@ -108,9 +155,10 @@ impl SaveCoordinator {
     }
 
     /// Stops ordinary requests, then drains or cancels current work before a bounded final save.
-    pub(super) async fn finish(
+    pub(super) async fn finalize(
         &self,
         final_save: impl Future<Output = Result<()>>,
+        report_usage: impl Future<Output = ()>,
         budget: Duration,
     ) -> Result<()> {
         let (active, deadline) = {
@@ -124,6 +172,12 @@ impl SaveCoordinator {
             }
             state.closing = true;
             state.pending = None;
+            state.pending_save_at = None;
+            if !state.save_in_progress
+                && let Some(active) = &state.active
+            {
+                active.abort.abort();
+            }
             let deadline = *state
                 .final_deadline
                 .get_or_insert_with(|| Instant::now() + budget);
@@ -144,6 +198,7 @@ impl SaveCoordinator {
         self.state.lock().active = None;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            self.state.lock().final_succeeded = Some(false);
             return Err(anyhow!("Harness final save deadline expired"));
         }
         let result = final_save
@@ -152,6 +207,10 @@ impl SaveCoordinator {
             .context("Harness final save timed out")
             .and_then(|result| result);
         self.state.lock().final_succeeded = Some(result.is_ok());
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = report_usage.with_timeout(remaining).await;
+        }
         result
     }
 }
@@ -172,15 +231,6 @@ fn remaining_final_save_budget(now: SystemTime, deadline: Option<SystemTime>) ->
             .unwrap_or_default()
             .min(FINAL_SAVE_TIMEOUT)
     })
-}
-
-/// Waits for both saves so either can complete independently if the other fails.
-pub(super) async fn save_transcript_and_block(
-    transcript: impl Future<Output = Result<()>>,
-    block: impl Future<Output = Result<()>>,
-) -> Result<()> {
-    let (transcript, block) = futures::join!(transcript, block);
-    transcript.and(block)
 }
 
 #[cfg(test)]

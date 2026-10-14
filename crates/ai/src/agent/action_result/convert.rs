@@ -163,8 +163,53 @@ impl TryFrom<RequestCommandOutputResult> for api::request::input::tool_call_resu
                     },
                 ),
             ),
+            RequestCommandOutputResult::ShellRecovered {
+                command,
+                block_id,
+                output,
+                status,
+                start_ts,
+                completed_ts,
+                ..
+            } => Ok(
+                api::request::input::tool_call_result::Result::RunShellCommand(
+                    #[allow(deprecated)]
+                    api::RunShellCommandResult {
+                        command,
+                        output: Default::default(),
+                        exit_code: Default::default(),
+                        result: Some(api::run_shell_command_result::Result::CommandFinished(
+                            api::ShellCommandFinished {
+                                command_id: block_id.to_string(),
+                                output,
+                                exit_code: status.exit_code(),
+                                start_ts: start_ts.map(local_datetime_to_timestamp),
+                                finish_ts: completed_ts.map(local_datetime_to_timestamp),
+                            },
+                        )),
+                    },
+                ),
+            ),
             RequestCommandOutputResult::CancelledBeforeExecution => {
                 Err(ConvertToAPITypeError::Ignore)
+            }
+            RequestCommandOutputResult::TerminalBusy { command, block_id } =>
+            {
+                #[allow(deprecated)]
+                Ok(
+                    api::request::input::tool_call_result::Result::RunShellCommand(
+                        api::RunShellCommandResult {
+                            command,
+                            output: Default::default(),
+                            exit_code: Default::default(),
+                            result: Some(api::run_shell_command_result::Result::TerminalBusy(
+                                api::run_shell_command_result::TerminalBusy {
+                                    running_command_id: block_id.to_string(),
+                                },
+                            )),
+                        },
+                    ),
+                )
             }
             RequestCommandOutputResult::Denylisted { command } =>
             {
@@ -565,7 +610,7 @@ impl TryFrom<ReadMCPResourceResult> for api::request::input::tool_call_result::R
                             api::read_mcp_resource_result::Success {
                                 contents: resource_contents
                                     .into_iter()
-                                    .map(convert_mcp_resource_content)
+                                    .filter_map(convert_mcp_resource_content)
                                     .collect(),
                             },
                         )),
@@ -809,6 +854,31 @@ impl TryFrom<ReadShellCommandOutputResult> for api::request::input::tool_call_re
                     },
                 ),
             ),
+            ReadShellCommandOutputResult::ShellRecovered {
+                command,
+                block_id,
+                output,
+                status,
+                start_ts,
+                completed_ts,
+            } => Ok(
+                api::request::input::tool_call_result::Result::ReadShellCommandOutput(
+                    api::ReadShellCommandOutputResult {
+                        command,
+                        result: Some(
+                            api::read_shell_command_output_result::Result::CommandFinished(
+                                api::ShellCommandFinished {
+                                    command_id: block_id.to_string(),
+                                    output,
+                                    exit_code: status.exit_code(),
+                                    start_ts: start_ts.map(local_datetime_to_timestamp),
+                                    finish_ts: completed_ts.map(local_datetime_to_timestamp),
+                                },
+                            ),
+                        ),
+                    },
+                ),
+            ),
             ReadShellCommandOutputResult::Error(ShellCommandError::BlockNotFound) => {
                 Ok(api::request::input::tool_call_result::Result::ReadShellCommandOutput(
                         api::ReadShellCommandOutputResult {
@@ -1015,7 +1085,11 @@ impl From<DocumentContext> for Vec<api::DocumentContent> {
     }
 }
 
-fn convert_mcp_resource_content(val: rmcp::model::ResourceContents) -> api::McpResourceContent {
+/// Returns `None` for resource kinds added to the protocol after this mapping was written;
+/// `ResourceContents` is `#[non_exhaustive]`.
+fn convert_mcp_resource_content(
+    val: rmcp::model::ResourceContents,
+) -> Option<api::McpResourceContent> {
     use api::mcp_resource_content::*;
     match val {
         rmcp::model::ResourceContents::TextResourceContents {
@@ -1023,25 +1097,29 @@ fn convert_mcp_resource_content(val: rmcp::model::ResourceContents) -> api::McpR
             mime_type,
             text,
             ..
-        } => api::McpResourceContent {
+        } => Some(api::McpResourceContent {
             uri,
             content_type: Some(ContentType::Text(Text {
                 content: text,
                 mime_type: mime_type.unwrap_or_default(),
             })),
-        },
+        }),
         rmcp::model::ResourceContents::BlobResourceContents {
             uri,
             mime_type,
             blob,
             ..
-        } => api::McpResourceContent {
+        } => Some(api::McpResourceContent {
             uri,
             content_type: Some(ContentType::Binary(Binary {
                 data: blob.into_bytes(),
                 mime_type: mime_type.unwrap_or_default(),
             })),
-        },
+        }),
+        _ => {
+            log::warn!("Unsupported MCP resource content kind");
+            None
+        }
     }
 }
 
@@ -1239,24 +1317,29 @@ fn convert_mcp_tool_call_result(
             .content
             .into_iter()
             .filter_map(|content| {
-                use rmcp::model::RawContent::*;
-                match content.raw {
-                    Text(raw_text_content) => Some(result::Result::Text(result::Text {
-                        text: raw_text_content.text,
+                use rmcp::model::ContentBlock::*;
+                match content {
+                    Text(text_content) => Some(result::Result::Text(result::Text {
+                        text: text_content.text,
                     })),
-                    Image(raw_image_content) => Some(result::Result::Image(result::Image {
-                        data: raw_image_content.data.into_bytes(),
-                        mime_type: raw_image_content.mime_type,
+                    Image(image_content) => Some(result::Result::Image(result::Image {
+                        data: image_content.data.into_bytes(),
+                        mime_type: image_content.mime_type,
                     })),
-                    Resource(raw_embedded_resource) => Some(result::Result::Resource(
-                        convert_mcp_resource_content(raw_embedded_resource.resource),
-                    )),
+                    Resource(embedded_resource) => {
+                        convert_mcp_resource_content(embedded_resource.resource)
+                            .map(result::Result::Resource)
+                    }
                     Audio(_) => {
                         log::warn!("Audio content not supported");
                         None
                     }
                     ResourceLink(_) => {
                         log::warn!("Resource link content not supported");
+                        None
+                    }
+                    _ => {
+                        log::warn!("Unsupported MCP content block kind");
                         None
                     }
                 }

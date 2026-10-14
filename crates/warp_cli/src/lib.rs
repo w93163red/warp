@@ -27,6 +27,7 @@ mod date_time;
 #[cfg(not(target_family = "wasm"))]
 pub mod edit;
 pub mod environment;
+pub mod environment_checkout;
 pub mod federate;
 pub mod harness_support;
 pub mod integration;
@@ -517,6 +518,18 @@ pub enum WorkerCommand {
     #[clap(hide = true)]
     RemoteServerDaemon(RemoteServerIdentityArgs),
 
+    /// Connect an Agent Client Protocol agent's stdin/stdout to the loopback socket the agent
+    /// driver is listening on. Run from the driver's terminal session so the agent inherits the
+    /// shell state established by environment setup commands.
+    #[cfg(not(target_family = "wasm"))]
+    #[clap(hide = true)]
+    AcpBridge {
+        /// File the driver wrote with the address to connect to, the token to present, and the
+        /// agent command line.
+        #[clap(long = "launch-file")]
+        launch_file: std::path::PathBuf,
+    },
+
     /// Run a headless ripgrep search worker.
     #[cfg(not(target_family = "wasm"))]
     #[clap(hide = true)]
@@ -545,6 +558,9 @@ pub enum CliCommand {
     /// Manage cloud environments.
     #[command(subcommand)]
     Environment(crate::environment::EnvironmentCommand),
+
+    #[command(hide = true)]
+    EnvironmentCheckout(crate::environment_checkout::EnvironmentCheckoutArgs),
 
     /// Manage MCP servers.
     #[command(subcommand)]
@@ -615,6 +631,7 @@ impl CliCommand {
         match self {
             CliCommand::Agent(command) => command.as_str_for_tracing(),
             CliCommand::Environment(command) => command.as_str_for_tracing(),
+            CliCommand::EnvironmentCheckout(_) => "environment_checkout",
             CliCommand::MCP(command) => command.as_str_for_tracing(),
             CliCommand::Run(command) => command.as_str_for_tracing(),
             CliCommand::Model(command) => command.as_str_for_tracing(),

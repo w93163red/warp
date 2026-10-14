@@ -1,9 +1,11 @@
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use warpui::App;
 
 use super::*;
+use crate::ai::aws_credentials::AwsCredentialRefresher;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::auth::AuthStateProvider;
@@ -12,11 +14,18 @@ use crate::cloud_object::model::persistence::CloudModel;
 use crate::network::NetworkStatus;
 use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::server_api::ServerApiProvider;
+use crate::server::server_api::team::MockTeamClient;
+use crate::server::server_api::workspace::MockWorkspaceClient;
 use crate::server::sync_queue::SyncQueue;
+use crate::settings::PrivacySettings;
 use crate::terminal::input::models::query_model_picker_choices;
 use crate::test_util::settings::initialize_settings_for_tests;
+use crate::workspaces::team::Team;
 use crate::workspaces::team_tester::TeamTesterStatus;
-use crate::workspaces::user_workspaces::{TeamlessScopeForTest, UserWorkspaces};
+use crate::workspaces::user_workspaces::{
+    TeamContextForOperation, TeamlessScopeForTest, UserWorkspaces,
+};
+use crate::workspaces::workspace::Workspace;
 use crate::{LaunchMode, TuiEntryPoint};
 
 // -- DisableReason::should_clear_preference tests --
@@ -846,6 +855,231 @@ fn reconcile_preserves_custom_models_saved_on_execution_profile() {
 }
 
 #[test]
+fn team_catalog_hydration_preserves_shared_profile_and_resolves_against_active_team() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(AuthManager::new_for_test);
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(CloudModel::mock);
+        app.add_singleton_model(TeamTesterStatus::mock);
+        app.add_singleton_model(SyncQueue::mock);
+        app.add_singleton_model(UpdateManager::mock);
+        app.add_singleton_model(PrivacySettings::mock);
+        app.add_singleton_model(|_| TemplatableMCPServerManager::default());
+
+        let fable_id = LLMId::from("claude-5-1-fable");
+        let mut enabled_fable = server_llm(fable_id.as_str(), None);
+        enabled_fable.context_window.is_configurable = true;
+        let mut disabled_fable = server_llm(fable_id.as_str(), Some(DisableReason::AdminDisabled));
+        disabled_fable.context_window.is_configurable = true;
+        let enabled_models = ModelsByFeature {
+            agent_mode: available(
+                "auto-genius",
+                vec![server_llm("auto-genius", None), enabled_fable],
+            ),
+            ..Default::default()
+        };
+        let disabled_models = ModelsByFeature {
+            agent_mode: available(
+                "auto-genius",
+                vec![server_llm("auto-genius", None), disabled_fable],
+            ),
+            ..Default::default()
+        };
+        let engineering_team_uid = ServerId::from(101);
+        let disabled_team_uid = ServerId::from(102);
+        let engineering_team = Team::from_local_cache(
+            engineering_team_uid,
+            "Engineering".to_string(),
+            None,
+            None,
+            None,
+            Some(enabled_models.clone()),
+        );
+        let disabled_team = Team::from_local_cache(
+            disabled_team_uid,
+            "Disabled team".to_string(),
+            None,
+            None,
+            None,
+            Some(disabled_models.clone()),
+        );
+        let workspace = Workspace::from_local_cache(
+            ServerId::from(100).into(),
+            "Warp".to_string(),
+            Some(vec![engineering_team, disabled_team]),
+            Some(disabled_models.clone()),
+        );
+        let refreshed_workspace = workspace.clone();
+        app.add_singleton_model(|ctx| {
+            UserWorkspaces::mock(
+                Arc::new(MockTeamClient::new()),
+                Arc::new(MockWorkspaceClient::new()),
+                vec![workspace],
+                ctx,
+            )
+        });
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.subscribe_to_settings_changes(ctx);
+        });
+
+        let profiles_model = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        let llm_preferences = app.add_singleton_model(LLMPreferences::new);
+        let profile_id = profiles_model.read(&app, |profiles, _| profiles.default_profile_id());
+        profiles_model.update(&mut app, |profiles, ctx| {
+            profiles.set_base_model(&profile_id, Some(fable_id.clone()), ctx);
+            profiles.set_context_window_limit(&profile_id, Some(200_000), ctx);
+        });
+        UserWorkspaces::handle(&app).update(&mut app, |workspaces, ctx| {
+            workspaces.update_workspaces(vec![refreshed_workspace], ctx);
+        });
+
+        let engineering_scope = TeamContextForOperation::new_for_test(engineering_team_uid);
+        let disabled_scope = TeamContextForOperation::new_for_test(disabled_team_uid);
+        llm_preferences.read(&app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_base_model(&engineering_scope, ctx, None)
+                    .id,
+                fable_id
+            );
+            assert_eq!(
+                preferences
+                    .get_active_base_model(&disabled_scope, ctx, None)
+                    .id
+                    .as_str(),
+                "auto-genius"
+            );
+            let disabled_fable = preferences
+                .get_base_llm_choices_for_agent_mode(&disabled_scope, ctx)
+                .find(|llm| llm.id == fable_id)
+                .expect("the preferred model should remain visible on the disabled team");
+            assert_eq!(
+                disabled_fable.disable_reason,
+                Some(DisableReason::AdminDisabled)
+            );
+        });
+        profiles_model.read(&app, |profiles, ctx| {
+            assert_eq!(
+                profiles.default_profile(ctx).data().base_model.as_ref(),
+                Some(&fable_id)
+            );
+            assert_eq!(
+                profiles.default_profile(ctx).data().context_window_limit,
+                Some(200_000)
+            );
+        });
+    });
+}
+
+#[test]
+fn reconcile_clears_unavailable_base_model_preference() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(AuthManager::new_for_test);
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(UserWorkspaces::default_mock);
+        app.add_singleton_model(CloudModel::mock);
+        app.add_singleton_model(TeamTesterStatus::mock);
+        app.add_singleton_model(SyncQueue::mock);
+        app.add_singleton_model(UpdateManager::mock);
+        app.add_singleton_model(|_| TemplatableMCPServerManager::default());
+
+        let profiles_model = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        let llm_preferences = app.add_singleton_model(LLMPreferences::new);
+        let profile_id = profiles_model.read(&app, |profiles, _| profiles.default_profile_id());
+        let unavailable_model_id = LLMId::from("unavailable-model");
+        let mut unavailable_model = server_llm(
+            unavailable_model_id.as_str(),
+            Some(DisableReason::Unavailable),
+        );
+        unavailable_model.context_window.is_configurable = true;
+        profiles_model.update(&mut app, |profiles, ctx| {
+            profiles.set_base_model(&profile_id, Some(unavailable_model_id), ctx);
+            profiles.set_context_window_limit(&profile_id, Some(200_000), ctx);
+        });
+        llm_preferences.update(&mut app, |preferences, ctx| {
+            preferences.update_feature_model_choices(
+                Ok(ModelsByFeature {
+                    agent_mode: available(
+                        "auto-genius",
+                        vec![server_llm("auto-genius", None), unavailable_model],
+                    ),
+                    ..Default::default()
+                }),
+                ctx,
+            );
+        });
+
+        profiles_model.read(&app, |profiles, ctx| {
+            let profile = profiles.default_profile(ctx);
+            assert_eq!(profile.data().base_model, None);
+            assert_eq!(profile.data().context_window_limit, None);
+        });
+    });
+}
+
+#[test]
+fn reconcile_clears_requires_upgrade_base_model_preference_without_byok() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(AuthManager::new_for_test);
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(UserWorkspaces::default_mock);
+        app.add_singleton_model(CloudModel::mock);
+        app.add_singleton_model(TeamTesterStatus::mock);
+        app.add_singleton_model(SyncQueue::mock);
+        app.add_singleton_model(UpdateManager::mock);
+        app.add_singleton_model(|_| TemplatableMCPServerManager::default());
+
+        let profiles_model = app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        let llm_preferences = app.add_singleton_model(LLMPreferences::new);
+        let profile_id = profiles_model.read(&app, |profiles, _| profiles.default_profile_id());
+
+        let upgrade_model_id = LLMId::from("upgrade-model");
+        let mut upgrade_model = server_llm(
+            upgrade_model_id.as_str(),
+            Some(DisableReason::RequiresUpgrade),
+        );
+        upgrade_model.context_window.is_configurable = true;
+        profiles_model.update(&mut app, |profiles, ctx| {
+            profiles.set_base_model(&profile_id, Some(upgrade_model_id), ctx);
+            profiles.set_context_window_limit(&profile_id, Some(200_000), ctx);
+        });
+        llm_preferences.update(&mut app, |preferences, ctx| {
+            preferences.update_feature_model_choices(
+                Ok(ModelsByFeature {
+                    agent_mode: available(
+                        "auto-genius",
+                        vec![server_llm("auto-genius", None), upgrade_model],
+                    ),
+                    ..Default::default()
+                }),
+                ctx,
+            );
+        });
+
+        profiles_model.read(&app, |profiles, ctx| {
+            let profile = profiles.default_profile(ctx);
+            assert_eq!(profile.data().base_model, None);
+            assert_eq!(profile.data().context_window_limit, None);
+        });
+    });
+}
+
+#[test]
 fn reconcile_preserves_custom_endpoint_models_not_configured_locally() {
     // Regression test for QUALITY-866: a profile whose model was set to a custom
     // endpoint on device A should NOT be reset when device B syncs that profile
@@ -1055,6 +1289,355 @@ fn preferences_for_profile_model_tests(ctx: &mut ModelContext<LLMPreferences>) -
     LLMPreferences::for_test(Vec::new())
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn with_computer_use_test_context(f: impl FnOnce(&mut App) + 'static) {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(AuthManager::new_for_test);
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(UserWorkspaces::default_mock);
+        app.add_singleton_model(CloudModel::mock);
+        app.add_singleton_model(TeamTesterStatus::mock);
+        app.add_singleton_model(SyncQueue::mock);
+        app.add_singleton_model(UpdateManager::mock);
+        app.add_singleton_model(|_| TemplatableMCPServerManager::default());
+        app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(
+                &LaunchMode::Tui {
+                    entrypoint: TuiEntryPoint::Interactive {
+                        mount: Box::new(|_| {}),
+                        api_key: None,
+                    },
+                },
+                ctx,
+            )
+        });
+        app.add_singleton_model(|ctx| {
+            UserWorkspaces::handle(ctx).update(ctx, |workspaces, _| {
+                workspaces.set_workspaceless_models_by_feature(ModelsByFeature {
+                    computer_use: Some(
+                        AvailableLLMs::new(
+                            "computer-use-agent-auto".into(),
+                            vec![
+                                agent_llm("computer-use-agent-auto", "auto"),
+                                agent_llm("computer-use-model", "selected"),
+                                agent_llm("profile-model", "profile"),
+                            ],
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                    ..Default::default()
+                });
+            });
+            LLMPreferences::for_test(Vec::new())
+        });
+        f(&mut app);
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn session_computer_use_enablement_is_scoped_to_the_terminal() {
+    with_computer_use_test_context(|app| {
+        let profiles = AIExecutionProfilesModel::handle(app);
+        let terminal_view_id = EntityId::new();
+        profiles.update(app, |profiles, ctx| {
+            profiles.set_session_computer_use(terminal_view_id, true, ctx);
+        });
+
+        profiles.read(app, |profiles, _| {
+            assert_eq!(
+                profiles
+                    .session_computer_use(terminal_view_id)
+                    .map(|selection| selection.enabled),
+                Some(true)
+            );
+            assert!(profiles.session_computer_use(EntityId::new()).is_none());
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn clearing_session_computer_use_removes_the_selection() {
+    with_computer_use_test_context(|app| {
+        let profiles = AIExecutionProfilesModel::handle(app);
+        let terminal_view_id = EntityId::new();
+        profiles.update(app, |profiles, ctx| {
+            profiles.set_session_computer_use(terminal_view_id, true, ctx);
+        });
+
+        profiles.update(app, |profiles, ctx| {
+            profiles.clear_session_computer_use(terminal_view_id, ctx);
+        });
+
+        profiles.read(app, |profiles, _| {
+            assert!(profiles.session_computer_use(terminal_view_id).is_none());
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn resetting_profiles_clears_session_computer_use() {
+    with_computer_use_test_context(|app| {
+        let profiles = AIExecutionProfilesModel::handle(app);
+        let terminal_view_id = EntityId::new();
+        profiles.update(app, |profiles, ctx| {
+            profiles.set_session_computer_use(terminal_view_id, true, ctx);
+        });
+
+        profiles.update(app, |profiles, _| profiles.reset(true));
+
+        profiles.read(app, |profiles, _| {
+            assert!(profiles.session_computer_use(terminal_view_id).is_none());
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn computer_use_model_override_takes_precedence_over_the_profile() {
+    with_computer_use_test_context(|app| {
+        let profiles = AIExecutionProfilesModel::handle(app);
+        let preferences = LLMPreferences::handle(app);
+        let terminal_view_id = EntityId::new();
+        profiles.update(app, |profiles, ctx| {
+            profiles.set_computer_use_model(
+                &profiles.default_profile_id(),
+                Some("profile-model".into()),
+                ctx,
+            );
+        });
+
+        preferences.update(app, |preferences, _| {
+            preferences
+                .set_computer_use_llm_override(terminal_view_id, Some("computer-use-model".into()));
+        });
+
+        preferences.read(app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_computer_use_model(
+                        &TeamlessScopeForTest,
+                        ctx,
+                        Some(terminal_view_id)
+                    )
+                    .id
+                    .as_str(),
+                "computer-use-model"
+            );
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn computer_use_default_override_ignores_the_profile_model() {
+    with_computer_use_test_context(|app| {
+        let profiles = AIExecutionProfilesModel::handle(app);
+        let preferences = LLMPreferences::handle(app);
+        let terminal_view_id = EntityId::new();
+        profiles.update(app, |profiles, ctx| {
+            profiles.set_computer_use_model(
+                &profiles.default_profile_id(),
+                Some("profile-model".into()),
+                ctx,
+            );
+        });
+
+        preferences.update(app, |preferences, _| {
+            preferences.set_computer_use_llm_override(terminal_view_id, None);
+        });
+
+        preferences.read(app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_computer_use_model(
+                        &TeamlessScopeForTest,
+                        ctx,
+                        Some(terminal_view_id)
+                    )
+                    .id
+                    .as_str(),
+                "computer-use-agent-auto"
+            );
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn computer_use_model_falls_back_to_the_profile_without_a_terminal_override() {
+    with_computer_use_test_context(|app| {
+        let profiles = AIExecutionProfilesModel::handle(app);
+        let preferences = LLMPreferences::handle(app);
+        let terminal_view_id = EntityId::new();
+        profiles.update(app, |profiles, ctx| {
+            profiles.set_computer_use_model(
+                &profiles.default_profile_id(),
+                Some("profile-model".into()),
+                ctx,
+            );
+        });
+
+        preferences.read(app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_computer_use_model(
+                        &TeamlessScopeForTest,
+                        ctx,
+                        Some(terminal_view_id)
+                    )
+                    .id
+                    .as_str(),
+                "profile-model"
+            );
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn clearing_computer_use_model_override_restores_the_profile_model() {
+    with_computer_use_test_context(|app| {
+        let profiles = AIExecutionProfilesModel::handle(app);
+        let preferences = LLMPreferences::handle(app);
+        let terminal_view_id = EntityId::new();
+        profiles.update(app, |profiles, ctx| {
+            profiles.set_computer_use_model(
+                &profiles.default_profile_id(),
+                Some("profile-model".into()),
+                ctx,
+            );
+        });
+        preferences.update(app, |preferences, _| {
+            preferences
+                .set_computer_use_llm_override(terminal_view_id, Some("computer-use-model".into()));
+        });
+
+        preferences.update(app, |preferences, _| {
+            preferences.clear_computer_use_llm_override(terminal_view_id);
+        });
+
+        preferences.read(app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_computer_use_model(
+                        &TeamlessScopeForTest,
+                        ctx,
+                        Some(terminal_view_id)
+                    )
+                    .id
+                    .as_str(),
+                "profile-model"
+            );
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn computer_use_model_override_falls_back_to_default_for_an_unknown_model() {
+    with_computer_use_test_context(|app| {
+        let preferences = LLMPreferences::handle(app);
+        let terminal_view_id = EntityId::new();
+
+        preferences.update(app, |preferences, _| {
+            preferences
+                .set_computer_use_llm_override(terminal_view_id, Some("unknown-model".into()));
+        });
+
+        preferences.read(app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_computer_use_model(
+                        &TeamlessScopeForTest,
+                        ctx,
+                        Some(terminal_view_id)
+                    )
+                    .id
+                    .as_str(),
+                "computer-use-agent-auto"
+            );
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn resetting_session_model_overrides_restores_the_computer_use_profile_model() {
+    with_computer_use_test_context(|app| {
+        let profiles = AIExecutionProfilesModel::handle(app);
+        let preferences = LLMPreferences::handle(app);
+        let terminal_view_id = EntityId::new();
+        profiles.update(app, |profiles, ctx| {
+            profiles.set_computer_use_model(
+                &profiles.default_profile_id(),
+                Some("profile-model".into()),
+                ctx,
+            );
+        });
+        preferences.update(app, |preferences, _| {
+            preferences
+                .set_computer_use_llm_override(terminal_view_id, Some("computer-use-model".into()));
+        });
+
+        preferences.update(app, |preferences, _| preferences.reset_session_overrides());
+
+        preferences.read(app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_computer_use_model(
+                        &TeamlessScopeForTest,
+                        ctx,
+                        Some(terminal_view_id)
+                    )
+                    .id
+                    .as_str(),
+                "profile-model"
+            );
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn resetting_session_model_overrides_restores_the_agent_mode_profile_model() {
+    with_computer_use_test_context(|app| {
+        let preferences = LLMPreferences::handle(app);
+        let terminal_view_id = EntityId::new();
+        preferences.update(app, |preferences, ctx| {
+            preferences.add_agent_mode_model_for_test(
+                &TeamlessScopeForTest,
+                agent_llm("claude-opus", "Opus"),
+                ctx,
+            );
+            preferences.set_agent_mode_llm_override(
+                &TeamlessScopeForTest,
+                terminal_view_id,
+                "claude-opus".into(),
+                ctx,
+            );
+        });
+
+        preferences.update(app, |preferences, _| preferences.reset_session_overrides());
+
+        preferences.read(app, |preferences, ctx| {
+            assert_eq!(
+                preferences
+                    .get_active_base_model(&TeamlessScopeForTest, ctx, Some(terminal_view_id))
+                    .id
+                    .as_str(),
+                "auto"
+            );
+        });
+    });
+}
+
 #[test]
 fn shared_model_picker_query_orders_filters_and_marks_disabled_choices() {
     with_model_picker_query_test_context(|preferences, scope, app| {
@@ -1062,6 +1645,7 @@ fn shared_model_picker_query_orders_filters_and_marks_disabled_choices() {
             preferences,
             preferences.get_base_llm_choices_for_agent_mode(&TeamlessScopeForTest, app),
             "",
+            None,
             scope,
             app,
         );
@@ -1079,6 +1663,7 @@ fn shared_model_picker_query_orders_filters_and_marks_disabled_choices() {
             preferences,
             preferences.get_base_llm_choices_for_agent_mode(&TeamlessScopeForTest, app),
             "gpt 5",
+            None,
             scope,
             app,
         );

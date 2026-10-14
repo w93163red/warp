@@ -23,6 +23,48 @@ pub struct ManagedSecretManager<RequestScope> {
     actor_provider: Arc<dyn ActorProvider>,
 }
 
+/// Converts task-scoped GraphQL secret values to managed secrets used by the agent.
+pub fn convert_task_secrets(
+    gql_secrets: HashMap<String, GqlManagedSecretValue>,
+) -> anyhow::Result<HashMap<String, ManagedSecretValue>> {
+    let mut secrets = HashMap::new();
+    for (name, gql_value) in gql_secrets {
+        let value = match gql_value {
+            GqlManagedSecretValue::ManagedSecretRawValue(raw) => {
+                ManagedSecretValue::raw_value(raw.value)
+            }
+            GqlManagedSecretValue::ManagedSecretAnthropicApiKeyValue(v) => {
+                ManagedSecretValue::anthropic_api_key(v.api_key)
+            }
+            GqlManagedSecretValue::ManagedSecretAnthropicBedrockAccessKeyValue(v) => {
+                ManagedSecretValue::anthropic_bedrock_access_key(
+                    v.aws_access_key_id,
+                    v.aws_secret_access_key,
+                    v.aws_session_token,
+                    v.aws_region,
+                )
+            }
+            GqlManagedSecretValue::ManagedSecretAnthropicBedrockApiKeyValue(v) => {
+                ManagedSecretValue::anthropic_bedrock_api_key(
+                    v.aws_bearer_token_bedrock,
+                    v.aws_region,
+                )
+            }
+            GqlManagedSecretValue::ManagedSecretOpenAiApiKeyValue(v) => {
+                ManagedSecretValue::openai_api_key(v.api_key, v.base_url)
+            }
+            GqlManagedSecretValue::Unknown => {
+                return Err(anyhow::anyhow!(
+                    "Unknown secret value type for secret: {}",
+                    name
+                ));
+            }
+        };
+        secrets.insert(name, value);
+    }
+    Ok(secrets)
+}
+
 pub trait ActorProvider: Send + Sync + 'static {
     fn actor_uid(&self) -> Option<String>;
 }
@@ -210,45 +252,7 @@ where
             let gql_secrets = client
                 .get_task_secrets(task_id, workload_token.token)
                 .await?;
-
-            // Convert GQL ManagedSecretValue to our ManagedSecretValue
-            let mut secrets = HashMap::new();
-            for (name, gql_value) in gql_secrets {
-                let value = match gql_value {
-                    GqlManagedSecretValue::ManagedSecretRawValue(raw) => {
-                        ManagedSecretValue::raw_value(raw.value)
-                    }
-                    GqlManagedSecretValue::ManagedSecretAnthropicApiKeyValue(v) => {
-                        ManagedSecretValue::anthropic_api_key(v.api_key)
-                    }
-                    GqlManagedSecretValue::ManagedSecretAnthropicBedrockAccessKeyValue(v) => {
-                        ManagedSecretValue::anthropic_bedrock_access_key(
-                            v.aws_access_key_id,
-                            v.aws_secret_access_key,
-                            // aws_session_token is now optional on the server.
-                            v.aws_session_token,
-                            v.aws_region,
-                        )
-                    }
-                    GqlManagedSecretValue::ManagedSecretAnthropicBedrockApiKeyValue(v) => {
-                        ManagedSecretValue::anthropic_bedrock_api_key(
-                            v.aws_bearer_token_bedrock,
-                            v.aws_region,
-                        )
-                    }
-                    GqlManagedSecretValue::ManagedSecretOpenAiApiKeyValue(v) => {
-                        ManagedSecretValue::openai_api_key(v.api_key, v.base_url)
-                    }
-                    GqlManagedSecretValue::Unknown => {
-                        return Err(anyhow::anyhow!(
-                            "Unknown secret value type for secret: {}",
-                            name
-                        ));
-                    }
-                };
-                secrets.insert(name, value);
-            }
-            Ok(secrets)
+            convert_task_secrets(gql_secrets)
         }
 
         inner(self.client.clone(), task_id)
@@ -257,10 +261,15 @@ where
     /// Issue a short-lived OIDC identity token for the current task.
     pub fn issue_task_identity_token(
         &self,
+        request_scope: Option<RequestScope>,
         options: IdentityTokenOptions,
     ) -> impl Future<Output = anyhow::Result<TaskIdentityToken>> + use<RequestScope> {
         let client = self.client.clone();
-        async move { client.issue_task_identity_token(options).await }
+        async move {
+            client
+                .issue_task_identity_token(request_scope.as_ref(), options)
+                .await
+        }
     }
 
     /// Issue a short-lived OIDC identity token in the JSON shape expected by
@@ -285,11 +294,14 @@ where
             }
 
             match client
-                .issue_task_identity_token(IdentityTokenOptions {
-                    audience,
-                    requested_duration,
-                    subject_template: vec1!["principal".to_owned()],
-                })
+                .issue_task_identity_token(
+                    None,
+                    IdentityTokenOptions {
+                        audience,
+                        requested_duration,
+                        subject_template: vec1!["principal".to_owned()],
+                    },
+                )
                 .await
             {
                 Ok(token) => Ok(GcpWorkloadIdentityFederationToken::new(token, token_type)),

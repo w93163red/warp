@@ -90,6 +90,7 @@ pub fn convert_conversation_data_to_ai_conversation(
             autoexecute_override: None,
             last_event_sequence: None,
             pinned: false,
+            use_warp_credits_instead_of_chatgpt: false,
         },
         RestorationMode::Continue => AgentConversationData {
             server_conversation_token: Some(
@@ -111,6 +112,7 @@ pub fn convert_conversation_data_to_ai_conversation(
             autoexecute_override: None,
             last_event_sequence: None,
             pinned: false,
+            use_warp_credits_instead_of_chatgpt: false,
         },
     };
 
@@ -611,6 +613,12 @@ pub(crate) fn convert_tool_call_result_to_input(
                     is_alt_screen_active: snapshot.is_alt_screen_active,
                     activity: snapshot.activity.as_ref().map(Into::into),
                 },
+                Some(api::run_shell_command_result::Result::TerminalBusy(busy)) => {
+                    RequestCommandOutputResult::TerminalBusy {
+                        command: result.command.clone(),
+                        block_id: busy.running_command_id.clone().into(),
+                    }
+                }
                 Some(api::run_shell_command_result::Result::PermissionDenied(
                     api::PermissionDenied { .. },
                 ))
@@ -976,10 +984,10 @@ pub(crate) fn convert_tool_call_result_to_input(
                         .map(|api_result| match &api_result.result {
                             Some(api::call_mcp_tool_result::success::result::Result::Text(
                                 text,
-                            )) => rmcp::model::Content::text(text.text.clone()),
+                            )) => rmcp::model::ContentBlock::text(text.text.clone()),
                             Some(api::call_mcp_tool_result::success::result::Result::Image(
                                 image,
-                            )) => rmcp::model::Content::image(
+                            )) => rmcp::model::ContentBlock::image(
                                 String::from_utf8_lossy(&image.data).to_string(),
                                 image.mime_type.clone(),
                             ),
@@ -987,7 +995,7 @@ pub(crate) fn convert_tool_call_result_to_input(
                                 resource,
                             )) => match &resource.content_type {
                                 Some(api::mcp_resource_content::ContentType::Text(text)) => {
-                                    rmcp::model::Content::resource(
+                                    rmcp::model::ContentBlock::resource(
                                         rmcp::model::ResourceContents::text(
                                             text.content.clone(),
                                             resource.uri.clone(),
@@ -995,7 +1003,7 @@ pub(crate) fn convert_tool_call_result_to_input(
                                     )
                                 }
                                 Some(api::mcp_resource_content::ContentType::Binary(binary)) => {
-                                    rmcp::model::Content::resource(
+                                    rmcp::model::ContentBlock::resource(
                                         rmcp::model::ResourceContents::BlobResourceContents {
                                             uri: resource.uri.clone(),
                                             mime_type: Some(binary.mime_type.clone()),
@@ -1004,14 +1012,14 @@ pub(crate) fn convert_tool_call_result_to_input(
                                         },
                                     )
                                 }
-                                None => rmcp::model::Content::resource(
+                                None => rmcp::model::ContentBlock::resource(
                                     rmcp::model::ResourceContents::text(
                                         String::new(),
                                         resource.uri.clone(),
                                     ),
                                 ),
                             },
-                            None => rmcp::model::Content::text(String::new()),
+                            None => rmcp::model::ContentBlock::text(String::new()),
                         })
                         .collect();
 

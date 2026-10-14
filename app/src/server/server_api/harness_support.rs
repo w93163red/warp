@@ -5,8 +5,19 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 #[cfg(test)]
 use mockall::automock;
+use warp_cli::agent::Harness;
+
+#[path = "harness_usage/publication.rs"]
+mod publication;
+pub use publication::HarnessUsageCapability;
+#[cfg(test)]
+use publication::parse_harness_usage_retry_after;
+#[cfg(not(target_family = "wasm"))]
+pub use publication::{HarnessUsageError, HarnessUsageErrorKind, HarnessUsagePublicationStatus};
 
 use super::ServerApi;
 #[cfg(feature = "local_fs")]
@@ -201,6 +212,7 @@ pub struct SnapshotUploadResponse {
 #[derive(serde::Serialize)]
 struct CreateExternalConversationRequest {
     format: String,
+    harness: &'static str,
 }
 
 #[derive(serde::Deserialize)]
@@ -211,6 +223,13 @@ struct CreateExternalConversationResponse {
 #[derive(serde::Serialize)]
 struct GetUploadTargetRequest {
     conversation_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct UploadConversationDataRequest {
+    conversation_id: String,
+    /// Base64 of the prost-encoded `ConversationData`.
+    conversation_data: String,
 }
 
 /// Skill attached to a resolve-prompt request,
@@ -248,6 +267,11 @@ pub struct ResolvedHarnessPrompt {
     /// after any resumption preamble.
     #[serde(default)]
     pub context: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "publication::deserialize_harness_usage_capability"
+    )]
+    pub harness_usage: Option<HarnessUsageCapability>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -304,9 +328,20 @@ impl ReportShutdownRequest {
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 pub trait HarnessSupportClient: 'static + Send + Sync {
     /// Create a new external conversation for a third-party harness. Returns a
-    /// server-issued [`ServerConversationToken`], not a client-local `AIConversationId`:
-    /// a 3rd-party-harness conversation is never represented in `BlocklistAIHistoryModel`.
-    async fn create_external_conversation(&self, format: &str) -> Result<ServerConversationToken>;
+    /// server-issued [`ServerConversationToken`], not a client-local `AIConversationId`.
+    async fn create_external_conversation(
+        &self,
+        format: &str,
+        harness: Harness,
+    ) -> Result<ServerConversationToken>;
+
+    /// Replace the stored native conversation data for an external conversation whose format
+    /// is client-reduced. `conversation_data` is prost-encoded `ConversationData`.
+    async fn upload_conversation_data(
+        &self,
+        conversation_id: &ServerConversationToken,
+        conversation_data: &[u8],
+    ) -> Result<()>;
 
     /// Get a presigned upload target for the conversation's raw transcript.
     async fn get_transcript_upload_target(
@@ -495,17 +530,37 @@ impl ServerApi {
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl HarnessSupportClient for ServerApi {
-    async fn create_external_conversation(&self, format: &str) -> Result<ServerConversationToken> {
+    async fn create_external_conversation(
+        &self,
+        format: &str,
+        harness: Harness,
+    ) -> Result<ServerConversationToken> {
         let response: CreateExternalConversationResponse = self
             .post_public_api(
                 "harness-support/external-conversation",
                 &CreateExternalConversationRequest {
                     format: format.to_string(),
+                    harness: harness.config_name(),
                 },
             )
             .await?;
 
         Ok(ServerConversationToken::new(response.conversation_id))
+    }
+
+    async fn upload_conversation_data(
+        &self,
+        conversation_id: &ServerConversationToken,
+        conversation_data: &[u8],
+    ) -> Result<()> {
+        self.post_public_api_unit(
+            "harness-support/conversation-data",
+            &UploadConversationDataRequest {
+                conversation_id: conversation_id.to_string(),
+                conversation_data: BASE64_STANDARD.encode(conversation_data),
+            },
+        )
+        .await
     }
 
     async fn get_transcript_upload_target(
@@ -643,3 +698,7 @@ pub async fn upload_to_target(
 #[cfg(test)]
 #[path = "harness_support_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "harness_usage_tests.rs"]
+mod harness_usage_tests;

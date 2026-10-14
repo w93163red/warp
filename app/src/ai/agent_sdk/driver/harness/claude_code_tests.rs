@@ -12,7 +12,7 @@ use super::*;
 use crate::ai::agent_events::{AgentMessageEventMetadata, MessageHydrator};
 use crate::ai::agent_sdk::driver::OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV;
 use crate::ai::agent_sdk::driver::harness::claude_transcript::{
-    encode_cwd, write_session_index_entry,
+    encode_cwd, read_envelope_with_diagnostics, write_session_index_entry,
 };
 use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::ai::{AIClient, MockAIClient, ReadAgentMessageResponse};
@@ -690,7 +690,8 @@ fn prepare_claude_environment_config_without_config_dir_uses_home_global_config(
     unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
 
     let working_dir = home_dir.path().join("workspace/project");
-    prepare_claude_environment_config(&working_dir, &working_dir, &HashMap::new()).unwrap();
+    prepare_claude_environment_config(&working_dir, &working_dir, &HashMap::new(), &[], false)
+        .unwrap();
 
     assert!(home_dir.path().join(CLAUDE_JSON_FILE_NAME).exists());
     assert!(
@@ -735,7 +736,8 @@ fn prepare_claude_environment_config_with_config_dir_uses_dir_global_config() {
     unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", claude_config_dir.path()) };
 
     let working_dir = home_dir.path().join("workspace/project");
-    prepare_claude_environment_config(&working_dir, &working_dir, &HashMap::new()).unwrap();
+    prepare_claude_environment_config(&working_dir, &working_dir, &HashMap::new(), &[], false)
+        .unwrap();
 
     assert!(
         claude_config_dir
@@ -862,8 +864,9 @@ fn prepare_local_wake_command_rehydrates_transcript_with_self_managed_listener()
     );
     assert!(!parent_bridge_hook_output_file(&state_dir).exists());
 
-    let restored_envelope =
-        read_envelope(session_id, &working_dir, claude_config_dir.path(), false).unwrap();
+    let (restored_envelope, _) =
+        read_envelope_with_diagnostics(session_id, &working_dir, claude_config_dir.path(), false)
+            .unwrap();
     assert_eq!(restored_envelope.cwd, working_dir);
     assert_eq!(
         restored_envelope.entries,

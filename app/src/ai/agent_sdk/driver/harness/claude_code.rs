@@ -4,8 +4,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -13,6 +14,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 use warp_cli::agent::Harness;
 use warp_core::safe_info;
+use warp_harness_usage::extract_claude;
 use warp_managed_secrets::ManagedSecretValue;
 use warpui::{ModelHandle, ModelSpawner};
 
@@ -20,23 +22,28 @@ use super::super::terminal::{CommandHandle, TerminalDriver};
 use super::super::{AgentDriver, AgentDriverError};
 use super::claude_transcript::{
     ClaudeResumeInfo, ClaudeTranscriptEnvelope, claude_config_dir, home_dir_for_claude_config,
-    read_envelope, rehydrate_claude_transcript,
+    read_envelope_with_diagnostics, rehydrate_claude_transcript,
+};
+use super::harness_persistence::{
+    HarnessPersistence, PersistenceOutcome, save_transcript_and_block,
 };
 use super::json_utils::{read_json_file_or_default, write_json_file};
-use super::save_coordinator::{SaveCoordinator, save_transcript_and_block};
+use super::transcript_persistence::{
+    CapturedTranscript, UploadedTranscriptUsage, capture_transcript_with_retry,
+    needs_capture_retry, upload_captured_transcript,
+};
+use super::usage_reporting::CaptureIdentity;
 use super::{
     HarnessCleanupDisposition, HarnessRunner, JSONMCPServer, ResumePayload, SavePoint,
     ThirdPartyHarness, cli_agent_session_status, write_temp_file,
 };
 use crate::ai::agent::api::ServerConversationToken;
-use crate::ai::agent_sdk::setup_observability::{
-    OzRunTimelineEvent, SetupClientEventReporter, SetupStep,
-};
+use crate::ai::agent_sdk::setup_observability::{SetupClientEventReporter, SetupStep};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::task::HarnessModelConfig;
 use crate::ai::mcp::JSONTransportType;
 use crate::server::server_api::ServerApi;
-use crate::server::server_api::harness_support::{HarnessSupportClient, upload_to_target};
+use crate::server::server_api::harness_support::HarnessSupportClient;
 use crate::terminal::CLIAgent;
 use crate::terminal::model::block::BlockId;
 use crate::terminal::model::session::ExecuteCommandOptions;
@@ -142,13 +149,21 @@ impl ThirdPartyHarness for ClaudeHarness {
         terminal_driver: ModelHandle<TerminalDriver>,
         resume: Option<ResumePayload>,
         resolved_env_vars: &HashMap<OsString, OsString>,
+        skill_dirs: &[PathBuf],
+        has_deferred_repositories: bool,
         _resolved_secrets: &HashMap<String, ManagedSecretValue>,
         resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
         _third_party_harness_model_config: Option<&HarnessModelConfig>,
     ) -> Result<Box<dyn HarnessRunner>, AgentDriverError> {
         // Prepare the environment config files.
-        prepare_claude_environment_config(workspace_root, harness_working_dir, resolved_env_vars)
-            .map_err(|error| AgentDriverError::HarnessConfigSetupFailed {
+        prepare_claude_environment_config(
+            workspace_root,
+            harness_working_dir,
+            resolved_env_vars,
+            skill_dirs,
+            has_deferred_repositories,
+        )
+        .map_err(|error| AgentDriverError::HarnessConfigSetupFailed {
             harness: self.cli_agent().command_prefix().to_owned(),
             error,
         })?;
@@ -245,7 +260,7 @@ struct ClaudeHarnessRunner {
     server_api: Arc<ServerApi>,
     terminal_driver: ModelHandle<TerminalDriver>,
     state: Mutex<ClaudeRunnerState>,
-    saves: SaveCoordinator,
+    persistence: HarnessPersistence,
     session_id: Uuid,
     harness_working_dir: PathBuf,
     parent_bridge: Option<MessageBridge>,
@@ -329,7 +344,7 @@ impl ClaudeHarnessRunner {
             server_api,
             terminal_driver,
             state: Mutex::new(ClaudeRunnerState::Preexec),
-            saves: SaveCoordinator::default(),
+            persistence: HarnessPersistence::default(),
             session_id,
             harness_working_dir: harness_working_dir.to_path_buf(),
             parent_bridge,
@@ -462,7 +477,7 @@ impl HarnessRunner for ClaudeHarnessRunner {
                 let id = setup_events
                     .record_result(SetupStep::ThirdPartyHarnessExternalConversation, async {
                         self.client
-                            .create_external_conversation(CLAUDE_CODE_FORMAT)
+                            .create_external_conversation(CLAUDE_CODE_FORMAT, Harness::Claude)
                             .await
                             .map_err(|e| {
                                 report_error!(&e);
@@ -500,10 +515,6 @@ impl HarnessRunner for ClaudeHarnessRunner {
             conversation_id,
             block_id: command_handle.block_id().clone(),
         };
-
-        setup_events
-            .post_timeline_event(OzRunTimelineEvent::AgentStarted)
-            .await;
 
         Ok(command_handle)
     }
@@ -554,26 +565,32 @@ impl HarnessRunner for ClaudeHarnessRunner {
     async fn handle_session_update(&self, _foreground: &ModelSpawner<AgentDriver>) -> Result<()> {
         self.handle_parent_bridge_session_update().await
     }
-    fn save_coordinator(&self) -> &SaveCoordinator {
-        &self.saves
+    fn persistence(&self) -> &HarnessPersistence {
+        &self.persistence
     }
 
     async fn save_conversation(
         &self,
         save_point: SavePoint,
         foreground: &ModelSpawner<AgentDriver>,
-    ) -> Result<()> {
+    ) -> PersistenceOutcome {
         if matches!(save_point, SavePoint::Periodic)
             && !super::has_running_cli_agent(&self.terminal_driver, foreground).await
         {
             log::debug!("Will not save conversation, Claude Code not in progress");
-            return Ok(());
+            return PersistenceOutcome::skipped();
         }
 
         let (conversation_id, block_id) = match &*self.state.lock() {
             ClaudeRunnerState::Preexec => {
                 log::warn!("save_conversation called before start");
-                return Ok(());
+                return if matches!(save_point, SavePoint::Final) {
+                    PersistenceOutcome::failed(anyhow!(
+                        "Cannot finalize Claude Code persistence before the harness starts"
+                    ))
+                } else {
+                    PersistenceOutcome::skipped()
+                };
             }
             ClaudeRunnerState::Running {
                 conversation_id,
@@ -589,13 +606,14 @@ impl HarnessRunner for ClaudeHarnessRunner {
         let require_main_transcript = matches!(save_point, SavePoint::Final);
 
         save_transcript_and_block(
-            upload_transcript(
+            capture_and_upload_transcript(
                 client,
                 &conversation_id,
                 session_id,
                 harness_working_dir,
                 claude_version,
                 require_main_transcript,
+                &self.persistence,
             ),
             super::upload_current_block_snapshot(
                 foreground,
@@ -620,42 +638,91 @@ impl HarnessRunner for ClaudeHarnessRunner {
     }
 }
 
-/// Upload the Claude Code session transcript to the server.
-async fn upload_transcript(
+/// Capture and persist the Claude Code session transcript.
+async fn capture_and_upload_transcript(
     client: &dyn HarnessSupportClient,
     conversation_id: &ServerConversationToken,
     session_id: Uuid,
     harness_working_dir: &Path,
     claude_version: Option<String>,
     require_main_transcript: bool,
-) -> Result<()> {
+    persistence: &HarnessPersistence,
+) -> Result<UploadedTranscriptUsage> {
     log::info!("Uploading Claude Code transcript to conversation {conversation_id}");
 
     let config_dir = claude_config_dir().context("Failed to resolve Claude config dir")?;
     let harness_working_dir = harness_working_dir.to_path_buf();
-    let body = tokio::task::spawn_blocking(move || {
-        let mut envelope = read_envelope(
-            session_id,
-            &harness_working_dir,
-            &config_dir,
-            require_main_transcript,
-        )
-        .with_context(|| format!("Failed to read transcript for session {session_id}"))?;
-        envelope.claude_version = claude_version;
-        serde_json::to_vec(&envelope).context("Failed to serialize transcript envelope")
+    let capture = capture_transcript_with_retry(persistence.is_reporting_enabled(), || {
+        let identity = persistence.begin_capture();
+        let harness_working_dir = harness_working_dir.clone();
+        let config_dir = config_dir.clone();
+        let claude_version = claude_version.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                capture_transcript_with_usage(
+                    session_id,
+                    &harness_working_dir,
+                    &config_dir,
+                    claude_version,
+                    require_main_transcript,
+                    identity,
+                )
+            })
+            .await
+            .context("Native transcript capture task failed")?
+            .map(Some)
+        }
     })
-    .await
-    .context("read_envelope task panicked")??;
-    let target = client
-        .get_transcript_upload_target(conversation_id)
-        .await
-        .with_context(|| format!("Failed to get transcript upload target for {conversation_id}"))?;
-    upload_to_target(client.http_client(), &target, body).await
+    .await?
+    .context("Claude transcript capture returned no data")?;
+    upload_captured_transcript(client, conversation_id, capture).await
 }
+
+pub(super) fn capture_transcript_with_usage(
+    session_id: Uuid,
+    harness_working_dir: &Path,
+    config_dir: &Path,
+    claude_version: Option<String>,
+    require_main_transcript: bool,
+    identity: Option<CaptureIdentity>,
+) -> Result<CapturedTranscript> {
+    let captured_at = Utc::now();
+    let (mut envelope, diagnostics) = read_envelope_with_diagnostics(
+        session_id,
+        harness_working_dir,
+        config_dir,
+        require_main_transcript || identity.is_some(),
+    )?;
+    envelope.claude_version = claude_version;
+    let transcript_body =
+        serde_json::to_vec(&envelope).context("Failed to serialize transcript envelope")?;
+    let usage_request = identity.and_then(|identity| {
+        identity.build_usage_request(
+            captured_at,
+            extract_claude(
+                &session_id.to_string(),
+                &envelope.entries,
+                envelope
+                    .subagents
+                    .iter()
+                    .map(|(id, entries)| (id.as_str(), entries.as_slice())),
+                &diagnostics,
+            ),
+        )
+    });
+    Ok(CapturedTranscript {
+        transcript_body,
+        usage_request,
+        needs_retry: needs_capture_retry(&diagnostics),
+    })
+}
+
 pub(crate) fn prepare_claude_environment_config(
     workspace_root: &Path,
     harness_working_dir: &Path,
     resolved_env_vars: &HashMap<OsString, OsString>,
+    skill_dirs: &[PathBuf],
+    has_deferred_repositories: bool,
 ) -> Result<()> {
     let claude_json_path = claude_global_config_path()?;
     let claude_dir = claude_config_dir()?;
@@ -667,7 +734,12 @@ pub(crate) fn prepare_claude_environment_config(
         api_key_suffix.as_deref(),
     )?;
     prepare_claude_settings(&claude_settings_path)?;
-    publish_skills_for_claude(workspace_root, harness_working_dir);
+    publish_skills_for_claude(
+        workspace_root,
+        harness_working_dir,
+        skill_dirs,
+        has_deferred_repositories,
+    )?;
     Ok(())
 }
 
@@ -684,14 +756,21 @@ pub(crate) fn prepare_claude_environment_config(
 /// `skill_dirs_publish::publish_skill`), with the conflict-resolution behavior
 /// depending on whether this run is sandboxed (see
 /// `warp_isolation_platform::detect`).
-fn publish_skills_for_claude(workspace_root: &Path, harness_working_dir: &Path) {
+fn publish_skills_for_claude(
+    workspace_root: &Path,
+    harness_working_dir: &Path,
+    skill_dirs: &[PathBuf],
+    has_deferred_repositories: bool,
+) -> Result<()> {
     let skill_root = harness_working_dir.join(".claude").join("skills");
     let is_sandbox = warp_isolation_platform::detect().is_some();
     let published = super::skill_dirs_publish::publish_skills_for_harness(
         &skill_root,
         workspace_root,
         is_sandbox,
-    );
+        skill_dirs,
+        has_deferred_repositories,
+    )?;
     super::skill_dirs_publish::exclude_published_skill_paths_from_git(
         harness_working_dir,
         &published,
@@ -706,6 +785,7 @@ fn publish_skills_for_claude(workspace_root: &Path, harness_working_dir: &Path) 
             )
         );
     }
+    Ok(())
 }
 
 // This function is used specifically for determining where to land `.claude.json`.

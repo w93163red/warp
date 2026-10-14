@@ -1502,32 +1502,17 @@ pub trait MenuPositioningProvider {
 /// Note that this is largely a workaround to avoid having to pass/upgrade
 /// a weak view handle from `Input` to `PromptRenderHelper` for this state.
 pub struct InputRenderStateModel {
-    editor_modified_since_block_finished: bool,
     // For future: we should explore reading this directly off TerminalModel.
     size_info: SizeInfo,
 }
 
 impl InputRenderStateModel {
-    pub fn new(editor_modified_since_block_finished: bool, size_info: SizeInfo) -> Self {
-        Self {
-            editor_modified_since_block_finished,
-            size_info,
-        }
-    }
-
-    pub fn editor_modified_since_block_finished(&self) -> bool {
-        self.editor_modified_since_block_finished
+    pub fn new(size_info: SizeInfo) -> Self {
+        Self { size_info }
     }
 
     pub fn size_info(&self) -> SizeInfo {
         self.size_info
-    }
-
-    pub fn set_editor_modified_since_block_finished(
-        &mut self,
-        editor_modified_since_block_finished: bool,
-    ) {
-        self.editor_modified_since_block_finished = editor_modified_since_block_finished;
     }
 
     pub fn set_size_info(&mut self, size_info: SizeInfo) {
@@ -2938,7 +2923,7 @@ impl Input {
         let view_id = ctx.view_id();
 
         let input_render_state_model_handle: ModelHandle<InputRenderStateModel> =
-            ctx.add_model(|_| InputRenderStateModel::new(false, size_info));
+            ctx.add_model(|_| InputRenderStateModel::new(size_info));
 
         let universal_developer_input_button_bar = ctx.add_typed_action_view(|ctx| {
             UniversalDeveloperInputButtonBar::new(
@@ -10711,20 +10696,6 @@ impl Input {
                     return;
                 }
 
-                if *edit_origin == EditOrigin::UserTyped
-                    && !ctx
-                        .model(&self.input_render_state_model_handle)
-                        .editor_modified_since_block_finished()
-                {
-                    self.input_render_state_model_handle.update(
-                        ctx,
-                        |input_render_state_model, _| {
-                            input_render_state_model.set_editor_modified_since_block_finished(true);
-                        },
-                    );
-                    ctx.notify();
-                }
-
                 let is_editor_empty = self.editor.as_ref(ctx).is_empty(ctx);
                 if is_editor_empty != self.is_editor_empty_on_last_edit {
                     self.is_editor_empty_on_last_edit = is_editor_empty;
@@ -15923,11 +15894,6 @@ impl Input {
             // Generate autosuggestion if the input is not empty (user had type-ahead).
             self.maybe_generate_autosuggestion(ctx);
         }
-
-        self.input_render_state_model_handle
-            .update(ctx, |input_render_state_model, _| {
-                input_render_state_model.set_editor_modified_since_block_finished(false);
-            });
 
         // Re-render for anything that depends on the block list (e.g. zero state AM chips).
         ctx.notify();

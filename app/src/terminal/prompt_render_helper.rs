@@ -418,39 +418,7 @@ impl PromptRenderHelper {
         } else {
             *TERMINAL_VIEW_PADDING_LEFT
         };
-        // If the active block hasn't received the precmd message, we're waiting for the next
-        // prompt. However, we don't want the UI to flicker so we show the previous prompt
-        // until the user changes the editor.
-        if !active_block.has_received_precmd()
-            && app
-                .model(&self.input_render_state_model_handle)
-                .editor_modified_since_block_finished()
-        {
-            let prompt = PromptAndPadding {
-                element: PromptAndPaddingElement::Text(Box::new(
-                    Text::new_inline(
-                        "Loading prompt...",
-                        appearance.monospace_font_family(),
-                        appearance.monospace_font_size(),
-                    )
-                    .with_color(appearance.theme().disabled_ui_text_color().into())
-                    .with_line_height_ratio(appearance.line_height_ratio())
-                    .with_compute_baseline_position_fn(
-                        grid_compute_baseline_position_fn(appearance.monospace_font_family()),
-                    ),
-                )),
-                padding_left: 0.,
-                padding_right,
-            };
-            if render_prompt_on_same_line {
-                (None, Some(prompt), None)
-            } else {
-                (Some(prompt), None, None)
-            }
-        } else if active_block.honor_ps1()
-            && model.block_list().is_bootstrapped()
-            && !is_universal_input
-        {
+        if active_block.honor_ps1() && model.block_list().is_bootstrapped() && !is_universal_input {
             // Only render PS1 directly if the shell is bootstrapped and universal developer input is disabled.
             let prompt_block = self.prompt_block(model).unwrap_or(active_block);
             let shell_type = active_block.shell_host().map(|shell| shell.shell_type);

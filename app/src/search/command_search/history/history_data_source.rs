@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Local;
 use futures_lite::future::yield_now;
+use instant::Instant;
 use ordered_float::OrderedFloat;
 use warp_core::features::FeatureFlag;
 use warpui::{AppContext, SingletonEntity};
@@ -55,7 +56,9 @@ const ATUIN_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `None` inside the option means atuin is not set up on this machine, which is
 /// cached like any other answer so that a missing database is not looked for on
 /// every keystroke.
-static ATUIN_ENTRIES: Mutex<Option<(Instant, Option<Arc<[Arc<HistoryEntry>]>>)>> = Mutex::new(None);
+static ATUIN_ENTRIES: Mutex<Option<(Instant, Option<HistoryEntries>)>> = Mutex::new(None);
+
+type HistoryEntries = Arc<[Arc<HistoryEntry>]>;
 
 /// Creates a data source over atuin's history, if atuin is set up on this
 /// machine.

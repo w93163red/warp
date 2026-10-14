@@ -296,19 +296,19 @@ impl CommandSearchView {
             // Registered separately from the session's history so that atuin's
             // commands are searchable even before Warp's own history is ready,
             // and so that a machine without atuin costs nothing here.
-            if *InputSettings::as_ref(ctx).search_atuin_history {
-                if let Some(source) = atuin_history_data_source() {
-                    mixer.add_async_source(
-                        source,
-                        HashSet::from([QueryFilter::History]),
-                        AddAsyncSourceOptions {
-                            debounce_interval: Some(Duration::from_millis(50)),
-                            run_in_zero_state: true,
-                            run_when_unfiltered: true,
-                        },
-                        ctx,
-                    );
-                }
+            if *InputSettings::as_ref(ctx).search_atuin_history
+                && let Some(source) = atuin_history_data_source()
+            {
+                mixer.add_async_source(
+                    source,
+                    HashSet::from([QueryFilter::History]),
+                    AddAsyncSourceOptions {
+                        debounce_interval: Some(Duration::from_millis(50)),
+                        run_in_zero_state: true,
+                        run_when_unfiltered: true,
+                    },
+                    ctx,
+                );
             }
 
             if History::as_ref(ctx).is_queryable(&session_id) {
